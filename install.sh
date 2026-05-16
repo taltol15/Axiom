@@ -457,6 +457,32 @@ write_config() {
     echo "[management.admin]"
     echo "username = \"$(toml_escape "${ADMIN_USERNAME}")\""
     echo "password_hash = \"$(toml_escape "${ADMIN_PASSWORD_HASH}")\""
+    echo
+    echo "[policy.archive]"
+    echo "rar = \"block\""
+    echo "seven_zip = \"block\""
+    echo "zip = \"monitor\""
+    echo "encrypted_zip = \"block\""
+    echo
+    echo "[policy.entropy]"
+    echo "mode = \"monitor\""
+    echo "threshold = 7.9"
+    echo "minimum_chunk_size = 8192"
+    echo
+    echo "[[policy.signatures]]"
+    echo "name = \"Axiom synthetic test marker\""
+    echo "pattern = \"AXIOM_TEST_THREAT\""
+    echo "mode = \"block\""
+    echo
+    echo "[[policy.signatures]]"
+    echo "name = \"WannaCry marker WNCRY\""
+    echo "pattern = \"WNCRY\""
+    echo "mode = \"block\""
+    echo
+    echo "[[policy.signatures]]"
+    echo "name = \"WannaCry marker WANACRY\""
+    echo "pattern = \"WANACRY!\""
+    echo "mode = \"block\""
 
     for index in "${!PROXY_INTERFACES[@]}"; do
       echo
@@ -474,8 +500,8 @@ write_config() {
     done
   } > "${temp_config}"
 
-  ${SUDO} install -d -m 0750 -o root -g "${SERVICE_GROUP}" "${CONFIG_DIR}"
-  ${SUDO} install -m 0640 -o root -g "${SERVICE_GROUP}" "${temp_config}" "${CONFIG_PATH}"
+  ${SUDO} install -d -m 0770 -o root -g "${SERVICE_GROUP}" "${CONFIG_DIR}"
+  ${SUDO} install -m 0660 -o root -g "${SERVICE_GROUP}" "${temp_config}" "${CONFIG_PATH}"
   rm -f "${temp_config}"
 }
 
@@ -513,7 +539,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectHome=true
 ProtectSystem=strict
-ReadWritePaths=/var/lib/axiom /var/log/axiom
+ReadWritePaths=/etc/axiom /var/lib/axiom /var/log/axiom
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 
 [Install]

@@ -1,4 +1,4 @@
-use std::{env, sync::Arc};
+use std::{env, path::PathBuf, sync::Arc};
 
 use anyhow::Context;
 use axiom_config::AxiomConfig;
@@ -17,14 +17,16 @@ async fn main() -> anyhow::Result<()> {
     let config = AxiomConfig::load_from_path(&config_path)
         .with_context(|| format!("failed loading Axiom config from '{config_path}'"))?;
 
-    let runtime = Arc::new(RuntimeState::new(StreamPolicy::default()));
+    let config_path = PathBuf::from(config_path);
+    let runtime = Arc::new(RuntimeState::new(StreamPolicy::from_config(
+        config.policy.clone(),
+    )));
     let mut tasks = JoinSet::new();
 
-    let management = config.management.clone();
-    let web_proxy_listeners = config.proxy_listeners.clone();
+    let web_config = config.clone();
     let web_runtime = Arc::clone(&runtime);
     tasks.spawn(async move {
-        axiom_web::run_management_server(management, web_proxy_listeners, web_runtime).await
+        axiom_web::run_management_server(config_path, web_config, web_runtime).await
     });
 
     for proxy_listener in config.proxy_listeners.clone() {

@@ -1,7 +1,12 @@
-use std::sync::Arc;
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex},
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use anyhow::Context;
-use axiom_config::{AdminCredentials, ManagementConfig, ProxyListenerConfig};
+use axiom_config::{AdminCredentials, AxiomConfig, PolicyConfig, ProxyListenerConfig};
 use axiom_core::{RuntimeState, StatusSnapshot};
 use axiom_net::bind_tcp_listener_to_interface;
 use axum::{
@@ -18,18 +23,18 @@ use tracing::{info, warn};
 const SESSION_COOKIE_NAME: &str = "axiom_session";
 const SESSION_MAX_AGE_SECONDS: u64 = 8 * 60 * 60;
 
-#[derive(Clone)]
 struct WebState {
     runtime: Arc<RuntimeState>,
-    management: ManagementConfig,
-    proxy_listeners: Vec<ProxyListenerConfig>,
+    config_path: PathBuf,
+    config: Mutex<AxiomConfig>,
 }
 
 pub async fn run_management_server(
-    management: ManagementConfig,
-    proxy_listeners: Vec<ProxyListenerConfig>,
+    config_path: PathBuf,
+    config: AxiomConfig,
     runtime: Arc<RuntimeState>,
 ) -> anyhow::Result<()> {
+    let management = config.management.clone();
     let listener =
         bind_tcp_listener_to_interface(&management.interface, management.listen_addr(), 1024)
             .await
@@ -43,8 +48,8 @@ pub async fn run_management_server(
 
     let state = Arc::new(WebState {
         runtime,
-        management: management.clone(),
-        proxy_listeners,
+        config_path,
+        config: Mutex::new(config),
     });
 
     let app = Router::new()
@@ -52,6 +57,7 @@ pub async fn run_management_server(
         .route("/dashboard", get(dashboard_page))
         .route("/login", get(login_page))
         .route("/api/status", get(api_status))
+        .route("/api/policies", get(api_policies).put(api_update_policies))
         .route("/api/login", post(api_login))
         .route("/api/logout", post(api_logout))
         .with_state(state);
@@ -96,6 +102,71 @@ async fn api_status(headers: HeaderMap, State(state): State<Arc<WebState>>) -> R
     Json(build_status_response(&state)).into_response()
 }
 
+async fn api_policies(headers: HeaderMap, State(state): State<Arc<WebState>>) -> Response {
+    if !is_authorized(&headers, &state) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(ErrorResponse {
+                message: "authentication required",
+            }),
+        )
+            .into_response();
+    }
+
+    Json(state.runtime.policy_config()).into_response()
+}
+
+async fn api_update_policies(
+    headers: HeaderMap,
+    State(state): State<Arc<WebState>>,
+    Json(policy): Json<PolicyConfig>,
+) -> Response {
+    if !is_authorized(&headers, &state) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(ErrorResponse {
+                message: "authentication required",
+            }),
+        )
+            .into_response();
+    }
+
+    if let Err(error) = policy.validate() {
+        warn!(?error, "invalid policy update rejected");
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                message: "invalid policy configuration",
+            }),
+        )
+            .into_response();
+    }
+
+    let persisted = {
+        let mut config = state.config.lock().expect("web config mutex poisoned");
+        config.policy = policy.clone();
+        persist_config(&state.config_path, &config)
+    };
+
+    if let Err(error) = persisted {
+        warn!(?error, "failed persisting policy update");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                message: "failed saving policy configuration",
+            }),
+        )
+            .into_response();
+    }
+
+    state.runtime.update_policy(policy);
+
+    Json(ErrorResponse {
+        message: "policy updated",
+    })
+    .into_response()
+}
+
 async fn api_login(
     State(state): State<Arc<WebState>>,
     Json(request): Json<LoginRequest>,
@@ -114,7 +185,11 @@ async fn api_login(
             .into_response();
     }
 
-    let admin = &state.management.admin;
+    let admin = {
+        let config = state.config.lock().expect("web config mutex poisoned");
+        config.management.admin.clone()
+    };
+    let admin = &admin;
     if request.username == admin.username && verify_admin_password(admin, &request.password) {
         let token = session_token(admin);
         let cookie = format!(
@@ -173,11 +248,12 @@ async fn api_logout() -> Response {
 }
 
 fn build_status_response(state: &WebState) -> StatusResponse {
+    let config = state.config.lock().expect("web config mutex poisoned");
     StatusResponse {
-        management_interface: state.management.interface.clone(),
-        management_bind_addr: state.management.listen_addr().to_string(),
-        configured_proxy_listeners: state.proxy_listeners.len(),
-        proxy_listeners: state
+        management_interface: config.management.interface.clone(),
+        management_bind_addr: config.management.listen_addr().to_string(),
+        configured_proxy_listeners: config.proxy_listeners.len(),
+        proxy_listeners: config
             .proxy_listeners
             .iter()
             .map(ProxyListenerStatus::from)
@@ -187,7 +263,10 @@ fn build_status_response(state: &WebState) -> StatusResponse {
 }
 
 fn is_authorized(headers: &HeaderMap, state: &WebState) -> bool {
-    let expected_token = session_token(&state.management.admin);
+    let expected_token = {
+        let config = state.config.lock().expect("web config mutex poisoned");
+        session_token(&config.management.admin)
+    };
 
     if let Some(header_value) = headers.get(header::AUTHORIZATION)
         && let Ok(value) = header_value.to_str()
@@ -267,6 +346,33 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
     }
 
     diff == 0
+}
+
+fn persist_config(path: &Path, config: &AxiomConfig) -> anyhow::Result<()> {
+    let serialized = toml::to_string_pretty(config).context("failed serializing Axiom config")?;
+
+    if path.exists() {
+        let backup_path = path.with_extension(format!("toml.bak-{}", unix_timestamp_seconds()));
+        fs::copy(path, &backup_path).with_context(|| {
+            format!(
+                "failed backing up config from {} to {}",
+                path.display(),
+                backup_path.display()
+            )
+        })?;
+    }
+
+    fs::write(path, serialized)
+        .with_context(|| format!("failed writing config to {}", path.display()))?;
+
+    Ok(())
+}
+
+fn unix_timestamp_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_else(|_| Duration::from_secs(0))
+        .as_secs()
 }
 
 #[derive(Debug, Serialize)]
@@ -425,7 +531,7 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
   </header>
 
   <main class="mx-auto max-w-7xl px-6 py-8">
-    <section class="grid gap-5 md:grid-cols-4">
+    <section class="grid gap-5 md:grid-cols-5">
       <article class="rounded-lg border border-zinc-800 bg-zinc-900 p-6">
         <p class="text-sm text-zinc-400">Total Bytes Transferred</p>
         <p id="total-bytes" class="mt-4 text-4xl font-semibold text-white">0 B</p>
@@ -439,9 +545,70 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
         <p id="blocked-threats" class="mt-4 text-4xl font-semibold text-red-300">0</p>
       </article>
       <article class="rounded-lg border border-zinc-800 bg-zinc-900 p-6">
+        <p class="text-sm text-zinc-400">Monitored Detections</p>
+        <p id="monitored-threats" class="mt-4 text-4xl font-semibold text-amber-200">0</p>
+      </article>
+      <article class="rounded-lg border border-zinc-800 bg-zinc-900 p-6">
         <p class="text-sm text-zinc-400">Inspected Chunks</p>
         <p id="inspected-chunks" class="mt-4 text-4xl font-semibold text-emerald-200">0</p>
       </article>
+    </section>
+
+    <section class="mt-8 rounded-lg border border-zinc-800 bg-zinc-900">
+      <div class="flex flex-col gap-4 border-b border-zinc-800 px-6 py-5 md:flex-row md:items-center md:justify-between">
+        <div>
+          <h2 class="text-xl font-semibold text-white">Policy Controls</h2>
+          <p id="policy-state" class="mt-1 text-sm text-zinc-400">Loading policies</p>
+        </div>
+        <button id="save-policies" class="rounded-md bg-emerald-400 px-4 py-2 text-sm font-semibold text-zinc-950 transition hover:bg-emerald-300">Save policies</button>
+      </div>
+
+      <div class="grid gap-6 p-6 lg:grid-cols-[1fr_1fr]">
+        <div>
+          <h3 class="text-sm font-semibold uppercase tracking-wider text-zinc-400">Archive Rules</h3>
+          <div class="mt-4 grid gap-4 sm:grid-cols-2">
+            <label class="block">
+              <span class="text-sm text-zinc-300">RAR</span>
+              <select id="policy-rar" class="mt-2 w-full rounded-md border border-zinc-700 bg-zinc-950 px-3 py-2 text-white"></select>
+            </label>
+            <label class="block">
+              <span class="text-sm text-zinc-300">7z</span>
+              <select id="policy-seven-zip" class="mt-2 w-full rounded-md border border-zinc-700 bg-zinc-950 px-3 py-2 text-white"></select>
+            </label>
+            <label class="block">
+              <span class="text-sm text-zinc-300">ZIP</span>
+              <select id="policy-zip" class="mt-2 w-full rounded-md border border-zinc-700 bg-zinc-950 px-3 py-2 text-white"></select>
+            </label>
+            <label class="block">
+              <span class="text-sm text-zinc-300">Encrypted ZIP</span>
+              <select id="policy-encrypted-zip" class="mt-2 w-full rounded-md border border-zinc-700 bg-zinc-950 px-3 py-2 text-white"></select>
+            </label>
+          </div>
+        </div>
+
+        <div>
+          <h3 class="text-sm font-semibold uppercase tracking-wider text-zinc-400">Entropy Rule</h3>
+          <div class="mt-4 grid gap-4 sm:grid-cols-3">
+            <label class="block">
+              <span class="text-sm text-zinc-300">Mode</span>
+              <select id="policy-entropy-mode" class="mt-2 w-full rounded-md border border-zinc-700 bg-zinc-950 px-3 py-2 text-white"></select>
+            </label>
+            <label class="block">
+              <span class="text-sm text-zinc-300">Threshold</span>
+              <input id="policy-entropy-threshold" type="number" step="0.01" min="0" max="8" class="mt-2 w-full rounded-md border border-zinc-700 bg-zinc-950 px-3 py-2 text-white">
+            </label>
+            <label class="block">
+              <span class="text-sm text-zinc-300">Min Chunk</span>
+              <input id="policy-entropy-minimum" type="number" min="1" class="mt-2 w-full rounded-md border border-zinc-700 bg-zinc-950 px-3 py-2 text-white">
+            </label>
+          </div>
+        </div>
+
+        <div class="lg:col-span-2">
+          <h3 class="text-sm font-semibold uppercase tracking-wider text-zinc-400">Signatures</h3>
+          <textarea id="policy-signatures" rows="5" spellcheck="false" class="mt-4 w-full rounded-md border border-zinc-700 bg-zinc-950 px-4 py-3 font-mono text-sm text-white outline-none focus:border-emerald-400"></textarea>
+        </div>
+      </div>
     </section>
 
     <section class="mt-8 rounded-lg border border-zinc-800 bg-zinc-900">
@@ -471,7 +638,7 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
 
     <section class="mt-8 rounded-lg border border-zinc-800 bg-zinc-900">
       <div class="border-b border-zinc-800 px-6 py-5">
-        <h2 class="text-xl font-semibold text-white">Recent Threat Events</h2>
+        <h2 class="text-xl font-semibold text-white">Recent Policy Events</h2>
       </div>
       <div id="threats" class="divide-y divide-zinc-800"></div>
     </section>
@@ -479,6 +646,11 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
 
   <script>
     const token = localStorage.getItem("axiomToken") || "";
+    const modes = ["disabled", "monitor", "block"];
+
+    function authHeaders(extra = {}) {
+      return token ? { ...extra, Authorization: `Bearer ${token}` } : extra;
+    }
 
     function formatBytes(value) {
       const units = ["B", "KB", "MB", "GB", "TB"];
@@ -497,7 +669,7 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
 
     async function refresh() {
       const response = await fetch("/api/status", {
-        headers: token ? { Authorization: `Bearer ${token}` } : {}
+        headers: authHeaders()
       });
 
       if (response.status === 401) {
@@ -513,6 +685,7 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
       document.getElementById("total-bytes").textContent = formatBytes(totalBytes);
       document.getElementById("active-connections").textContent = stats.active_connections;
       document.getElementById("blocked-threats").textContent = stats.blocked_threats;
+      document.getElementById("monitored-threats").textContent = stats.monitored_threats;
       document.getElementById("inspected-chunks").textContent = stats.inspected_chunks;
       document.getElementById("management-info").textContent = `${data.management_interface} at ${data.management_bind_addr}`;
       document.getElementById("refresh-state").textContent = `Updated ${new Date().toLocaleTimeString()}`;
@@ -530,19 +703,96 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
 
       const threats = document.getElementById("threats");
       if (!stats.recent_threats.length) {
-        threats.innerHTML = `<div class="px-6 py-6 text-sm text-zinc-400">No blocked threats recorded.</div>`;
+        threats.innerHTML = `<div class="px-6 py-6 text-sm text-zinc-400">No policy detections recorded.</div>`;
         return;
       }
 
       threats.innerHTML = stats.recent_threats.slice().reverse().map((event) => `
         <div class="px-6 py-4">
           <div class="flex flex-col gap-1 md:flex-row md:items-center md:justify-between">
-            <p class="font-medium text-red-200">${text(event.reason)}</p>
+            <p class="font-medium ${event.action === "block" ? "text-red-200" : "text-amber-200"}">${text(event.action).toUpperCase()} · ${text(event.reason)}</p>
             <p class="text-xs text-zinc-500">${new Date(event.unix_timestamp_seconds * 1000).toLocaleString()}</p>
           </div>
-          <p class="mt-2 text-sm text-zinc-400">${text(event.route_name)} · ${text(event.interface)} · ${text(event.direction)} · entropy ${Number(event.entropy || 0).toFixed(3)}</p>
+          <p class="mt-2 text-sm text-zinc-400">${text(event.rule_name)} · ${text(event.route_name)} · ${text(event.interface)} · ${text(event.direction)} · entropy ${Number(event.entropy || 0).toFixed(3)}</p>
         </div>
       `).join("");
+    }
+
+    function fillModeSelect(id, value) {
+      const element = document.getElementById(id);
+      element.innerHTML = modes.map((mode) => `<option value="${mode}">${mode}</option>`).join("");
+      element.value = value || "disabled";
+    }
+
+    async function loadPolicies() {
+      const response = await fetch("/api/policies", { headers: authHeaders() });
+      if (response.status === 401) {
+        localStorage.removeItem("axiomToken");
+        window.location.href = "/login";
+        return;
+      }
+
+      const policy = await response.json();
+      fillModeSelect("policy-rar", policy.archive.rar);
+      fillModeSelect("policy-seven-zip", policy.archive.seven_zip);
+      fillModeSelect("policy-zip", policy.archive.zip);
+      fillModeSelect("policy-encrypted-zip", policy.archive.encrypted_zip);
+      fillModeSelect("policy-entropy-mode", policy.entropy.mode);
+      document.getElementById("policy-entropy-threshold").value = policy.entropy.threshold;
+      document.getElementById("policy-entropy-minimum").value = policy.entropy.minimum_chunk_size;
+      document.getElementById("policy-signatures").value = (policy.signatures || [])
+        .map((signature) => `${signature.name}|${signature.mode}|${signature.pattern}`)
+        .join("\n");
+      document.getElementById("policy-state").textContent = "Policies loaded";
+    }
+
+    function readPolicyPayload() {
+      const signatures = document.getElementById("policy-signatures").value
+        .split("\n")
+        .map((line) => line.trim())
+        .filter(Boolean)
+        .map((line) => {
+          const [name, mode, ...patternParts] = line.split("|");
+          return {
+            name: (name || "").trim(),
+            mode: modes.includes((mode || "").trim()) ? mode.trim() : "monitor",
+            pattern: patternParts.join("|")
+          };
+        })
+        .filter((signature) => signature.name && signature.pattern);
+
+      return {
+        archive: {
+          rar: document.getElementById("policy-rar").value,
+          seven_zip: document.getElementById("policy-seven-zip").value,
+          zip: document.getElementById("policy-zip").value,
+          encrypted_zip: document.getElementById("policy-encrypted-zip").value
+        },
+        entropy: {
+          mode: document.getElementById("policy-entropy-mode").value,
+          threshold: Number(document.getElementById("policy-entropy-threshold").value),
+          minimum_chunk_size: Number(document.getElementById("policy-entropy-minimum").value)
+        },
+        signatures
+      };
+    }
+
+    async function savePolicies() {
+      document.getElementById("policy-state").textContent = "Saving policies";
+      const response = await fetch("/api/policies", {
+        method: "PUT",
+        headers: authHeaders({ "Content-Type": "application/json" }),
+        body: JSON.stringify(readPolicyPayload())
+      });
+
+      const payload = await response.json().catch(() => ({ message: "save failed" }));
+      if (!response.ok) {
+        document.getElementById("policy-state").textContent = payload.message || "Policy save failed";
+        return;
+      }
+
+      document.getElementById("policy-state").textContent = "Policies saved";
+      await loadPolicies();
     }
 
     document.getElementById("logout").addEventListener("click", async () => {
@@ -550,8 +800,10 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
       localStorage.removeItem("axiomToken");
       window.location.href = "/login";
     });
+    document.getElementById("save-policies").addEventListener("click", savePolicies);
 
     refresh();
+    loadPolicies();
     setInterval(refresh, 2000);
   </script>
 </body>

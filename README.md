@@ -23,6 +23,13 @@ The installer embeds the full Axiom source tree, extracts it to a temporary
 directory, discovers NICs interactively, writes `/etc/axiom/axiom.toml`, builds
 the release binary, applies Linux capabilities, and starts `axiom.service`.
 
+## Policies
+
+The management UI includes runtime policy controls for archive detection,
+entropy detection, and custom byte signatures. Each rule can be set to
+`disabled`, `monitor`, or `block`. Policy changes are applied immediately and
+persisted back to `/etc/axiom/axiom.toml`.
+
 The default MVP management login is:
 
 ```text

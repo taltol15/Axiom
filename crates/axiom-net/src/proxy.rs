@@ -146,7 +146,7 @@ where
     W: AsyncWrite + Unpin,
 {
     let mut buffer = vec![0_u8; 64 * 1024];
-    let mut inspection_window = InspectionWindow::new(state.policy().max_pattern_len());
+    let mut inspection_window = InspectionWindow::new(state.max_pattern_len());
 
     loop {
         let bytes_read = reader.read(&mut buffer).await?;
@@ -165,7 +165,7 @@ where
             target_addr,
         };
 
-        match state.policy().inspect_chunk(&context, &inspection_bytes) {
+        match state.inspect_chunk(&context, &inspection_bytes) {
             InspectionResult::Allow { entropy } => {
                 debug!(
                     route = route.name,
@@ -174,6 +174,23 @@ where
                     entropy,
                     "forwarding inspected SMB chunk"
                 );
+                writer.write_all(&buffer[..bytes_read]).await?;
+                inspection_window.remember(&buffer[..bytes_read]);
+                state.record_allowed_chunk();
+                state.record_bytes(direction, bytes_read as u64);
+            }
+            InspectionResult::Monitor { event } => {
+                let reason = event.reason.clone();
+                warn!(
+                    route = route.name,
+                    interface = route.interface(),
+                    ?direction,
+                    peer = %peer_addr,
+                    target = %target_addr,
+                    reason,
+                    "monitored SMB stream policy event"
+                );
+                state.record_monitored_threat(event);
                 writer.write_all(&buffer[..bytes_read]).await?;
                 inspection_window.remember(&buffer[..bytes_read]);
                 state.record_allowed_chunk();

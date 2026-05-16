@@ -36,6 +36,7 @@ dependencies = [
 name = "axiom-core"
 version = "0.1.0"
 dependencies = [
+ "axiom-config",
  "serde",
 ]
 
@@ -77,6 +78,7 @@ dependencies = [
  "axum",
  "serde",
  "sha2",
+ "toml",
  "tracing",
 ]
 

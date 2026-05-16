@@ -2,21 +2,23 @@ use std::{
     collections::VecDeque,
     net::SocketAddr,
     sync::{
-        Mutex,
+        Mutex, RwLock,
         atomic::{AtomicU64, Ordering},
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use axiom_config::{PolicyConfig, PolicyMode};
 use serde::Serialize;
 
 const MAX_RETAINED_THREAT_EVENTS: usize = 128;
+const ARCHIVE_MAX_PATTERN_LEN: usize = 8;
 
 #[derive(Debug)]
 pub struct AppState {
     started_at: SystemTime,
     counters: TrafficCounters,
-    policy: StreamPolicy,
+    policy: RwLock<StreamPolicy>,
     recent_threats: Mutex<VecDeque<ThreatEvent>>,
 }
 
@@ -25,7 +27,7 @@ impl AppState {
         Self {
             started_at: SystemTime::now(),
             counters: TrafficCounters::default(),
-            policy,
+            policy: RwLock::new(policy),
             recent_threats: Mutex::new(VecDeque::with_capacity(MAX_RETAINED_THREAT_EVENTS)),
         }
     }
@@ -73,25 +75,49 @@ impl AppState {
         self.counters.allowed_chunks.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub fn record_monitored_threat(&self, event: ThreatEvent) {
+        self.counters
+            .monitored_chunks
+            .fetch_add(1, Ordering::Relaxed);
+        self.counters
+            .monitored_threats
+            .fetch_add(1, Ordering::Relaxed);
+        self.push_recent_event(event);
+    }
+
     pub fn record_blocked_threat(&self, event: ThreatEvent) {
         self.counters.blocked_chunks.fetch_add(1, Ordering::Relaxed);
         self.counters
             .blocked_threats
             .fetch_add(1, Ordering::Relaxed);
-
-        let mut recent_threats = self
-            .recent_threats
-            .lock()
-            .expect("recent threat event mutex poisoned");
-
-        if recent_threats.len() == MAX_RETAINED_THREAT_EVENTS {
-            recent_threats.pop_front();
-        }
-        recent_threats.push_back(event);
+        self.push_recent_event(event);
     }
 
-    pub fn policy(&self) -> &StreamPolicy {
-        &self.policy
+    pub fn inspect_chunk(&self, context: &InspectionContext<'_>, chunk: &[u8]) -> InspectionResult {
+        self.policy
+            .read()
+            .expect("stream policy lock poisoned")
+            .inspect_chunk(context, chunk)
+    }
+
+    pub fn policy_config(&self) -> PolicyConfig {
+        self.policy
+            .read()
+            .expect("stream policy lock poisoned")
+            .config()
+            .clone()
+    }
+
+    pub fn update_policy(&self, policy: PolicyConfig) {
+        let mut guard = self.policy.write().expect("stream policy lock poisoned");
+        *guard = StreamPolicy::from_config(policy);
+    }
+
+    pub fn max_pattern_len(&self) -> usize {
+        self.policy
+            .read()
+            .expect("stream policy lock poisoned")
+            .max_pattern_len()
     }
 
     pub fn snapshot(&self) -> StatusSnapshot {
@@ -114,12 +140,26 @@ impl AppState {
             inspected_chunks: self.counters.inspected_chunks.load(Ordering::Relaxed),
             inspected_bytes: self.counters.inspected_bytes.load(Ordering::Relaxed),
             allowed_chunks: self.counters.allowed_chunks.load(Ordering::Relaxed),
+            monitored_chunks: self.counters.monitored_chunks.load(Ordering::Relaxed),
             blocked_chunks: self.counters.blocked_chunks.load(Ordering::Relaxed),
             bytes_client_to_server: self.counters.bytes_client_to_server.load(Ordering::Relaxed),
             bytes_server_to_client: self.counters.bytes_server_to_client.load(Ordering::Relaxed),
+            monitored_threats: self.counters.monitored_threats.load(Ordering::Relaxed),
             blocked_threats: self.counters.blocked_threats.load(Ordering::Relaxed),
             recent_threats,
         }
+    }
+
+    fn push_recent_event(&self, event: ThreatEvent) {
+        let mut recent_threats = self
+            .recent_threats
+            .lock()
+            .expect("recent threat event mutex poisoned");
+
+        if recent_threats.len() == MAX_RETAINED_THREAT_EVENTS {
+            recent_threats.pop_front();
+        }
+        recent_threats.push_back(event);
     }
 }
 
@@ -138,9 +178,11 @@ struct TrafficCounters {
     inspected_chunks: AtomicU64,
     inspected_bytes: AtomicU64,
     allowed_chunks: AtomicU64,
+    monitored_chunks: AtomicU64,
     blocked_chunks: AtomicU64,
     bytes_client_to_server: AtomicU64,
     bytes_server_to_client: AtomicU64,
+    monitored_threats: AtomicU64,
     blocked_threats: AtomicU64,
 }
 
@@ -152,9 +194,11 @@ pub struct StatusSnapshot {
     pub inspected_chunks: u64,
     pub inspected_bytes: u64,
     pub allowed_chunks: u64,
+    pub monitored_chunks: u64,
     pub blocked_chunks: u64,
     pub bytes_client_to_server: u64,
     pub bytes_server_to_client: u64,
+    pub monitored_threats: u64,
     pub blocked_threats: u64,
     pub recent_threats: Vec<ThreatEvent>,
 }
@@ -171,6 +215,8 @@ pub enum TrafficDirection {
 #[derive(Debug, Clone, Serialize)]
 pub struct ThreatEvent {
     pub unix_timestamp_seconds: u64,
+    pub action: PolicyMode,
+    pub rule_name: String,
     pub route_name: String,
     pub interface: String,
     pub direction: TrafficDirection,
@@ -184,6 +230,8 @@ pub struct ThreatEvent {
 impl ThreatEvent {
     pub fn now(
         context: &InspectionContext<'_>,
+        action: PolicyMode,
+        rule_name: String,
         reason: String,
         bytes_in_chunk: usize,
         entropy: f64,
@@ -193,6 +241,8 @@ impl ThreatEvent {
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_else(|_| Duration::from_secs(0))
                 .as_secs(),
+            action,
+            rule_name,
             route_name: context.route_name.to_string(),
             interface: context.interface.to_string(),
             direction: context.direction,
@@ -207,56 +257,55 @@ impl ThreatEvent {
 
 #[derive(Debug, Clone)]
 pub struct StreamPolicy {
-    signatures: Vec<BlockedSignature>,
-    entropy_block_threshold: f64,
-    entropy_minimum_chunk_size: usize,
+    config: PolicyConfig,
+    signatures: Vec<RuntimeSignature>,
 }
 
 impl StreamPolicy {
-    pub fn new(
-        signatures: Vec<BlockedSignature>,
-        entropy_block_threshold: f64,
-        entropy_minimum_chunk_size: usize,
-    ) -> Self {
-        Self {
-            signatures,
-            entropy_block_threshold,
-            entropy_minimum_chunk_size,
-        }
+    pub fn from_config(config: PolicyConfig) -> Self {
+        let signatures = config
+            .signatures
+            .iter()
+            .map(RuntimeSignature::from)
+            .collect();
+
+        Self { config, signatures }
+    }
+
+    pub fn config(&self) -> &PolicyConfig {
+        &self.config
     }
 
     pub fn inspect_chunk(&self, context: &InspectionContext<'_>, chunk: &[u8]) -> InspectionResult {
         let entropy = calculate_shannon_entropy(chunk);
 
-        if let Some(reason) = detect_archive_policy_violation(chunk) {
-            return InspectionResult::Block {
-                event: ThreatEvent::now(context, reason, chunk.len(), entropy),
-            };
+        if let Some(detection) = self.detect_archive_policy_violation(chunk) {
+            return detection.into_result(context, chunk.len(), entropy);
         }
 
         if let Some(signature) = self.match_signature(chunk) {
-            return InspectionResult::Block {
-                event: ThreatEvent::now(
-                    context,
-                    format!("blocked signature '{}'", signature.name),
-                    chunk.len(),
-                    entropy,
-                ),
-            };
+            return PolicyDetection {
+                action: signature.mode,
+                rule_name: signature.name.clone(),
+                reason: format!("signature '{}' matched", signature.name),
+            }
+            .into_result(context, chunk.len(), entropy);
         }
 
-        if chunk.len() >= self.entropy_minimum_chunk_size
-            && entropy >= self.entropy_block_threshold
+        if chunk.len() >= self.config.entropy.minimum_chunk_size
+            && self.config.entropy.mode.is_enabled()
+            && entropy >= self.config.entropy.threshold
             && !looks_like_smb_negotiate_or_session_setup(chunk)
         {
-            return InspectionResult::Block {
-                event: ThreatEvent::now(
-                    context,
-                    format!("entropy {:.3} exceeded threshold", entropy),
-                    chunk.len(),
-                    entropy,
+            return PolicyDetection {
+                action: self.config.entropy.mode,
+                rule_name: "High entropy payload".to_string(),
+                reason: format!(
+                    "entropy {:.3} exceeded threshold {:.3}",
+                    entropy, self.config.entropy.threshold
                 ),
-            };
+            }
+            .into_result(context, chunk.len(), entropy);
         }
 
         InspectionResult::Allow { entropy }
@@ -270,39 +319,121 @@ impl StreamPolicy {
             .max()
             .unwrap_or(0);
 
-        signature_len.max(8)
+        signature_len.max(ARCHIVE_MAX_PATTERN_LEN)
     }
 
-    fn match_signature<'a>(&'a self, chunk: &[u8]) -> Option<&'a BlockedSignature> {
-        self.signatures
-            .iter()
-            .find(|signature| contains_bytes(chunk, signature.pattern))
+    fn match_signature<'a>(&'a self, chunk: &[u8]) -> Option<&'a RuntimeSignature> {
+        self.signatures.iter().find(|signature| {
+            signature.mode.is_enabled() && contains_bytes(chunk, &signature.pattern)
+        })
+    }
+
+    fn detect_archive_policy_violation(&self, chunk: &[u8]) -> Option<PolicyDetection> {
+        if let Some(mode) = encrypted_zip_mode(chunk, self.config.archive.encrypted_zip)
+            && mode.is_enabled()
+        {
+            return Some(PolicyDetection {
+                action: mode,
+                rule_name: "Encrypted ZIP archive".to_string(),
+                reason: "encrypted ZIP transfer detected".to_string(),
+            });
+        }
+
+        if contains_bytes(chunk, b"Rar!\x1A\x07\x00") && self.config.archive.rar.is_enabled() {
+            return Some(PolicyDetection {
+                action: self.config.archive.rar,
+                rule_name: "RAR archive".to_string(),
+                reason: "RAR4 archive transfer detected".to_string(),
+            });
+        }
+
+        if contains_bytes(chunk, b"Rar!\x1A\x07\x01\x00") && self.config.archive.rar.is_enabled() {
+            return Some(PolicyDetection {
+                action: self.config.archive.rar,
+                rule_name: "RAR archive".to_string(),
+                reason: "RAR5 archive transfer detected".to_string(),
+            });
+        }
+
+        if contains_bytes(chunk, b"7z\xBC\xAF\x27\x1C")
+            && self.config.archive.seven_zip.is_enabled()
+        {
+            return Some(PolicyDetection {
+                action: self.config.archive.seven_zip,
+                rule_name: "7z archive".to_string(),
+                reason: "7z archive transfer detected".to_string(),
+            });
+        }
+
+        if contains_bytes(chunk, b"PK\x03\x04") && self.config.archive.zip.is_enabled() {
+            return Some(PolicyDetection {
+                action: self.config.archive.zip,
+                rule_name: "ZIP archive".to_string(),
+                reason: "ZIP archive transfer detected".to_string(),
+            });
+        }
+
+        None
     }
 }
 
 impl Default for StreamPolicy {
     fn default() -> Self {
-        Self::new(
-            vec![
-                BlockedSignature::new("Axiom synthetic test marker", b"AXIOM_TEST_THREAT"),
-                BlockedSignature::new("WannaCry marker WNCRY", b"WNCRY"),
-                BlockedSignature::new("WannaCry marker WANACRY", b"WANACRY!"),
-            ],
-            7.90,
-            8 * 1024,
-        )
+        Self::from_config(PolicyConfig::default())
+    }
+}
+
+impl From<PolicyConfig> for StreamPolicy {
+    fn from(config: PolicyConfig) -> Self {
+        Self::from_config(config)
     }
 }
 
 #[derive(Debug, Clone)]
-pub struct BlockedSignature {
-    name: &'static str,
-    pattern: &'static [u8],
+struct RuntimeSignature {
+    name: String,
+    pattern: Vec<u8>,
+    mode: PolicyMode,
 }
 
-impl BlockedSignature {
-    pub fn new(name: &'static str, pattern: &'static [u8]) -> Self {
-        Self { name, pattern }
+impl From<&axiom_config::SignaturePolicyConfig> for RuntimeSignature {
+    fn from(value: &axiom_config::SignaturePolicyConfig) -> Self {
+        Self {
+            name: value.name.clone(),
+            pattern: value.pattern.as_bytes().to_vec(),
+            mode: value.mode,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct PolicyDetection {
+    action: PolicyMode,
+    rule_name: String,
+    reason: String,
+}
+
+impl PolicyDetection {
+    fn into_result(
+        self,
+        context: &InspectionContext<'_>,
+        bytes_in_chunk: usize,
+        entropy: f64,
+    ) -> InspectionResult {
+        let event = ThreatEvent::now(
+            context,
+            self.action,
+            self.rule_name,
+            self.reason,
+            bytes_in_chunk,
+            entropy,
+        );
+
+        match self.action {
+            PolicyMode::Disabled => InspectionResult::Allow { entropy },
+            PolicyMode::Monitor => InspectionResult::Monitor { event },
+            PolicyMode::Block => InspectionResult::Block { event },
+        }
     }
 }
 
@@ -320,6 +451,7 @@ pub type InspectContext<'a> = InspectionContext<'a>;
 #[derive(Debug)]
 pub enum InspectionResult {
     Allow { entropy: f64 },
+    Monitor { event: ThreatEvent },
     Block { event: ThreatEvent },
 }
 
@@ -353,32 +485,16 @@ fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
             .any(|window| window == needle)
 }
 
-fn detect_archive_policy_violation(chunk: &[u8]) -> Option<String> {
-    if contains_bytes(chunk, b"Rar!\x1A\x07\x00") {
-        return Some("RAR4 archive transfer blocked by Axiom lab archive policy".to_string());
-    }
-
-    if contains_bytes(chunk, b"Rar!\x1A\x07\x01\x00") {
-        return Some("RAR5 archive transfer blocked by Axiom lab archive policy".to_string());
-    }
-
-    if contains_bytes(chunk, b"7z\xBC\xAF\x27\x1C") {
-        return Some("7z archive transfer blocked by Axiom lab archive policy".to_string());
-    }
-
-    if contains_encrypted_zip_local_header(chunk) {
-        return Some("encrypted ZIP transfer blocked by Axiom archive policy".to_string());
-    }
-
-    None
-}
-
-fn contains_encrypted_zip_local_header(chunk: &[u8]) -> bool {
+fn encrypted_zip_mode(chunk: &[u8], mode: PolicyMode) -> Option<PolicyMode> {
     let signature = b"PK\x03\x04";
 
-    chunk.windows(8).any(|window| {
-        window.starts_with(signature) && u16::from_le_bytes([window[6], window[7]]) & 0x0001 != 0
-    })
+    chunk
+        .windows(8)
+        .any(|window| {
+            window.starts_with(signature)
+                && u16::from_le_bytes([window[6], window[7]]) & 0x0001 != 0
+        })
+        .then_some(mode)
 }
 
 fn looks_like_smb_negotiate_or_session_setup(chunk: &[u8]) -> bool {
@@ -412,6 +528,8 @@ fn looks_like_smb_negotiate_or_session_setup(chunk: &[u8]) -> bool {
 mod tests {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
+    use axiom_config::{ArchivePolicyConfig, EntropyPolicyConfig};
+
     use super::*;
 
     #[test]
@@ -426,6 +544,17 @@ mod tests {
     }
 
     #[test]
+    fn monitors_zip_when_zip_policy_is_monitor() {
+        let policy = StreamPolicy::default();
+        let context = test_context();
+        let chunk = b"prefixPK\x03\x04\x14\x00\x00\x00plain-zip";
+
+        let result = policy.inspect_chunk(&context, chunk);
+
+        assert!(matches!(result, InspectionResult::Monitor { .. }));
+    }
+
+    #[test]
     fn blocks_encrypted_zip_local_header() {
         let policy = StreamPolicy::default();
         let context = test_context();
@@ -434,6 +563,30 @@ mod tests {
         let result = policy.inspect_chunk(&context, chunk);
 
         assert!(matches!(result, InspectionResult::Block { .. }));
+    }
+
+    #[test]
+    fn disabled_archive_policy_allows_rar() {
+        let policy = StreamPolicy::from_config(PolicyConfig {
+            archive: ArchivePolicyConfig {
+                rar: PolicyMode::Disabled,
+                seven_zip: PolicyMode::Disabled,
+                zip: PolicyMode::Disabled,
+                encrypted_zip: PolicyMode::Disabled,
+            },
+            entropy: EntropyPolicyConfig {
+                mode: PolicyMode::Disabled,
+                threshold: 7.90,
+                minimum_chunk_size: 8192,
+            },
+            signatures: Vec::new(),
+        });
+        let context = test_context();
+        let chunk = b"Rar!\x1A\x07\x01\x00payload";
+
+        let result = policy.inspect_chunk(&context, chunk);
+
+        assert!(matches!(result, InspectionResult::Allow { .. }));
     }
 
     #[test]

@@ -7,4 +7,5 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+axiom-config = { path = "../axiom-config" }
 serde.workspace = true

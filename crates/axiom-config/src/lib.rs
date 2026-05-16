@@ -12,6 +12,8 @@ use thiserror::Error;
 pub struct AxiomConfig {
     pub management: ManagementNicConfig,
     #[serde(default)]
+    pub policy: PolicyConfig,
+    #[serde(default)]
     pub proxy_listeners: Vec<ProxyNicConfig>,
 }
 
@@ -30,6 +32,7 @@ impl AxiomConfig {
 
     pub fn validate(&self) -> Result<(), ConfigError> {
         self.management.validate()?;
+        self.policy.validate()?;
 
         if self.proxy_listeners.is_empty() {
             return Err(ConfigError::Invalid(
@@ -65,6 +68,144 @@ impl AxiomConfig {
         }
 
         Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct PolicyConfig {
+    #[serde(default)]
+    pub archive: ArchivePolicyConfig,
+    #[serde(default)]
+    pub entropy: EntropyPolicyConfig,
+    #[serde(default = "default_signatures")]
+    pub signatures: Vec<SignaturePolicyConfig>,
+}
+
+impl PolicyConfig {
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        self.entropy.validate()?;
+
+        for signature in &self.signatures {
+            signature.validate()?;
+        }
+
+        Ok(())
+    }
+}
+
+impl Default for PolicyConfig {
+    fn default() -> Self {
+        Self {
+            archive: ArchivePolicyConfig::default(),
+            entropy: EntropyPolicyConfig::default(),
+            signatures: default_signatures(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ArchivePolicyConfig {
+    #[serde(default = "default_block_mode")]
+    pub rar: PolicyMode,
+    #[serde(default = "default_block_mode")]
+    pub seven_zip: PolicyMode,
+    #[serde(default = "default_monitor_mode")]
+    pub zip: PolicyMode,
+    #[serde(default = "default_block_mode")]
+    pub encrypted_zip: PolicyMode,
+}
+
+impl Default for ArchivePolicyConfig {
+    fn default() -> Self {
+        Self {
+            rar: PolicyMode::Block,
+            seven_zip: PolicyMode::Block,
+            zip: PolicyMode::Monitor,
+            encrypted_zip: PolicyMode::Block,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct EntropyPolicyConfig {
+    #[serde(default = "default_monitor_mode")]
+    pub mode: PolicyMode,
+    #[serde(default = "default_entropy_threshold")]
+    pub threshold: f64,
+    #[serde(default = "default_entropy_minimum_chunk_size")]
+    pub minimum_chunk_size: usize,
+}
+
+impl EntropyPolicyConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        if !(0.0..=8.0).contains(&self.threshold) {
+            return Err(ConfigError::Invalid(
+                "policy.entropy.threshold must be between 0.0 and 8.0".to_string(),
+            ));
+        }
+
+        if self.minimum_chunk_size == 0 {
+            return Err(ConfigError::Invalid(
+                "policy.entropy.minimum_chunk_size must be greater than zero".to_string(),
+            ));
+        }
+
+        Ok(())
+    }
+}
+
+impl Default for EntropyPolicyConfig {
+    fn default() -> Self {
+        Self {
+            mode: PolicyMode::Monitor,
+            threshold: default_entropy_threshold(),
+            minimum_chunk_size: default_entropy_minimum_chunk_size(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct SignaturePolicyConfig {
+    pub name: String,
+    pub pattern: String,
+    #[serde(default = "default_block_mode")]
+    pub mode: PolicyMode,
+}
+
+impl SignaturePolicyConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        if self.name.trim().is_empty() {
+            return Err(ConfigError::Invalid(
+                "policy.signatures name must not be empty".to_string(),
+            ));
+        }
+
+        if self.pattern.is_empty() {
+            return Err(ConfigError::Invalid(format!(
+                "policy.signatures '{}' pattern must not be empty",
+                self.name
+            )));
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PolicyMode {
+    Disabled,
+    Monitor,
+    Block,
+}
+
+impl PolicyMode {
+    pub fn is_enabled(self) -> bool {
+        self != Self::Disabled
+    }
+
+    pub fn is_blocking(self) -> bool {
+        self == Self::Block
     }
 }
 
@@ -228,4 +369,40 @@ fn default_management_port() -> u16 {
 
 fn default_backlog() -> i32 {
     4096
+}
+
+fn default_block_mode() -> PolicyMode {
+    PolicyMode::Block
+}
+
+fn default_monitor_mode() -> PolicyMode {
+    PolicyMode::Monitor
+}
+
+fn default_entropy_threshold() -> f64 {
+    7.90
+}
+
+fn default_entropy_minimum_chunk_size() -> usize {
+    8 * 1024
+}
+
+fn default_signatures() -> Vec<SignaturePolicyConfig> {
+    vec![
+        SignaturePolicyConfig {
+            name: "Axiom synthetic test marker".to_string(),
+            pattern: "AXIOM_TEST_THREAT".to_string(),
+            mode: PolicyMode::Block,
+        },
+        SignaturePolicyConfig {
+            name: "WannaCry marker WNCRY".to_string(),
+            pattern: "WNCRY".to_string(),
+            mode: PolicyMode::Block,
+        },
+        SignaturePolicyConfig {
+            name: "WannaCry marker WANACRY".to_string(),
+            pattern: "WANACRY!".to_string(),
+            mode: PolicyMode::Block,
+        },
+    ]
 }
