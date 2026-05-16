@@ -1,0 +1,17 @@
+[package]
+name = "axiom-daemon"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+axiom-config = { path = "../axiom-config" }
+axiom-core = { path = "../axiom-core" }
+axiom-net = { path = "../axiom-net" }
+axiom-web = { path = "../axiom-web" }
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
