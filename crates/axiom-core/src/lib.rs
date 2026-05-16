@@ -60,7 +60,21 @@ impl AppState {
         };
     }
 
+    pub fn record_inspection(&self, bytes: u64) {
+        self.counters
+            .inspected_chunks
+            .fetch_add(1, Ordering::Relaxed);
+        self.counters
+            .inspected_bytes
+            .fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    pub fn record_allowed_chunk(&self) {
+        self.counters.allowed_chunks.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn record_blocked_threat(&self, event: ThreatEvent) {
+        self.counters.blocked_chunks.fetch_add(1, Ordering::Relaxed);
         self.counters
             .blocked_threats
             .fetch_add(1, Ordering::Relaxed);
@@ -97,6 +111,10 @@ impl AppState {
                 .as_secs(),
             total_connections: self.counters.total_connections.load(Ordering::Relaxed),
             active_connections: self.counters.active_connections.load(Ordering::Relaxed),
+            inspected_chunks: self.counters.inspected_chunks.load(Ordering::Relaxed),
+            inspected_bytes: self.counters.inspected_bytes.load(Ordering::Relaxed),
+            allowed_chunks: self.counters.allowed_chunks.load(Ordering::Relaxed),
+            blocked_chunks: self.counters.blocked_chunks.load(Ordering::Relaxed),
             bytes_client_to_server: self.counters.bytes_client_to_server.load(Ordering::Relaxed),
             bytes_server_to_client: self.counters.bytes_server_to_client.load(Ordering::Relaxed),
             blocked_threats: self.counters.blocked_threats.load(Ordering::Relaxed),
@@ -117,6 +135,10 @@ pub type RuntimeState = AppState;
 struct TrafficCounters {
     total_connections: AtomicU64,
     active_connections: AtomicU64,
+    inspected_chunks: AtomicU64,
+    inspected_bytes: AtomicU64,
+    allowed_chunks: AtomicU64,
+    blocked_chunks: AtomicU64,
     bytes_client_to_server: AtomicU64,
     bytes_server_to_client: AtomicU64,
     blocked_threats: AtomicU64,
@@ -127,6 +149,10 @@ pub struct StatusSnapshot {
     pub uptime_seconds: u64,
     pub total_connections: u64,
     pub active_connections: u64,
+    pub inspected_chunks: u64,
+    pub inspected_bytes: u64,
+    pub allowed_chunks: u64,
+    pub blocked_chunks: u64,
     pub bytes_client_to_server: u64,
     pub bytes_server_to_client: u64,
     pub blocked_threats: u64,
@@ -181,14 +207,14 @@ impl ThreatEvent {
 
 #[derive(Debug, Clone)]
 pub struct StreamPolicy {
-    signatures: Vec<Vec<u8>>,
+    signatures: Vec<BlockedSignature>,
     entropy_block_threshold: f64,
     entropy_minimum_chunk_size: usize,
 }
 
 impl StreamPolicy {
     pub fn new(
-        signatures: Vec<Vec<u8>>,
+        signatures: Vec<BlockedSignature>,
         entropy_block_threshold: f64,
         entropy_minimum_chunk_size: usize,
     ) -> Self {
@@ -202,14 +228,17 @@ impl StreamPolicy {
     pub fn inspect_chunk(&self, context: &InspectionContext<'_>, chunk: &[u8]) -> InspectionResult {
         let entropy = calculate_shannon_entropy(chunk);
 
+        if let Some(reason) = detect_archive_policy_violation(chunk) {
+            return InspectionResult::Block {
+                event: ThreatEvent::now(context, reason, chunk.len(), entropy),
+            };
+        }
+
         if let Some(signature) = self.match_signature(chunk) {
             return InspectionResult::Block {
                 event: ThreatEvent::now(
                     context,
-                    format!(
-                        "blocked signature '{}'",
-                        String::from_utf8_lossy(signature).escape_default()
-                    ),
+                    format!("blocked signature '{}'", signature.name),
                     chunk.len(),
                     entropy,
                 ),
@@ -233,11 +262,21 @@ impl StreamPolicy {
         InspectionResult::Allow { entropy }
     }
 
-    fn match_signature<'a>(&'a self, chunk: &[u8]) -> Option<&'a [u8]> {
+    pub fn max_pattern_len(&self) -> usize {
+        let signature_len = self
+            .signatures
+            .iter()
+            .map(|signature| signature.pattern.len())
+            .max()
+            .unwrap_or(0);
+
+        signature_len.max(8)
+    }
+
+    fn match_signature<'a>(&'a self, chunk: &[u8]) -> Option<&'a BlockedSignature> {
         self.signatures
             .iter()
-            .find(|signature| contains_bytes(chunk, signature))
-            .map(Vec::as_slice)
+            .find(|signature| contains_bytes(chunk, signature.pattern))
     }
 }
 
@@ -245,13 +284,25 @@ impl Default for StreamPolicy {
     fn default() -> Self {
         Self::new(
             vec![
-                b"AXIOM_TEST_THREAT".to_vec(),
-                b"WNCRY".to_vec(),
-                b"WANACRY!".to_vec(),
+                BlockedSignature::new("Axiom synthetic test marker", b"AXIOM_TEST_THREAT"),
+                BlockedSignature::new("WannaCry marker WNCRY", b"WNCRY"),
+                BlockedSignature::new("WannaCry marker WANACRY", b"WANACRY!"),
             ],
-            7.98,
-            64 * 1024,
+            7.90,
+            8 * 1024,
         )
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct BlockedSignature {
+    name: &'static str,
+    pattern: &'static [u8],
+}
+
+impl BlockedSignature {
+    pub fn new(name: &'static str, pattern: &'static [u8]) -> Self {
+        Self { name, pattern }
     }
 }
 
@@ -302,6 +353,34 @@ fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
             .any(|window| window == needle)
 }
 
+fn detect_archive_policy_violation(chunk: &[u8]) -> Option<String> {
+    if contains_bytes(chunk, b"Rar!\x1A\x07\x00") {
+        return Some("RAR4 archive transfer blocked by Axiom lab archive policy".to_string());
+    }
+
+    if contains_bytes(chunk, b"Rar!\x1A\x07\x01\x00") {
+        return Some("RAR5 archive transfer blocked by Axiom lab archive policy".to_string());
+    }
+
+    if contains_bytes(chunk, b"7z\xBC\xAF\x27\x1C") {
+        return Some("7z archive transfer blocked by Axiom lab archive policy".to_string());
+    }
+
+    if contains_encrypted_zip_local_header(chunk) {
+        return Some("encrypted ZIP transfer blocked by Axiom archive policy".to_string());
+    }
+
+    None
+}
+
+fn contains_encrypted_zip_local_header(chunk: &[u8]) -> bool {
+    let signature = b"PK\x03\x04";
+
+    chunk.windows(8).any(|window| {
+        window.starts_with(signature) && u16::from_le_bytes([window[6], window[7]]) & 0x0001 != 0
+    })
+}
+
 fn looks_like_smb_negotiate_or_session_setup(chunk: &[u8]) -> bool {
     if chunk.len() < 8 {
         return false;
@@ -327,4 +406,54 @@ fn looks_like_smb_negotiate_or_session_setup(chunk: &[u8]) -> bool {
     let command = u16::from_le_bytes([command_bytes[0], command_bytes[1]]);
 
     command == 0 || command == 1
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    use super::*;
+
+    #[test]
+    fn blocks_rar5_archive_marker_inside_smb_payload() {
+        let policy = StreamPolicy::default();
+        let context = test_context();
+        let chunk = b"\x00\x00\x00\x40\xfeSMBmetadata-padding-Rar!\x1A\x07\x01\x00payload";
+
+        let result = policy.inspect_chunk(&context, chunk);
+
+        assert!(matches!(result, InspectionResult::Block { .. }));
+    }
+
+    #[test]
+    fn blocks_encrypted_zip_local_header() {
+        let policy = StreamPolicy::default();
+        let context = test_context();
+        let chunk = b"prefixPK\x03\x04\x14\x00\x01\x00encrypted";
+
+        let result = policy.inspect_chunk(&context, chunk);
+
+        assert!(matches!(result, InspectionResult::Block { .. }));
+    }
+
+    #[test]
+    fn allows_plain_text_chunk() {
+        let policy = StreamPolicy::default();
+        let context = test_context();
+        let chunk = b"normal business text document body";
+
+        let result = policy.inspect_chunk(&context, chunk);
+
+        assert!(matches!(result, InspectionResult::Allow { .. }));
+    }
+
+    fn test_context() -> InspectionContext<'static> {
+        InspectionContext {
+            route_name: "test-route",
+            interface: "lo",
+            direction: TrafficDirection::ClientToServer,
+            peer_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 49152),
+            target_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 445),
+        }
+    }
 }

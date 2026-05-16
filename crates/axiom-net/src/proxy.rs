@@ -146,6 +146,7 @@ where
     W: AsyncWrite + Unpin,
 {
     let mut buffer = vec![0_u8; 64 * 1024];
+    let mut inspection_window = InspectionWindow::new(state.policy().max_pattern_len());
 
     loop {
         let bytes_read = reader.read(&mut buffer).await?;
@@ -154,6 +155,8 @@ where
             return Ok(());
         }
 
+        state.record_inspection(bytes_read as u64);
+        let inspection_bytes = inspection_window.merge(&buffer[..bytes_read]);
         let context = InspectionContext {
             route_name: &route.name,
             interface: route.interface(),
@@ -162,10 +165,7 @@ where
             target_addr,
         };
 
-        match state
-            .policy()
-            .inspect_chunk(&context, &buffer[..bytes_read])
-        {
+        match state.policy().inspect_chunk(&context, &inspection_bytes) {
             InspectionResult::Allow { entropy } => {
                 debug!(
                     route = route.name,
@@ -175,6 +175,8 @@ where
                     "forwarding inspected SMB chunk"
                 );
                 writer.write_all(&buffer[..bytes_read]).await?;
+                inspection_window.remember(&buffer[..bytes_read]);
+                state.record_allowed_chunk();
                 state.record_bytes(direction, bytes_read as u64);
             }
             InspectionResult::Block { event } => {
@@ -215,5 +217,42 @@ impl ConnectionGuard {
 impl Drop for ConnectionGuard {
     fn drop(&mut self) {
         self.state.connection_finished();
+    }
+}
+
+struct InspectionWindow {
+    tail: Vec<u8>,
+    max_tail_len: usize,
+}
+
+impl InspectionWindow {
+    fn new(max_pattern_len: usize) -> Self {
+        Self {
+            tail: Vec::new(),
+            max_tail_len: max_pattern_len.saturating_sub(1),
+        }
+    }
+
+    fn merge(&self, chunk: &[u8]) -> Vec<u8> {
+        if self.tail.is_empty() {
+            return chunk.to_vec();
+        }
+
+        let mut merged = Vec::with_capacity(self.tail.len() + chunk.len());
+        merged.extend_from_slice(&self.tail);
+        merged.extend_from_slice(chunk);
+        merged
+    }
+
+    fn remember(&mut self, chunk: &[u8]) {
+        if self.max_tail_len == 0 {
+            self.tail.clear();
+            return;
+        }
+
+        let retained = chunk.len().min(self.max_tail_len);
+        self.tail.clear();
+        self.tail
+            .extend_from_slice(&chunk[chunk.len().saturating_sub(retained)..]);
     }
 }

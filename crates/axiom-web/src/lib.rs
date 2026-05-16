@@ -425,7 +425,7 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
   </header>
 
   <main class="mx-auto max-w-7xl px-6 py-8">
-    <section class="grid gap-5 md:grid-cols-3">
+    <section class="grid gap-5 md:grid-cols-4">
       <article class="rounded-lg border border-zinc-800 bg-zinc-900 p-6">
         <p class="text-sm text-zinc-400">Total Bytes Transferred</p>
         <p id="total-bytes" class="mt-4 text-4xl font-semibold text-white">0 B</p>
@@ -437,6 +437,10 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
       <article class="rounded-lg border border-zinc-800 bg-zinc-900 p-6">
         <p class="text-sm text-zinc-400">Blocked Threats</p>
         <p id="blocked-threats" class="mt-4 text-4xl font-semibold text-red-300">0</p>
+      </article>
+      <article class="rounded-lg border border-zinc-800 bg-zinc-900 p-6">
+        <p class="text-sm text-zinc-400">Inspected Chunks</p>
+        <p id="inspected-chunks" class="mt-4 text-4xl font-semibold text-emerald-200">0</p>
       </article>
     </section>
 
@@ -509,6 +513,7 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
       document.getElementById("total-bytes").textContent = formatBytes(totalBytes);
       document.getElementById("active-connections").textContent = stats.active_connections;
       document.getElementById("blocked-threats").textContent = stats.blocked_threats;
+      document.getElementById("inspected-chunks").textContent = stats.inspected_chunks;
       document.getElementById("management-info").textContent = `${data.management_interface} at ${data.management_bind_addr}`;
       document.getElementById("refresh-state").textContent = `Updated ${new Date().toLocaleTimeString()}`;
 
