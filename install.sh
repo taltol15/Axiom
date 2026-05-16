@@ -458,6 +458,9 @@ write_config() {
     echo "username = \"$(toml_escape "${ADMIN_USERNAME}")\""
     echo "password_hash = \"$(toml_escape "${ADMIN_PASSWORD_HASH}")\""
     echo
+    echo "[policy.smb]"
+    echo "encrypted_payload = \"monitor\""
+    echo
     echo "[policy.archive]"
     echo "rar = \"block\""
     echo "seven_zip = \"block\""

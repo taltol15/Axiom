@@ -279,6 +279,10 @@ impl StreamPolicy {
     pub fn inspect_chunk(&self, context: &InspectionContext<'_>, chunk: &[u8]) -> InspectionResult {
         let entropy = calculate_shannon_entropy(chunk);
 
+        if let Some(detection) = self.detect_smb_policy_violation(chunk) {
+            return detection.into_result(context, chunk.len(), entropy);
+        }
+
         if let Some(detection) = self.detect_archive_policy_violation(chunk) {
             return detection.into_result(context, chunk.len(), entropy);
         }
@@ -320,6 +324,21 @@ impl StreamPolicy {
             .unwrap_or(0);
 
         signature_len.max(ARCHIVE_MAX_PATTERN_LEN)
+    }
+
+    fn detect_smb_policy_violation(&self, chunk: &[u8]) -> Option<PolicyDetection> {
+        if contains_smb_encrypted_transform_header(chunk)
+            && self.config.smb.encrypted_payload.is_enabled()
+        {
+            return Some(PolicyDetection {
+                action: self.config.smb.encrypted_payload,
+                rule_name: "SMB encrypted payload".to_string(),
+                reason: "SMB3 encrypted payload detected; file content cannot be inspected"
+                    .to_string(),
+            });
+        }
+
+        None
     }
 
     fn match_signature<'a>(&'a self, chunk: &[u8]) -> Option<&'a RuntimeSignature> {
@@ -485,6 +504,10 @@ fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
             .any(|window| window == needle)
 }
 
+fn contains_smb_encrypted_transform_header(chunk: &[u8]) -> bool {
+    contains_bytes(chunk, b"\xFDSMB")
+}
+
 fn encrypted_zip_mode(chunk: &[u8], mode: PolicyMode) -> Option<PolicyMode> {
     let signature = b"PK\x03\x04";
 
@@ -528,7 +551,7 @@ fn looks_like_smb_negotiate_or_session_setup(chunk: &[u8]) -> bool {
 mod tests {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
-    use axiom_config::{ArchivePolicyConfig, EntropyPolicyConfig};
+    use axiom_config::{ArchivePolicyConfig, EntropyPolicyConfig, SmbPolicyConfig};
 
     use super::*;
 
@@ -566,8 +589,22 @@ mod tests {
     }
 
     #[test]
+    fn monitors_smb_encrypted_payload_by_default() {
+        let policy = StreamPolicy::default();
+        let context = test_context();
+        let chunk = b"\x00\x00\x00\x80\xfdSMB encrypted transform payload";
+
+        let result = policy.inspect_chunk(&context, chunk);
+
+        assert!(matches!(result, InspectionResult::Monitor { .. }));
+    }
+
+    #[test]
     fn disabled_archive_policy_allows_rar() {
         let policy = StreamPolicy::from_config(PolicyConfig {
+            smb: SmbPolicyConfig {
+                encrypted_payload: PolicyMode::Disabled,
+            },
             archive: ArchivePolicyConfig {
                 rar: PolicyMode::Disabled,
                 seven_zip: PolicyMode::Disabled,

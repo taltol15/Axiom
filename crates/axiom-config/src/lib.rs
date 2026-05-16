@@ -74,6 +74,8 @@ impl AxiomConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct PolicyConfig {
     #[serde(default)]
+    pub smb: SmbPolicyConfig,
+    #[serde(default)]
     pub archive: ArchivePolicyConfig,
     #[serde(default)]
     pub entropy: EntropyPolicyConfig,
@@ -96,9 +98,24 @@ impl PolicyConfig {
 impl Default for PolicyConfig {
     fn default() -> Self {
         Self {
+            smb: SmbPolicyConfig::default(),
             archive: ArchivePolicyConfig::default(),
             entropy: EntropyPolicyConfig::default(),
             signatures: default_signatures(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct SmbPolicyConfig {
+    #[serde(default = "default_monitor_mode")]
+    pub encrypted_payload: PolicyMode,
+}
+
+impl Default for SmbPolicyConfig {
+    fn default() -> Self {
+        Self {
+            encrypted_payload: PolicyMode::Monitor,
         }
     }
 }

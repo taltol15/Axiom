@@ -565,6 +565,17 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
 
       <div class="grid gap-6 p-6 lg:grid-cols-[1fr_1fr]">
         <div>
+          <h3 class="text-sm font-semibold uppercase tracking-wider text-zinc-400">SMB Transport Rules</h3>
+          <div class="mt-4">
+            <label class="block">
+              <span class="text-sm text-zinc-300">SMB Encrypted Payload</span>
+              <select id="policy-smb-encrypted-payload" class="mt-2 w-full rounded-md border border-zinc-700 bg-zinc-950 px-3 py-2 text-white"></select>
+            </label>
+            <p class="mt-2 text-xs leading-5 text-zinc-500">When SMB encryption is active, file bytes are not visible to archive or signature rules.</p>
+          </div>
+        </div>
+
+        <div>
           <h3 class="text-sm font-semibold uppercase tracking-wider text-zinc-400">Archive Rules</h3>
           <div class="mt-4 grid gap-4 sm:grid-cols-2">
             <label class="block">
@@ -733,6 +744,7 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
       }
 
       const policy = await response.json();
+      fillModeSelect("policy-smb-encrypted-payload", policy.smb.encrypted_payload);
       fillModeSelect("policy-rar", policy.archive.rar);
       fillModeSelect("policy-seven-zip", policy.archive.seven_zip);
       fillModeSelect("policy-zip", policy.archive.zip);
@@ -762,6 +774,9 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
         .filter((signature) => signature.name && signature.pattern);
 
       return {
+        smb: {
+          encrypted_payload: document.getElementById("policy-smb-encrypted-payload").value
+        },
         archive: {
           rar: document.getElementById("policy-rar").value,
           seven_zip: document.getElementById("policy-seven-zip").value,
