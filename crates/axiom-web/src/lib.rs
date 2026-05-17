@@ -300,6 +300,12 @@ fn build_diagnostics_response(state: &WebState) -> DiagnosticsResponse {
             run_diagnostic_command("ss", &["-tnp"]),
             run_diagnostic_command("ip", &["-br", "addr"]),
             run_diagnostic_command("ip", &["route"]),
+            run_diagnostic_command("ip", &["rule"]),
+            run_diagnostic_command("nft", &["list", "ruleset"]),
+            run_diagnostic_command("iptables-save", &[]),
+            run_diagnostic_command("sysctl", &["net.ipv4.ip_forward"]),
+            run_diagnostic_command("sysctl", &["net.ipv4.conf.all.forwarding"]),
+            run_diagnostic_command("sysctl", &["net.ipv4.conf.all.route_localnet"]),
         ],
         proc_self_status: fs::read_to_string("/proc/self/status").ok(),
     }

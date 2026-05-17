@@ -59,6 +59,7 @@ install_missing_dependencies() {
     ["systemctl"]="systemd"
     ["setcap"]="libcap2-bin"
     ["sha256sum"]="coreutils"
+    ["sysctl"]="procps"
     ["curl"]="curl"
     ["tar"]="tar"
     ["gzip"]="gzip"
@@ -86,7 +87,7 @@ install_missing_dependencies() {
     build-essential \
     pkg-config
 
-  for command_name in ip systemctl setcap sha256sum curl tar gzip; do
+  for command_name in ip systemctl setcap sha256sum sysctl curl tar gzip; do
     if ! command -v "${command_name}" >/dev/null 2>&1; then
       echo "Required command '${command_name}' is still unavailable after dependency installation." >&2
       exit 1
@@ -402,6 +403,7 @@ collect_configuration() {
     echo
     echo "Configure proxy interface: ${proxy_interface}"
     local vlan
+    local discovered_proxy_ip
     local listen_ip
     local listen_port
     local target_ip
@@ -409,7 +411,11 @@ collect_configuration() {
     local route_name
 
     vlan="$(prompt_optional_vlan "Client VLAN ID for ${proxy_interface}")"
-    listen_ip="$(prompt_ipv4 "SMB listen IPv4 for ${proxy_interface}" "${LISTEN_DEFAULT_IP}")"
+    discovered_proxy_ip="$(get_interface_ipv4 "${proxy_interface}")"
+    if [[ -z "${discovered_proxy_ip}" ]]; then
+      discovered_proxy_ip="${LISTEN_DEFAULT_IP}"
+    fi
+    listen_ip="$(prompt_ipv4 "SMB listen IPv4 for ${proxy_interface}" "${discovered_proxy_ip}")"
     listen_port="$(prompt_port "SMB listen TCP port for ${proxy_interface}" "${SMB_DEFAULT_PORT}")"
     target_ip="$(prompt_ipv4 "Target File Server IPv4 protected by ${proxy_interface}")"
     target_port="$(prompt_port "Target File Server TCP port" "${SMB_DEFAULT_PORT}")"
@@ -517,6 +523,57 @@ build_and_install_binary() {
   ${SUDO} setcap 'cap_net_bind_service,cap_net_raw+ep' "${BINARY_PATH}"
 }
 
+warn_if_smb_nat_rules_exist() {
+  local nft_matches=""
+  local iptables_matches=""
+
+  if command -v nft >/dev/null 2>&1; then
+    nft_matches="$(${SUDO} nft list ruleset 2>/dev/null | grep -Ei 'tcp dport (445|microsoft-ds)|dport 445|:445' || true)"
+  fi
+
+  if command -v iptables-save >/dev/null 2>&1; then
+    iptables_matches="$(${SUDO} iptables-save 2>/dev/null | grep -Ei -- '--dport 445|dpt:445|:445' || true)"
+  fi
+
+  if [[ -n "${nft_matches}${iptables_matches}" ]]; then
+    echo
+    echo "WARNING: Existing firewall/NAT rules reference TCP 445."
+    echo "Axiom is a user-space reverse proxy. DNAT/REDIRECT/FORWARD rules for SMB can bypass inspection."
+    echo "Review these rules if dashboard counters stay at zero after a client connects:"
+    if [[ -n "${nft_matches}" ]]; then
+      echo
+      echo "nft matches:"
+      echo "${nft_matches}"
+    fi
+    if [[ -n "${iptables_matches}" ]]; then
+      echo
+      echo "iptables matches:"
+      echo "${iptables_matches}"
+    fi
+  fi
+}
+
+configure_reverse_proxy_network_mode() {
+  local temp_sysctl
+  temp_sysctl="$(mktemp)"
+
+  cat > "${temp_sysctl}" <<EOF
+# Managed by Axiom installer.
+# Axiom is a user-space SMB reverse proxy, not a Linux L3 forwarding gateway.
+net.ipv4.ip_forward = 0
+net.ipv4.conf.all.forwarding = 0
+net.ipv4.conf.default.forwarding = 0
+EOF
+
+  ${SUDO} install -m 0644 -o root -g root "${temp_sysctl}" /etc/sysctl.d/99-axiom-reverse-proxy.conf
+  rm -f "${temp_sysctl}"
+
+  echo
+  echo "Disabling kernel IPv4 forwarding so SMB traffic cannot bypass Axiom inspection."
+  ${SUDO} sysctl -q -p /etc/sysctl.d/99-axiom-reverse-proxy.conf
+  warn_if_smb_nat_rules_exist
+}
+
 write_systemd_service() {
   local temp_service
   temp_service="$(mktemp)"
@@ -543,7 +600,7 @@ PrivateTmp=true
 ProtectHome=true
 ProtectSystem=strict
 ReadWritePaths=/etc/axiom /var/lib/axiom /var/log/axiom
-RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
 
 [Install]
 WantedBy=multi-user.target
@@ -583,6 +640,7 @@ main() {
   ensure_service_user
   write_config
   build_and_install_binary
+  configure_reverse_proxy_network_mode
   write_systemd_service
   enable_and_start_service
   print_summary
