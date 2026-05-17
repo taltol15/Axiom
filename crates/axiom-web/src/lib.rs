@@ -250,6 +250,8 @@ async fn api_logout() -> Response {
 fn build_status_response(state: &WebState) -> StatusResponse {
     let config = state.config.lock().expect("web config mutex poisoned");
     StatusResponse {
+        process_id: std::process::id(),
+        config_path: state.config_path.display().to_string(),
         management_interface: config.management.interface.clone(),
         management_bind_addr: config.management.listen_addr().to_string(),
         configured_proxy_listeners: config.proxy_listeners.len(),
@@ -377,6 +379,8 @@ fn unix_timestamp_seconds() -> u64 {
 
 #[derive(Debug, Serialize)]
 struct StatusResponse {
+    process_id: u32,
+    config_path: String,
     management_interface: String,
     management_bind_addr: String,
     configured_proxy_listeners: usize,
@@ -640,6 +644,9 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
               <th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-zinc-400">VLAN</th>
               <th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-zinc-400">Listen</th>
               <th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-zinc-400">Target File Server</th>
+              <th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-zinc-400">Connections</th>
+              <th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-zinc-400">Inspected</th>
+              <th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-zinc-400">Route Bytes</th>
             </tr>
           </thead>
           <tbody id="mapping-body" class="divide-y divide-zinc-800"></tbody>
@@ -699,17 +706,27 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
       document.getElementById("monitored-threats").textContent = stats.monitored_threats;
       document.getElementById("inspected-chunks").textContent = stats.inspected_chunks;
       document.getElementById("management-info").textContent = `${data.management_interface} at ${data.management_bind_addr}`;
-      document.getElementById("refresh-state").textContent = `Updated ${new Date().toLocaleTimeString()}`;
+      document.getElementById("refresh-state").textContent = `PID ${data.process_id} · ${data.config_path} · updated ${new Date().toLocaleTimeString()}`;
 
       const mappingBody = document.getElementById("mapping-body");
+      const routeStats = new Map((stats.route_stats || []).map((route) => [route.route_name, route]));
       mappingBody.innerHTML = data.proxy_listeners.map((route) => `
+        ${(() => {
+          const runtime = routeStats.get(route.name) || {};
+          const routeBytes = Number(runtime.bytes_client_to_server || 0) + Number(runtime.bytes_server_to_client || 0);
+          return `
         <tr class="hover:bg-zinc-800/40">
           <td class="whitespace-nowrap px-6 py-4 text-sm font-medium text-white">${text(route.name)}</td>
           <td class="whitespace-nowrap px-6 py-4 text-sm text-emerald-200">${text(route.source_interface)}</td>
           <td class="whitespace-nowrap px-6 py-4 text-sm text-zinc-300">${text(route.client_vlan)}</td>
           <td class="whitespace-nowrap px-6 py-4 text-sm text-zinc-300">${text(route.listen_addr)}</td>
           <td class="whitespace-nowrap px-6 py-4 text-sm text-cyan-200">${text(route.target_file_server_addr)}</td>
+          <td class="whitespace-nowrap px-6 py-4 text-sm text-zinc-300">${text(runtime.active_connections || 0)} active / ${text(runtime.total_connections || 0)} total</td>
+          <td class="whitespace-nowrap px-6 py-4 text-sm text-zinc-300">${text(runtime.inspected_chunks || 0)} chunks</td>
+          <td class="whitespace-nowrap px-6 py-4 text-sm text-zinc-300">${formatBytes(routeBytes)}</td>
         </tr>
+          `;
+        })()}
       `).join("");
 
       const threats = document.getElementById("threats");

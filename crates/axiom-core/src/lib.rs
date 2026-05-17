@@ -1,5 +1,5 @@
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     net::SocketAddr,
     sync::{
         Mutex, RwLock,
@@ -19,6 +19,7 @@ pub struct AppState {
     started_at: SystemTime,
     counters: TrafficCounters,
     policy: RwLock<StreamPolicy>,
+    route_stats: Mutex<HashMap<String, RouteRuntimeStats>>,
     recent_threats: Mutex<VecDeque<ThreatEvent>>,
 }
 
@@ -28,8 +29,36 @@ impl AppState {
             started_at: SystemTime::now(),
             counters: TrafficCounters::default(),
             policy: RwLock::new(policy),
+            route_stats: Mutex::new(HashMap::new()),
             recent_threats: Mutex::new(VecDeque::with_capacity(MAX_RETAINED_THREAT_EVENTS)),
         }
+    }
+
+    pub fn register_route(
+        &self,
+        route_name: &str,
+        interface: &str,
+        listen_addr: SocketAddr,
+        target_addr: SocketAddr,
+    ) {
+        let mut route_stats = self.route_stats.lock().expect("route stats mutex poisoned");
+        route_stats
+            .entry(route_name.to_string())
+            .and_modify(|route| {
+                route.interface = interface.to_string();
+                route.listen_addr = listen_addr.to_string();
+                route.target_addr = target_addr.to_string();
+                route.listener_ready = true;
+                route.last_activity_unix_timestamp_seconds = Some(unix_timestamp_seconds());
+            })
+            .or_insert_with(|| RouteRuntimeStats {
+                route_name: route_name.to_string(),
+                interface: interface.to_string(),
+                listen_addr: listen_addr.to_string(),
+                target_addr: target_addr.to_string(),
+                listener_ready: true,
+                ..RouteRuntimeStats::default()
+            });
     }
 
     pub fn connection_started(&self) {
@@ -41,12 +70,26 @@ impl AppState {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    pub fn route_connection_started(&self, route_name: &str, peer_addr: SocketAddr) {
+        self.with_route_stats(route_name, |route| {
+            route.total_connections += 1;
+            route.active_connections += 1;
+            route.last_peer_addr = Some(peer_addr.to_string());
+        });
+    }
+
     pub fn connection_finished(&self) {
         let _ = self.counters.active_connections.fetch_update(
             Ordering::Relaxed,
             Ordering::Relaxed,
             |value| Some(value.saturating_sub(1)),
         );
+    }
+
+    pub fn route_connection_finished(&self, route_name: &str) {
+        self.with_route_stats(route_name, |route| {
+            route.active_connections = route.active_connections.saturating_sub(1);
+        });
     }
 
     pub fn record_bytes(&self, direction: TrafficDirection, bytes: u64) {
@@ -62,6 +105,13 @@ impl AppState {
         };
     }
 
+    pub fn record_route_bytes(&self, route_name: &str, direction: TrafficDirection, bytes: u64) {
+        self.with_route_stats(route_name, |route| match direction {
+            TrafficDirection::ClientToServer => route.bytes_client_to_server += bytes,
+            TrafficDirection::ServerToClient => route.bytes_server_to_client += bytes,
+        });
+    }
+
     pub fn record_inspection(&self, bytes: u64) {
         self.counters
             .inspected_chunks
@@ -69,6 +119,13 @@ impl AppState {
         self.counters
             .inspected_bytes
             .fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    pub fn record_route_inspection(&self, route_name: &str, bytes: u64) {
+        self.with_route_stats(route_name, |route| {
+            route.inspected_chunks += 1;
+            route.inspected_bytes += bytes;
+        });
     }
 
     pub fn record_allowed_chunk(&self) {
@@ -82,6 +139,9 @@ impl AppState {
         self.counters
             .monitored_threats
             .fetch_add(1, Ordering::Relaxed);
+        self.with_route_stats(&event.route_name, |route| {
+            route.monitored_events += 1;
+        });
         self.push_recent_event(event);
     }
 
@@ -90,6 +150,9 @@ impl AppState {
         self.counters
             .blocked_threats
             .fetch_add(1, Ordering::Relaxed);
+        self.with_route_stats(&event.route_name, |route| {
+            route.blocked_events += 1;
+        });
         self.push_recent_event(event);
     }
 
@@ -146,6 +209,7 @@ impl AppState {
             bytes_server_to_client: self.counters.bytes_server_to_client.load(Ordering::Relaxed),
             monitored_threats: self.counters.monitored_threats.load(Ordering::Relaxed),
             blocked_threats: self.counters.blocked_threats.load(Ordering::Relaxed),
+            route_stats: self.route_snapshots(),
             recent_threats,
         }
     }
@@ -160,6 +224,32 @@ impl AppState {
             recent_threats.pop_front();
         }
         recent_threats.push_back(event);
+    }
+
+    fn with_route_stats(&self, route_name: &str, update: impl FnOnce(&mut RouteRuntimeStats)) {
+        let mut route_stats = self.route_stats.lock().expect("route stats mutex poisoned");
+        let route = route_stats
+            .entry(route_name.to_string())
+            .or_insert_with(|| RouteRuntimeStats {
+                route_name: route_name.to_string(),
+                ..RouteRuntimeStats::default()
+            });
+
+        update(route);
+        route.last_activity_unix_timestamp_seconds = Some(unix_timestamp_seconds());
+    }
+
+    fn route_snapshots(&self) -> Vec<RouteStatsSnapshot> {
+        let mut snapshots: Vec<_> = self
+            .route_stats
+            .lock()
+            .expect("route stats mutex poisoned")
+            .values()
+            .map(RouteStatsSnapshot::from)
+            .collect();
+
+        snapshots.sort_by(|left, right| left.route_name.cmp(&right.route_name));
+        snapshots
     }
 }
 
@@ -200,7 +290,68 @@ pub struct StatusSnapshot {
     pub bytes_server_to_client: u64,
     pub monitored_threats: u64,
     pub blocked_threats: u64,
+    pub route_stats: Vec<RouteStatsSnapshot>,
     pub recent_threats: Vec<ThreatEvent>,
+}
+
+#[derive(Debug, Default)]
+struct RouteRuntimeStats {
+    route_name: String,
+    interface: String,
+    listen_addr: String,
+    target_addr: String,
+    listener_ready: bool,
+    total_connections: u64,
+    active_connections: u64,
+    inspected_chunks: u64,
+    inspected_bytes: u64,
+    bytes_client_to_server: u64,
+    bytes_server_to_client: u64,
+    monitored_events: u64,
+    blocked_events: u64,
+    last_peer_addr: Option<String>,
+    last_activity_unix_timestamp_seconds: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RouteStatsSnapshot {
+    pub route_name: String,
+    pub interface: String,
+    pub listen_addr: String,
+    pub target_addr: String,
+    pub listener_ready: bool,
+    pub total_connections: u64,
+    pub active_connections: u64,
+    pub inspected_chunks: u64,
+    pub inspected_bytes: u64,
+    pub bytes_client_to_server: u64,
+    pub bytes_server_to_client: u64,
+    pub monitored_events: u64,
+    pub blocked_events: u64,
+    pub last_peer_addr: Option<String>,
+    pub last_activity_unix_timestamp_seconds: Option<u64>,
+}
+
+impl From<&RouteRuntimeStats> for RouteStatsSnapshot {
+    fn from(value: &RouteRuntimeStats) -> Self {
+        Self {
+            route_name: value.route_name.clone(),
+            interface: value.interface.clone(),
+            listen_addr: value.listen_addr.clone(),
+            target_addr: value.target_addr.clone(),
+            listener_ready: value.listener_ready,
+            total_connections: value.total_connections,
+            active_connections: value.active_connections,
+            inspected_chunks: value.inspected_chunks,
+            inspected_bytes: value.inspected_bytes,
+            bytes_client_to_server: value.bytes_client_to_server,
+            bytes_server_to_client: value.bytes_server_to_client,
+            monitored_events: value.monitored_events,
+            blocked_events: value.blocked_events,
+            last_peer_addr: value.last_peer_addr.clone(),
+            last_activity_unix_timestamp_seconds: value.last_activity_unix_timestamp_seconds,
+        }
+    }
 }
 
 pub type TrafficSnapshot = StatusSnapshot;
@@ -506,6 +657,13 @@ fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
 
 fn contains_smb_encrypted_transform_header(chunk: &[u8]) -> bool {
     contains_bytes(chunk, b"\xFDSMB")
+}
+
+fn unix_timestamp_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_else(|_| Duration::from_secs(0))
+        .as_secs()
 }
 
 fn encrypted_zip_mode(chunk: &[u8], mode: PolicyMode) -> Option<PolicyMode> {

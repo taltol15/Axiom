@@ -37,6 +37,12 @@ pub async fn run_proxy_listener(
         vlan = ?route.client_vlan,
         "SMB proxy listener started"
     );
+    state.register_route(
+        &route.name,
+        route.interface(),
+        route.listen_addr(),
+        route.target_addr(),
+    );
 
     loop {
         let (client_stream, peer_addr) = listener.accept().await.with_context(|| {
@@ -48,7 +54,8 @@ pub async fn run_proxy_listener(
         })?;
 
         state.connection_started();
-        let guard = ConnectionGuard::new(Arc::clone(&state));
+        state.route_connection_started(&route.name, peer_addr);
+        let guard = ConnectionGuard::new(Arc::clone(&state), route.name.clone());
         let route = Arc::new(route.clone());
         let task_state = Arc::clone(&state);
 
@@ -156,6 +163,7 @@ where
         }
 
         state.record_inspection(bytes_read as u64);
+        state.record_route_inspection(&route.name, bytes_read as u64);
         let inspection_bytes = inspection_window.merge(&buffer[..bytes_read]);
         let context = InspectionContext {
             route_name: &route.name,
@@ -178,6 +186,7 @@ where
                 inspection_window.remember(&buffer[..bytes_read]);
                 state.record_allowed_chunk();
                 state.record_bytes(direction, bytes_read as u64);
+                state.record_route_bytes(&route.name, direction, bytes_read as u64);
             }
             InspectionResult::Monitor { event } => {
                 let reason = event.reason.clone();
@@ -195,6 +204,7 @@ where
                 inspection_window.remember(&buffer[..bytes_read]);
                 state.record_allowed_chunk();
                 state.record_bytes(direction, bytes_read as u64);
+                state.record_route_bytes(&route.name, direction, bytes_read as u64);
             }
             InspectionResult::Block { event } => {
                 let reason = event.reason.clone();
@@ -223,17 +233,19 @@ fn record_blocked_event(state: &RuntimeState, event: ThreatEvent) {
 
 struct ConnectionGuard {
     state: Arc<RuntimeState>,
+    route_name: String,
 }
 
 impl ConnectionGuard {
-    fn new(state: Arc<RuntimeState>) -> Self {
-        Self { state }
+    fn new(state: Arc<RuntimeState>, route_name: String) -> Self {
+        Self { state, route_name }
     }
 }
 
 impl Drop for ConnectionGuard {
     fn drop(&mut self) {
         self.state.connection_finished();
+        self.state.route_connection_finished(&self.route_name);
     }
 }
 
