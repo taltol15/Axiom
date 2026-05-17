@@ -4,7 +4,7 @@ use anyhow::Context;
 use axiom_config::ProxyListenerConfig;
 use axiom_core::{
     InspectionContext, InspectionResult, RuntimeState, ThreatEvent, TrafficDirection,
-    extract_smb_file_paths,
+    contains_smb2_server_side_copy_request, extract_smb_file_paths, extract_smb2_write_lengths,
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
@@ -180,6 +180,7 @@ where
 
         state.record_inspection(bytes_read as u64);
         state.record_route_inspection(&route.name, bytes_read as u64);
+        state.record_stream_bytes(&route.name, direction, bytes_read as u64);
         let inspection_bytes = inspection_window.merge(&buffer[..bytes_read]);
         let context = InspectionContext {
             route_name: &route.name,
@@ -194,6 +195,12 @@ where
                 if observed_files.insert(file_path.clone()) {
                     state.record_file_observed(&context, file_path, bytes_read as u64);
                 }
+            }
+            for write_length in extract_smb2_write_lengths(&inspection_bytes) {
+                state.record_smb_write_payload(&route.name, write_length as u64);
+            }
+            if contains_smb2_server_side_copy_request(&inspection_bytes) {
+                state.record_server_side_copy_requested(&context);
             }
         }
 

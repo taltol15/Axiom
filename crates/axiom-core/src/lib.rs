@@ -142,6 +142,24 @@ impl AppState {
         };
     }
 
+    pub fn record_stream_bytes(&self, route_name: &str, direction: TrafficDirection, bytes: u64) {
+        match direction {
+            TrafficDirection::ClientToServer => self
+                .counters
+                .stream_bytes_client_to_server
+                .fetch_add(bytes, Ordering::Relaxed),
+            TrafficDirection::ServerToClient => self
+                .counters
+                .stream_bytes_server_to_client
+                .fetch_add(bytes, Ordering::Relaxed),
+        };
+
+        self.with_route_stats(route_name, |route| match direction {
+            TrafficDirection::ClientToServer => route.stream_bytes_client_to_server += bytes,
+            TrafficDirection::ServerToClient => route.stream_bytes_server_to_client += bytes,
+        });
+    }
+
     pub fn record_route_bytes(&self, route_name: &str, direction: TrafficDirection, bytes: u64) {
         self.with_route_stats(route_name, |route| match direction {
             TrafficDirection::ClientToServer => route.bytes_client_to_server += bytes,
@@ -187,6 +205,35 @@ impl AppState {
             "SMB file open/create observed".to_string(),
             Some(bytes_in_chunk),
             None,
+        ));
+    }
+
+    pub fn record_smb_write_payload(&self, route_name: &str, bytes: u64) {
+        self.counters
+            .smb_write_requests
+            .fetch_add(1, Ordering::Relaxed);
+        self.counters
+            .smb_write_bytes
+            .fetch_add(bytes, Ordering::Relaxed);
+        self.with_route_stats(route_name, |route| {
+            route.smb_write_requests += 1;
+            route.smb_write_bytes += bytes;
+        });
+    }
+
+    pub fn record_server_side_copy_requested(&self, context: &InspectionContext<'_>) {
+        self.counters
+            .server_side_copy_requests
+            .fetch_add(1, Ordering::Relaxed);
+        self.push_audit_event(AuditEvent::from_context(
+            context,
+            AuditEventKind::ServerSideCopyRequested,
+            AuditSeverity::Warning,
+            None,
+            "observe".to_string(),
+            "SMB server-side copy request observed; file bytes may not cross the proxy".to_string(),
+            None,
+            Some("SMB2 IOCTL copychunk".to_string()),
         ));
     }
 
@@ -306,8 +353,22 @@ impl AppState {
             blocked_chunks: self.counters.blocked_chunks.load(Ordering::Relaxed),
             observed_file_events: self.counters.observed_file_events.load(Ordering::Relaxed),
             audit_events: self.counters.audit_events.load(Ordering::Relaxed),
+            stream_bytes_client_to_server: self
+                .counters
+                .stream_bytes_client_to_server
+                .load(Ordering::Relaxed),
+            stream_bytes_server_to_client: self
+                .counters
+                .stream_bytes_server_to_client
+                .load(Ordering::Relaxed),
             bytes_client_to_server: self.counters.bytes_client_to_server.load(Ordering::Relaxed),
             bytes_server_to_client: self.counters.bytes_server_to_client.load(Ordering::Relaxed),
+            smb_write_requests: self.counters.smb_write_requests.load(Ordering::Relaxed),
+            smb_write_bytes: self.counters.smb_write_bytes.load(Ordering::Relaxed),
+            server_side_copy_requests: self
+                .counters
+                .server_side_copy_requests
+                .load(Ordering::Relaxed),
             monitored_threats: self.counters.monitored_threats.load(Ordering::Relaxed),
             blocked_threats: self.counters.blocked_threats.load(Ordering::Relaxed),
             policy_runtime: self.policy_runtime_snapshot(),
@@ -391,8 +452,13 @@ struct TrafficCounters {
     blocked_chunks: AtomicU64,
     observed_file_events: AtomicU64,
     audit_events: AtomicU64,
+    stream_bytes_client_to_server: AtomicU64,
+    stream_bytes_server_to_client: AtomicU64,
     bytes_client_to_server: AtomicU64,
     bytes_server_to_client: AtomicU64,
+    smb_write_requests: AtomicU64,
+    smb_write_bytes: AtomicU64,
+    server_side_copy_requests: AtomicU64,
     monitored_threats: AtomicU64,
     blocked_threats: AtomicU64,
 }
@@ -409,8 +475,13 @@ pub struct StatusSnapshot {
     pub blocked_chunks: u64,
     pub observed_file_events: u64,
     pub audit_events: u64,
+    pub stream_bytes_client_to_server: u64,
+    pub stream_bytes_server_to_client: u64,
     pub bytes_client_to_server: u64,
     pub bytes_server_to_client: u64,
+    pub smb_write_requests: u64,
+    pub smb_write_bytes: u64,
+    pub server_side_copy_requests: u64,
     pub monitored_threats: u64,
     pub blocked_threats: u64,
     pub policy_runtime: PolicyRuntimeSnapshot,
@@ -440,8 +511,13 @@ struct RouteRuntimeStats {
     active_connections: u64,
     inspected_chunks: u64,
     inspected_bytes: u64,
+    stream_bytes_client_to_server: u64,
+    stream_bytes_server_to_client: u64,
     bytes_client_to_server: u64,
     bytes_server_to_client: u64,
+    smb_write_requests: u64,
+    smb_write_bytes: u64,
+    server_side_copy_requests: u64,
     monitored_events: u64,
     blocked_events: u64,
     last_peer_addr: Option<String>,
@@ -459,8 +535,13 @@ pub struct RouteStatsSnapshot {
     pub active_connections: u64,
     pub inspected_chunks: u64,
     pub inspected_bytes: u64,
+    pub stream_bytes_client_to_server: u64,
+    pub stream_bytes_server_to_client: u64,
     pub bytes_client_to_server: u64,
     pub bytes_server_to_client: u64,
+    pub smb_write_requests: u64,
+    pub smb_write_bytes: u64,
+    pub server_side_copy_requests: u64,
     pub monitored_events: u64,
     pub blocked_events: u64,
     pub last_peer_addr: Option<String>,
@@ -479,8 +560,13 @@ impl From<&RouteRuntimeStats> for RouteStatsSnapshot {
             active_connections: value.active_connections,
             inspected_chunks: value.inspected_chunks,
             inspected_bytes: value.inspected_bytes,
+            stream_bytes_client_to_server: value.stream_bytes_client_to_server,
+            stream_bytes_server_to_client: value.stream_bytes_server_to_client,
             bytes_client_to_server: value.bytes_client_to_server,
             bytes_server_to_client: value.bytes_server_to_client,
+            smb_write_requests: value.smb_write_requests,
+            smb_write_bytes: value.smb_write_bytes,
+            server_side_copy_requests: value.server_side_copy_requests,
             monitored_events: value.monitored_events,
             blocked_events: value.blocked_events,
             last_peer_addr: value.last_peer_addr.clone(),
@@ -593,6 +679,7 @@ pub enum AuditEventKind {
     FileObserved,
     PolicyDetection,
     PolicyBlocked,
+    ServerSideCopyRequested,
 }
 
 impl ThreatEvent {
@@ -1012,6 +1099,72 @@ pub fn extract_smb_file_paths(chunk: &[u8]) -> Vec<String> {
     paths
 }
 
+pub fn extract_smb2_write_lengths(chunk: &[u8]) -> Vec<u32> {
+    let mut lengths = Vec::new();
+    let mut search_start = 0;
+
+    while let Some(relative_offset) = find_bytes(&chunk[search_start..], b"\xFESMB") {
+        let header_offset = search_start + relative_offset;
+        search_start = header_offset + 4;
+
+        let Some(command) = read_u16_le(chunk, header_offset + 12) else {
+            continue;
+        };
+        if command != 9 {
+            continue;
+        }
+
+        let body_offset = header_offset + 64;
+        let Some(structure_size) = read_u16_le(chunk, body_offset) else {
+            continue;
+        };
+        if structure_size != 49 {
+            continue;
+        }
+
+        if let Some(length) = read_u32_le(chunk, body_offset + 4)
+            && length > 0
+        {
+            lengths.push(length);
+        }
+    }
+
+    lengths
+}
+
+pub fn contains_smb2_server_side_copy_request(chunk: &[u8]) -> bool {
+    let mut search_start = 0;
+
+    while let Some(relative_offset) = find_bytes(&chunk[search_start..], b"\xFESMB") {
+        let header_offset = search_start + relative_offset;
+        search_start = header_offset + 4;
+
+        let Some(command) = read_u16_le(chunk, header_offset + 12) else {
+            continue;
+        };
+        if command != 11 {
+            continue;
+        }
+
+        let body_offset = header_offset + 64;
+        let Some(structure_size) = read_u16_le(chunk, body_offset) else {
+            continue;
+        };
+        if structure_size != 57 {
+            continue;
+        }
+
+        let Some(control_code) = read_u32_le(chunk, body_offset + 4) else {
+            continue;
+        };
+        if control_code == 0x0014_40F2 || control_code == 0x0014_80F2 {
+            return true;
+        }
+    }
+
+    false
+}
+
 fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     (!needle.is_empty())
         .then(|| {
@@ -1025,6 +1178,11 @@ fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 fn read_u16_le(bytes: &[u8], offset: usize) -> Option<u16> {
     let pair = bytes.get(offset..offset + 2)?;
     Some(u16::from_le_bytes([pair[0], pair[1]]))
+}
+
+fn read_u32_le(bytes: &[u8], offset: usize) -> Option<u32> {
+    let quad = bytes.get(offset..offset + 4)?;
+    Some(u32::from_le_bytes([quad[0], quad[1], quad[2], quad[3]]))
 }
 
 fn decode_utf16le_path(bytes: &[u8]) -> Option<String> {
@@ -1340,6 +1498,22 @@ mod tests {
     }
 
     #[test]
+    fn extracts_smb2_write_lengths() {
+        let chunk = smb2_write_request(262_144);
+
+        let lengths = extract_smb2_write_lengths(&chunk);
+
+        assert_eq!(lengths, vec![262_144]);
+    }
+
+    #[test]
+    fn detects_smb2_server_side_copy_request() {
+        let chunk = smb2_ioctl_request(0x0014_40F2);
+
+        assert!(contains_smb2_server_side_copy_request(&chunk));
+    }
+
+    #[test]
     fn blocks_utf16le_signature_variant() {
         let policy = StreamPolicy::default();
         let context = test_context();
@@ -1394,6 +1568,44 @@ mod tests {
             .copy_from_slice(&(name.len() as u16).to_le_bytes());
         packet[smb_header_offset + name_offset..smb_header_offset + name_offset + name.len()]
             .copy_from_slice(&name);
+
+        packet
+    }
+
+    fn smb2_write_request(length: u32) -> Vec<u8> {
+        let smb_header_offset = 4;
+        let body_offset = smb_header_offset + 64;
+        let packet_len = body_offset + 48;
+        let netbios_len = (packet_len - 4) as u32;
+        let mut packet = vec![0_u8; packet_len];
+
+        packet[0] = ((netbios_len >> 16) & 0xff) as u8;
+        packet[1] = ((netbios_len >> 8) & 0xff) as u8;
+        packet[2] = (netbios_len & 0xff) as u8;
+        packet[smb_header_offset..smb_header_offset + 4].copy_from_slice(b"\xFESMB");
+        packet[smb_header_offset + 12..smb_header_offset + 14]
+            .copy_from_slice(&9_u16.to_le_bytes());
+        packet[body_offset..body_offset + 2].copy_from_slice(&49_u16.to_le_bytes());
+        packet[body_offset + 4..body_offset + 8].copy_from_slice(&length.to_le_bytes());
+
+        packet
+    }
+
+    fn smb2_ioctl_request(control_code: u32) -> Vec<u8> {
+        let smb_header_offset = 4;
+        let body_offset = smb_header_offset + 64;
+        let packet_len = body_offset + 56;
+        let netbios_len = (packet_len - 4) as u32;
+        let mut packet = vec![0_u8; packet_len];
+
+        packet[0] = ((netbios_len >> 16) & 0xff) as u8;
+        packet[1] = ((netbios_len >> 8) & 0xff) as u8;
+        packet[2] = (netbios_len & 0xff) as u8;
+        packet[smb_header_offset..smb_header_offset + 4].copy_from_slice(b"\xFESMB");
+        packet[smb_header_offset + 12..smb_header_offset + 14]
+            .copy_from_slice(&11_u16.to_le_bytes());
+        packet[body_offset..body_offset + 2].copy_from_slice(&57_u16.to_le_bytes());
+        packet[body_offset + 4..body_offset + 8].copy_from_slice(&control_code.to_le_bytes());
 
         packet
     }

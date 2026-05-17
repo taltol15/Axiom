@@ -742,10 +742,18 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
   </header>
 
   <main class="mx-auto max-w-7xl px-6 py-8">
-    <section class="grid gap-5 md:grid-cols-3 xl:grid-cols-6">
+    <section class="grid gap-5 md:grid-cols-4 xl:grid-cols-8">
       <article class="rounded-lg border border-zinc-800 bg-zinc-900 p-6">
-        <p class="text-sm text-zinc-400">Total Bytes Transferred</p>
-        <p id="total-bytes" class="mt-4 text-4xl font-semibold text-white">0 B</p>
+        <p class="text-sm text-zinc-400">Forwarded Bytes</p>
+        <p id="forwarded-bytes" class="mt-4 text-4xl font-semibold text-white">0 B</p>
+      </article>
+      <article class="rounded-lg border border-zinc-800 bg-zinc-900 p-6">
+        <p class="text-sm text-zinc-400">Socket Bytes Read</p>
+        <p id="stream-bytes" class="mt-4 text-4xl font-semibold text-sky-200">0 B</p>
+      </article>
+      <article class="rounded-lg border border-zinc-800 bg-zinc-900 p-6">
+        <p class="text-sm text-zinc-400">SMB Write Bytes</p>
+        <p id="smb-write-bytes" class="mt-4 text-4xl font-semibold text-lime-200">0 B</p>
       </article>
       <article class="rounded-lg border border-zinc-800 bg-zinc-900 p-6">
         <p class="text-sm text-zinc-400">Active Connections</p>
@@ -766,6 +774,10 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
       <article class="rounded-lg border border-zinc-800 bg-zinc-900 p-6">
         <p class="text-sm text-zinc-400">Observed Files</p>
         <p id="observed-files" class="mt-4 text-4xl font-semibold text-violet-200">0</p>
+      </article>
+      <article class="rounded-lg border border-zinc-800 bg-zinc-900 p-6">
+        <p class="text-sm text-zinc-400">Server-side Copies</p>
+        <p id="server-side-copies" class="mt-4 text-4xl font-semibold text-orange-200">0</p>
       </article>
     </section>
 
@@ -965,14 +977,18 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
 
       const data = await response.json();
       const stats = data.stats;
-      const totalBytes = Number(stats.bytes_client_to_server || 0) + Number(stats.bytes_server_to_client || 0);
+      const forwardedBytes = Number(stats.bytes_client_to_server || 0) + Number(stats.bytes_server_to_client || 0);
+      const streamBytes = Number(stats.stream_bytes_client_to_server || 0) + Number(stats.stream_bytes_server_to_client || 0);
 
-      document.getElementById("total-bytes").textContent = formatBytes(totalBytes);
+      document.getElementById("forwarded-bytes").textContent = formatBytes(forwardedBytes);
+      document.getElementById("stream-bytes").textContent = formatBytes(streamBytes);
+      document.getElementById("smb-write-bytes").textContent = formatBytes(stats.smb_write_bytes || 0);
       document.getElementById("active-connections").textContent = stats.active_connections;
       document.getElementById("blocked-threats").textContent = stats.blocked_threats;
       document.getElementById("monitored-threats").textContent = stats.monitored_threats;
       document.getElementById("inspected-chunks").textContent = stats.inspected_chunks;
       document.getElementById("observed-files").textContent = stats.observed_file_events || 0;
+      document.getElementById("server-side-copies").textContent = stats.server_side_copy_requests || 0;
       document.getElementById("management-info").textContent = `${data.management_interface} at ${data.management_bind_addr}`;
       document.getElementById("refresh-state").textContent = `PID ${data.process_id} · ${data.config_path} · updated ${new Date().toLocaleTimeString()}`;
       renderPolicyRuntime(stats.policy_runtime);
@@ -983,6 +999,7 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
         ${(() => {
           const runtime = routeStats.get(route.name) || {};
           const routeBytes = Number(runtime.bytes_client_to_server || 0) + Number(runtime.bytes_server_to_client || 0);
+          const routeStreamBytes = Number(runtime.stream_bytes_client_to_server || 0) + Number(runtime.stream_bytes_server_to_client || 0);
           return `
         <tr class="hover:bg-zinc-800/40">
           <td class="whitespace-nowrap px-6 py-4 text-sm font-medium text-white">${text(route.name)}</td>
@@ -992,7 +1009,7 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
           <td class="whitespace-nowrap px-6 py-4 text-sm text-cyan-200">${text(route.target_file_server_addr)}</td>
           <td class="whitespace-nowrap px-6 py-4 text-sm text-zinc-300">${text(runtime.active_connections || 0)} active / ${text(runtime.total_connections || 0)} total</td>
           <td class="whitespace-nowrap px-6 py-4 text-sm text-zinc-300">${text(runtime.inspected_chunks || 0)} chunks</td>
-          <td class="whitespace-nowrap px-6 py-4 text-sm text-zinc-300">${formatBytes(routeBytes)}</td>
+          <td class="whitespace-nowrap px-6 py-4 text-sm text-zinc-300">${formatBytes(routeBytes)} fwd / ${formatBytes(routeStreamBytes)} read</td>
         </tr>
           `;
         })()}
