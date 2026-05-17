@@ -1,6 +1,7 @@
 use std::{
     fs,
     path::{Path, PathBuf},
+    process::Command,
     sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -57,6 +58,7 @@ pub async fn run_management_server(
         .route("/dashboard", get(dashboard_page))
         .route("/login", get(login_page))
         .route("/api/status", get(api_status))
+        .route("/api/diagnostics", get(api_diagnostics))
         .route("/api/policies", get(api_policies).put(api_update_policies))
         .route("/api/login", post(api_login))
         .route("/api/logout", post(api_logout))
@@ -100,6 +102,20 @@ async fn api_status(headers: HeaderMap, State(state): State<Arc<WebState>>) -> R
     }
 
     Json(build_status_response(&state)).into_response()
+}
+
+async fn api_diagnostics(headers: HeaderMap, State(state): State<Arc<WebState>>) -> Response {
+    if !is_authorized(&headers, &state) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(ErrorResponse {
+                message: "authentication required",
+            }),
+        )
+            .into_response();
+    }
+
+    Json(build_diagnostics_response(&state)).into_response()
 }
 
 async fn api_policies(headers: HeaderMap, State(state): State<Arc<WebState>>) -> Response {
@@ -264,6 +280,31 @@ fn build_status_response(state: &WebState) -> StatusResponse {
     }
 }
 
+fn build_diagnostics_response(state: &WebState) -> DiagnosticsResponse {
+    let config = state.config.lock().expect("web config mutex poisoned");
+    DiagnosticsResponse {
+        process_id: std::process::id(),
+        executable_path: std::env::current_exe()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|error| format!("unavailable: {error}")),
+        config_path: state.config_path.display().to_string(),
+        management_bind_addr: config.management.listen_addr().to_string(),
+        proxy_listeners: config
+            .proxy_listeners
+            .iter()
+            .map(ProxyListenerStatus::from)
+            .collect(),
+        status: state.runtime.snapshot(),
+        command_outputs: vec![
+            run_diagnostic_command("ss", &["-ltnp"]),
+            run_diagnostic_command("ss", &["-tnp"]),
+            run_diagnostic_command("ip", &["-br", "addr"]),
+            run_diagnostic_command("ip", &["route"]),
+        ],
+        proc_self_status: fs::read_to_string("/proc/self/status").ok(),
+    }
+}
+
 fn is_authorized(headers: &HeaderMap, state: &WebState) -> bool {
     let expected_token = {
         let config = state.config.lock().expect("web config mutex poisoned");
@@ -377,6 +418,23 @@ fn unix_timestamp_seconds() -> u64 {
         .as_secs()
 }
 
+fn run_diagnostic_command(command: &str, args: &[&str]) -> CommandOutput {
+    match Command::new(command).args(args).output() {
+        Ok(output) => CommandOutput {
+            command: format!("{} {}", command, args.join(" ")),
+            exit_code: output.status.code(),
+            stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+        },
+        Err(error) => CommandOutput {
+            command: format!("{} {}", command, args.join(" ")),
+            exit_code: None,
+            stdout: String::new(),
+            stderr: error.to_string(),
+        },
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct StatusResponse {
     process_id: u32,
@@ -386,6 +444,26 @@ struct StatusResponse {
     configured_proxy_listeners: usize,
     proxy_listeners: Vec<ProxyListenerStatus>,
     stats: StatusSnapshot,
+}
+
+#[derive(Debug, Serialize)]
+struct DiagnosticsResponse {
+    process_id: u32,
+    executable_path: String,
+    config_path: String,
+    management_bind_addr: String,
+    proxy_listeners: Vec<ProxyListenerStatus>,
+    status: StatusSnapshot,
+    command_outputs: Vec<CommandOutput>,
+    proc_self_status: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct CommandOutput {
+    command: String,
+    exit_code: Option<i32>,
+    stdout: String,
+    stderr: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -660,6 +738,17 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
       </div>
       <div id="threats" class="divide-y divide-zinc-800"></div>
     </section>
+
+    <section class="mt-8 rounded-lg border border-zinc-800 bg-zinc-900">
+      <div class="flex flex-col gap-4 border-b border-zinc-800 px-6 py-5 md:flex-row md:items-center md:justify-between">
+        <div>
+          <h2 class="text-xl font-semibold text-white">Runtime Diagnostics</h2>
+          <p id="diagnostics-state" class="mt-1 text-sm text-zinc-400">Diagnostics not loaded</p>
+        </div>
+        <button id="load-diagnostics" class="rounded-md border border-zinc-700 px-4 py-2 text-sm text-zinc-200 transition hover:border-emerald-300 hover:text-emerald-200">Load diagnostics</button>
+      </div>
+      <pre id="diagnostics-output" class="max-h-96 overflow-auto whitespace-pre-wrap px-6 py-5 text-xs leading-5 text-zinc-300"></pre>
+    </section>
   </main>
 
   <script>
@@ -827,12 +916,36 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
       await loadPolicies();
     }
 
+    async function loadDiagnostics() {
+      document.getElementById("diagnostics-state").textContent = "Loading diagnostics";
+      const response = await fetch("/api/diagnostics", { headers: authHeaders() });
+      const payload = await response.json().catch(() => ({ message: "diagnostics failed" }));
+
+      if (!response.ok) {
+        document.getElementById("diagnostics-state").textContent = payload.message || "Diagnostics failed";
+        return;
+      }
+
+      const important = {
+        process_id: payload.process_id,
+        executable_path: payload.executable_path,
+        config_path: payload.config_path,
+        proxy_listeners: payload.proxy_listeners,
+        route_stats: payload.status.route_stats,
+        commands: payload.command_outputs
+      };
+
+      document.getElementById("diagnostics-output").textContent = JSON.stringify(important, null, 2);
+      document.getElementById("diagnostics-state").textContent = "Diagnostics loaded";
+    }
+
     document.getElementById("logout").addEventListener("click", async () => {
       await fetch("/api/logout", { method: "POST" });
       localStorage.removeItem("axiomToken");
       window.location.href = "/login";
     });
     document.getElementById("save-policies").addEventListener("click", savePolicies);
+    document.getElementById("load-diagnostics").addEventListener("click", loadDiagnostics);
 
     refresh();
     loadPolicies();
