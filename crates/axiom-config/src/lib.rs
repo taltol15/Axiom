@@ -412,6 +412,12 @@ fn default_signatures() -> Vec<SignaturePolicyConfig> {
             mode: PolicyMode::Block,
         },
         SignaturePolicyConfig {
+            name: "EICAR antivirus test string".to_string(),
+            pattern: "X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*"
+                .to_string(),
+            mode: PolicyMode::Block,
+        },
+        SignaturePolicyConfig {
             name: "WannaCry marker WNCRY".to_string(),
             pattern: "WNCRY".to_string(),
             mode: PolicyMode::Block,

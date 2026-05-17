@@ -470,7 +470,7 @@ write_config() {
     echo "[policy.archive]"
     echo "rar = \"block\""
     echo "seven_zip = \"block\""
-    echo "zip = \"monitor\""
+    echo "zip = \"block\""
     echo "encrypted_zip = \"block\""
     echo
     echo "[policy.entropy]"
@@ -481,6 +481,11 @@ write_config() {
     echo "[[policy.signatures]]"
     echo "name = \"Axiom synthetic test marker\""
     echo "pattern = \"AXIOM_TEST_THREAT\""
+    echo "mode = \"block\""
+    echo
+    echo "[[policy.signatures]]"
+    echo "name = \"EICAR antivirus test string\""
+    echo 'pattern = "X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*"'
     echo "mode = \"block\""
     echo
     echo "[[policy.signatures]]"

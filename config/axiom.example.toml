@@ -27,6 +27,11 @@ pattern = "AXIOM_TEST_THREAT"
 mode = "block"
 
 [[policy.signatures]]
+name = "EICAR antivirus test string"
+pattern = "X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*"
+mode = "block"
+
+[[policy.signatures]]
 name = "WannaCry marker WNCRY"
 pattern = "WNCRY"
 mode = "block"

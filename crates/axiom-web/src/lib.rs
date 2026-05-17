@@ -219,6 +219,10 @@ async fn api_policy_self_test(headers: HeaderMap, State(state): State<Arc<WebSta
             utf16le_test_payload("AXIOM_TEST_THREAT"),
         ),
         (
+            "EICAR signature",
+            b"X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*".to_vec(),
+        ),
+        (
             "RAR filename extension",
             utf16le_test_payload("FinanceBackup.rar"),
         ),
@@ -368,6 +372,8 @@ fn build_diagnostics_response(state: &WebState) -> DiagnosticsResponse {
             run_diagnostic_command("sysctl", &["net.ipv4.ip_forward"]),
             run_diagnostic_command("sysctl", &["net.ipv4.conf.all.forwarding"]),
             run_diagnostic_command("sysctl", &["net.ipv4.conf.all.route_localnet"]),
+            run_diagnostic_command("ls", &["-l", "/var/log/axiom"]),
+            run_diagnostic_command("tail", &["-n", "80", "/var/log/axiom/audit.jsonl"]),
         ],
         proc_self_status: fs::read_to_string("/proc/self/status").ok(),
     }
@@ -736,7 +742,7 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
   </header>
 
   <main class="mx-auto max-w-7xl px-6 py-8">
-    <section class="grid gap-5 md:grid-cols-5">
+    <section class="grid gap-5 md:grid-cols-3 xl:grid-cols-6">
       <article class="rounded-lg border border-zinc-800 bg-zinc-900 p-6">
         <p class="text-sm text-zinc-400">Total Bytes Transferred</p>
         <p id="total-bytes" class="mt-4 text-4xl font-semibold text-white">0 B</p>
@@ -756,6 +762,10 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
       <article class="rounded-lg border border-zinc-800 bg-zinc-900 p-6">
         <p class="text-sm text-zinc-400">Inspected Chunks</p>
         <p id="inspected-chunks" class="mt-4 text-4xl font-semibold text-emerald-200">0</p>
+      </article>
+      <article class="rounded-lg border border-zinc-800 bg-zinc-900 p-6">
+        <p class="text-sm text-zinc-400">Observed Files</p>
+        <p id="observed-files" class="mt-4 text-4xl font-semibold text-violet-200">0</p>
       </article>
     </section>
 
@@ -876,6 +886,17 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
     </section>
 
     <section class="mt-8 rounded-lg border border-zinc-800 bg-zinc-900">
+      <div class="flex flex-col gap-2 border-b border-zinc-800 px-6 py-5 md:flex-row md:items-end md:justify-between">
+        <div>
+          <h2 class="text-xl font-semibold text-white">Global Activity Log</h2>
+          <p id="audit-state" class="mt-1 text-sm text-zinc-400">Waiting for SMB activity</p>
+        </div>
+        <p id="audit-count" class="text-sm text-zinc-500">0 audit events</p>
+      </div>
+      <div id="audit-log" class="divide-y divide-zinc-800"></div>
+    </section>
+
+    <section class="mt-8 rounded-lg border border-zinc-800 bg-zinc-900">
       <div class="border-b border-zinc-800 px-6 py-5">
         <h2 class="text-xl font-semibold text-white">Recent Policy Events</h2>
       </div>
@@ -951,6 +972,7 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
       document.getElementById("blocked-threats").textContent = stats.blocked_threats;
       document.getElementById("monitored-threats").textContent = stats.monitored_threats;
       document.getElementById("inspected-chunks").textContent = stats.inspected_chunks;
+      document.getElementById("observed-files").textContent = stats.observed_file_events || 0;
       document.getElementById("management-info").textContent = `${data.management_interface} at ${data.management_bind_addr}`;
       document.getElementById("refresh-state").textContent = `PID ${data.process_id} · ${data.config_path} · updated ${new Date().toLocaleTimeString()}`;
       renderPolicyRuntime(stats.policy_runtime);
@@ -976,21 +998,52 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
         })()}
       `).join("");
 
+      const auditLog = document.getElementById("audit-log");
+      const auditEvents = stats.recent_audit_events || [];
+      document.getElementById("audit-count").textContent = `${stats.audit_events || 0} audit events`;
+      document.getElementById("audit-state").textContent = auditEvents.length
+        ? `Latest event ${new Date(auditEvents[auditEvents.length - 1].unix_timestamp_seconds * 1000).toLocaleTimeString()}`
+        : "Waiting for SMB activity";
+
+      if (!auditEvents.length) {
+        auditLog.innerHTML = `<div class="px-6 py-6 text-sm text-zinc-400">No SMB activity recorded.</div>`;
+      } else {
+        auditLog.innerHTML = auditEvents.slice().reverse().slice(0, 80).map((event) => {
+          const severityClass = event.severity === "critical" ? "text-red-200" : event.severity === "warning" ? "text-amber-200" : "text-zinc-200";
+          const badgeClass = event.kind === "policy_blocked" ? "border-red-400/40 bg-red-500/10 text-red-100" : event.kind === "policy_detection" ? "border-amber-400/40 bg-amber-500/10 text-amber-100" : "border-zinc-700 bg-zinc-950 text-zinc-300";
+          return `
+            <div class="px-6 py-4">
+              <div class="flex flex-col gap-2 lg:flex-row lg:items-center lg:justify-between">
+                <div class="min-w-0">
+                  <div class="flex flex-wrap items-center gap-2">
+                    <span class="rounded-full border px-2.5 py-1 text-xs font-semibold uppercase ${badgeClass}">${text(event.kind).replaceAll("_", " ")}</span>
+                    <span class="text-sm font-semibold ${severityClass}">${text(event.action).toUpperCase()}</span>
+                    <span class="text-sm text-zinc-400">${text(event.peer_addr)} → ${text(event.target_addr)}</span>
+                  </div>
+                  <p class="mt-2 truncate text-sm text-white">${text(event.file_path)}</p>
+                  <p class="mt-1 text-sm text-zinc-400">${text(event.reason)}${event.rule_name ? ` · ${text(event.rule_name)}` : ""}</p>
+                </div>
+                <p class="text-xs text-zinc-500">${new Date(event.unix_timestamp_seconds * 1000).toLocaleString()}</p>
+              </div>
+            </div>
+          `;
+        }).join("");
+      }
+
       const threats = document.getElementById("threats");
       if (!stats.recent_threats.length) {
         threats.innerHTML = `<div class="px-6 py-6 text-sm text-zinc-400">No policy detections recorded.</div>`;
-        return;
-      }
-
-      threats.innerHTML = stats.recent_threats.slice().reverse().map((event) => `
-        <div class="px-6 py-4">
-          <div class="flex flex-col gap-1 md:flex-row md:items-center md:justify-between">
-            <p class="font-medium ${event.action === "block" ? "text-red-200" : "text-amber-200"}">${text(event.action).toUpperCase()} · ${text(event.reason)}</p>
-            <p class="text-xs text-zinc-500">${new Date(event.unix_timestamp_seconds * 1000).toLocaleString()}</p>
+      } else {
+        threats.innerHTML = stats.recent_threats.slice().reverse().map((event) => `
+          <div class="px-6 py-4">
+            <div class="flex flex-col gap-1 md:flex-row md:items-center md:justify-between">
+              <p class="font-medium ${event.action === "block" ? "text-red-200" : "text-amber-200"}">${text(event.action).toUpperCase()} · ${text(event.reason)}</p>
+              <p class="text-xs text-zinc-500">${new Date(event.unix_timestamp_seconds * 1000).toLocaleString()}</p>
+            </div>
+            <p class="mt-2 text-sm text-zinc-400">${text(event.rule_name)} · ${text(event.route_name)} · ${text(event.interface)} · ${text(event.direction)} · ${text(event.peer_addr)} · entropy ${Number(event.entropy || 0).toFixed(3)}</p>
           </div>
-          <p class="mt-2 text-sm text-zinc-400">${text(event.rule_name)} · ${text(event.route_name)} · ${text(event.interface)} · ${text(event.direction)} · entropy ${Number(event.entropy || 0).toFixed(3)}</p>
-        </div>
-      `).join("");
+        `).join("");
+      }
     }
 
     function fillModeSelect(id, value) {

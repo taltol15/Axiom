@@ -1,9 +1,10 @@
-use std::{io, net::SocketAddr, sync::Arc};
+use std::{collections::HashSet, io, net::SocketAddr, sync::Arc};
 
 use anyhow::Context;
 use axiom_config::ProxyListenerConfig;
 use axiom_core::{
     InspectionContext, InspectionResult, RuntimeState, ThreatEvent, TrafficDirection,
+    extract_smb_file_paths,
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
@@ -55,7 +56,21 @@ pub async fn run_proxy_listener(
 
         state.connection_started();
         state.route_connection_started(&route.name, peer_addr);
-        let guard = ConnectionGuard::new(Arc::clone(&state), route.name.clone());
+        let connection_context = InspectionContext {
+            route_name: &route.name,
+            interface: route.interface(),
+            direction: TrafficDirection::ClientToServer,
+            peer_addr,
+            target_addr: route.target_addr(),
+        };
+        state.record_connection_opened(&connection_context);
+        let guard = ConnectionGuard::new(
+            Arc::clone(&state),
+            route.name.clone(),
+            route.interface().to_string(),
+            peer_addr,
+            route.target_addr(),
+        );
         let route = Arc::new(route.clone());
         let task_state = Arc::clone(&state);
 
@@ -154,6 +169,7 @@ where
 {
     let mut buffer = vec![0_u8; 64 * 1024];
     let mut inspection_window = InspectionWindow::new(state.max_pattern_len());
+    let mut observed_files = HashSet::new();
 
     loop {
         let bytes_read = reader.read(&mut buffer).await?;
@@ -172,6 +188,14 @@ where
             peer_addr,
             target_addr,
         };
+
+        if direction == TrafficDirection::ClientToServer {
+            for file_path in extract_smb_file_paths(&inspection_bytes) {
+                if observed_files.insert(file_path.clone()) {
+                    state.record_file_observed(&context, file_path, bytes_read as u64);
+                }
+            }
+        }
 
         match state.inspect_chunk(&context, &inspection_bytes) {
             InspectionResult::Allow { entropy } => {
@@ -234,11 +258,26 @@ fn record_blocked_event(state: &RuntimeState, event: ThreatEvent) {
 struct ConnectionGuard {
     state: Arc<RuntimeState>,
     route_name: String,
+    interface: String,
+    peer_addr: SocketAddr,
+    target_addr: SocketAddr,
 }
 
 impl ConnectionGuard {
-    fn new(state: Arc<RuntimeState>, route_name: String) -> Self {
-        Self { state, route_name }
+    fn new(
+        state: Arc<RuntimeState>,
+        route_name: String,
+        interface: String,
+        peer_addr: SocketAddr,
+        target_addr: SocketAddr,
+    ) -> Self {
+        Self {
+            state,
+            route_name,
+            interface,
+            peer_addr,
+            target_addr,
+        }
     }
 }
 
@@ -246,6 +285,14 @@ impl Drop for ConnectionGuard {
     fn drop(&mut self) {
         self.state.connection_finished();
         self.state.route_connection_finished(&self.route_name);
+        let context = InspectionContext {
+            route_name: &self.route_name,
+            interface: &self.interface,
+            direction: TrafficDirection::ClientToServer,
+            peer_addr: self.peer_addr,
+            target_addr: self.target_addr,
+        };
+        self.state.record_connection_closed(&context);
     }
 }
 
