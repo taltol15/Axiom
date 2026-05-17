@@ -8,7 +8,10 @@ use std::{
 
 use anyhow::Context;
 use axiom_config::{AdminCredentials, AxiomConfig, PolicyConfig, ProxyListenerConfig};
-use axiom_core::{RuntimeState, StatusSnapshot};
+use axiom_core::{
+    InspectionContext, InspectionResult, PolicyRuntimeSnapshot, RuntimeState, StatusSnapshot,
+    TrafficDirection,
+};
 use axiom_net::bind_tcp_listener_to_interface;
 use axum::{
     Json, Router,
@@ -60,6 +63,7 @@ pub async fn run_management_server(
         .route("/api/status", get(api_status))
         .route("/api/diagnostics", get(api_diagnostics))
         .route("/api/policies", get(api_policies).put(api_update_policies))
+        .route("/api/policies/self-test", post(api_policy_self_test))
         .route("/api/login", post(api_login))
         .route("/api/logout", post(api_logout))
         .with_state(state);
@@ -175,10 +179,68 @@ async fn api_update_policies(
             .into_response();
     }
 
-    state.runtime.update_policy(policy);
+    let runtime_policy = state.runtime.update_policy(policy);
 
-    Json(ErrorResponse {
-        message: "policy updated",
+    Json(PolicyUpdateResponse {
+        message: "policy updated and applied to the running engine",
+        process_id: std::process::id(),
+        config_path: state.config_path.display().to_string(),
+        policy_runtime: runtime_policy,
+    })
+    .into_response()
+}
+
+async fn api_policy_self_test(headers: HeaderMap, State(state): State<Arc<WebState>>) -> Response {
+    if !is_authorized(&headers, &state) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(ErrorResponse {
+                message: "authentication required",
+            }),
+        )
+            .into_response();
+    }
+
+    let context = InspectionContext {
+        route_name: "policy-self-test",
+        interface: "local",
+        direction: TrafficDirection::ClientToServer,
+        peer_addr: "127.0.0.1:44500".parse().expect("static address is valid"),
+        target_addr: "127.0.0.1:445".parse().expect("static address is valid"),
+    };
+
+    let tests = [
+        (
+            "Synthetic signature",
+            b"SMB write body AXIOM_TEST_THREAT payload".to_vec(),
+        ),
+        (
+            "UTF-16LE synthetic signature",
+            utf16le_test_payload("AXIOM_TEST_THREAT"),
+        ),
+        (
+            "RAR filename extension",
+            utf16le_test_payload("FinanceBackup.rar"),
+        ),
+        (
+            "ZIP content header",
+            b"\x00\x00\x00\x40\xfeSMBpaddingPK\x03\x04\x14\x00\x00\x00payload".to_vec(),
+        ),
+    ];
+
+    let results = tests
+        .into_iter()
+        .map(|(name, payload)| {
+            let outcome = state.runtime.inspect_chunk(&context, &payload);
+            PolicySelfTestResult::from_outcome(name, outcome)
+        })
+        .collect();
+
+    Json(PolicySelfTestResponse {
+        message: "policy self-test completed",
+        process_id: std::process::id(),
+        policy_runtime: state.runtime.policy_runtime_snapshot(),
+        results,
     })
     .into_response()
 }
@@ -515,8 +577,63 @@ struct LoginResponse {
 }
 
 #[derive(Debug, Serialize)]
+struct PolicyUpdateResponse {
+    message: &'static str,
+    process_id: u32,
+    config_path: String,
+    policy_runtime: PolicyRuntimeSnapshot,
+}
+
+#[derive(Debug, Serialize)]
+struct PolicySelfTestResponse {
+    message: &'static str,
+    process_id: u32,
+    policy_runtime: PolicyRuntimeSnapshot,
+    results: Vec<PolicySelfTestResult>,
+}
+
+#[derive(Debug, Serialize)]
+struct PolicySelfTestResult {
+    name: &'static str,
+    outcome: &'static str,
+    rule_name: Option<String>,
+    reason: Option<String>,
+}
+
+impl PolicySelfTestResult {
+    fn from_outcome(name: &'static str, outcome: InspectionResult) -> Self {
+        match outcome {
+            InspectionResult::Allow { .. } => Self {
+                name,
+                outcome: "allow",
+                rule_name: None,
+                reason: None,
+            },
+            InspectionResult::Monitor { event } => Self {
+                name,
+                outcome: "monitor",
+                rule_name: Some(event.rule_name),
+                reason: Some(event.reason),
+            },
+            InspectionResult::Block { event } => Self {
+                name,
+                outcome: "block",
+                rule_name: Some(event.rule_name),
+                reason: Some(event.reason),
+            },
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
 struct ErrorResponse {
     message: &'static str,
+}
+
+fn utf16le_test_payload(value: &str) -> Vec<u8> {
+    let mut payload = b"\x00\x00\x00\x90\xfeSMBself-test-padding".to_vec();
+    payload.extend(value.encode_utf16().flat_map(|unit| unit.to_le_bytes()));
+    payload
 }
 
 const LOGIN_HTML: &str = r##"<!doctype html>
@@ -642,13 +759,33 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
       </article>
     </section>
 
+    <section class="mt-6 rounded-lg border border-emerald-500/20 bg-emerald-500/5 px-6 py-5">
+      <div class="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
+        <div>
+          <p class="text-sm font-semibold uppercase tracking-wider text-emerald-300">Runtime Enforcement</p>
+          <h2 id="runtime-policy-state" class="mt-2 text-xl font-semibold text-white">Loading active policy</h2>
+          <p id="runtime-policy-detail" class="mt-1 text-sm text-zinc-300"></p>
+        </div>
+        <div class="flex flex-col gap-3 sm:flex-row sm:items-center">
+          <button id="run-policy-self-test" class="rounded-md border border-emerald-400/40 px-4 py-2 text-sm font-semibold text-emerald-100 transition hover:border-emerald-300 hover:bg-emerald-400/10">Run policy self-test</button>
+          <p id="self-test-state" class="text-sm text-zinc-400">Self-test not run</p>
+        </div>
+      </div>
+      <div id="self-test-results" class="mt-4 grid gap-3 md:grid-cols-4"></div>
+    </section>
+
     <section class="mt-8 rounded-lg border border-zinc-800 bg-zinc-900">
       <div class="flex flex-col gap-4 border-b border-zinc-800 px-6 py-5 md:flex-row md:items-center md:justify-between">
         <div>
           <h2 class="text-xl font-semibold text-white">Policy Controls</h2>
           <p id="policy-state" class="mt-1 text-sm text-zinc-400">Loading policies</p>
         </div>
-        <button id="save-policies" class="rounded-md bg-emerald-400 px-4 py-2 text-sm font-semibold text-zinc-950 transition hover:bg-emerald-300">Save policies</button>
+        <div class="flex flex-wrap gap-2">
+          <button data-preset="monitor" class="policy-preset rounded-md border border-zinc-700 px-3 py-2 text-sm text-zinc-200 transition hover:border-cyan-300 hover:text-cyan-100">Monitor only</button>
+          <button data-preset="balanced" class="policy-preset rounded-md border border-zinc-700 px-3 py-2 text-sm text-zinc-200 transition hover:border-emerald-300 hover:text-emerald-100">Balanced</button>
+          <button data-preset="strict" class="policy-preset rounded-md border border-zinc-700 px-3 py-2 text-sm text-zinc-200 transition hover:border-red-300 hover:text-red-100">Strict</button>
+          <button id="save-policies" class="rounded-md bg-emerald-400 px-4 py-2 text-sm font-semibold text-zinc-950 transition hover:bg-emerald-300">Save and apply</button>
+        </div>
       </div>
 
       <div class="grid gap-6 p-6 lg:grid-cols-[1fr_1fr]">
@@ -780,6 +917,20 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
       return value === null || value === undefined || value === "" ? "—" : String(value);
     }
 
+    function formatTime(seconds) {
+      if (!seconds) return "not available";
+      return new Date(Number(seconds) * 1000).toLocaleString();
+    }
+
+    function renderPolicyRuntime(runtime) {
+      if (!runtime) return;
+      const blocking = runtime.blocking_rules || [];
+      const monitoring = runtime.monitoring_rules || [];
+      document.getElementById("runtime-policy-state").textContent = `Policy generation ${runtime.generation} is active`;
+      document.getElementById("runtime-policy-detail").textContent =
+        `${blocking.length} blocking rules · ${monitoring.length} monitor rules · applied ${formatTime(runtime.last_updated_unix_timestamp_seconds)}`;
+    }
+
     async function refresh() {
       const response = await fetch("/api/status", {
         headers: authHeaders()
@@ -802,6 +953,7 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
       document.getElementById("inspected-chunks").textContent = stats.inspected_chunks;
       document.getElementById("management-info").textContent = `${data.management_interface} at ${data.management_bind_addr}`;
       document.getElementById("refresh-state").textContent = `PID ${data.process_id} · ${data.config_path} · updated ${new Date().toLocaleTimeString()}`;
+      renderPolicyRuntime(stats.policy_runtime);
 
       const mappingBody = document.getElementById("mapping-body");
       const routeStats = new Map((stats.route_stats || []).map((route) => [route.route_name, route]));
@@ -904,6 +1056,47 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
       };
     }
 
+    function setMode(id, mode) {
+      document.getElementById(id).value = mode;
+    }
+
+    function applyPreset(name) {
+      if (name === "monitor") {
+        setMode("policy-smb-encrypted-payload", "monitor");
+        setMode("policy-rar", "monitor");
+        setMode("policy-seven-zip", "monitor");
+        setMode("policy-zip", "monitor");
+        setMode("policy-encrypted-zip", "monitor");
+        setMode("policy-entropy-mode", "monitor");
+        document.getElementById("policy-entropy-threshold").value = "7.9";
+        document.getElementById("policy-entropy-minimum").value = "8192";
+      }
+
+      if (name === "balanced") {
+        setMode("policy-smb-encrypted-payload", "monitor");
+        setMode("policy-rar", "block");
+        setMode("policy-seven-zip", "block");
+        setMode("policy-zip", "block");
+        setMode("policy-encrypted-zip", "block");
+        setMode("policy-entropy-mode", "monitor");
+        document.getElementById("policy-entropy-threshold").value = "7.9";
+        document.getElementById("policy-entropy-minimum").value = "8192";
+      }
+
+      if (name === "strict") {
+        setMode("policy-smb-encrypted-payload", "block");
+        setMode("policy-rar", "block");
+        setMode("policy-seven-zip", "block");
+        setMode("policy-zip", "block");
+        setMode("policy-encrypted-zip", "block");
+        setMode("policy-entropy-mode", "block");
+        document.getElementById("policy-entropy-threshold").value = "7.5";
+        document.getElementById("policy-entropy-minimum").value = "2048";
+      }
+
+      document.getElementById("policy-state").textContent = `${name} preset selected; save to apply`;
+    }
+
     async function savePolicies() {
       document.getElementById("policy-state").textContent = "Saving policies";
       const response = await fetch("/api/policies", {
@@ -918,8 +1111,39 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
         return;
       }
 
-      document.getElementById("policy-state").textContent = "Policies saved";
       await loadPolicies();
+      renderPolicyRuntime(payload.policy_runtime);
+      document.getElementById("policy-state").textContent =
+        `Saved and active on PID ${payload.process_id} · generation ${payload.policy_runtime.generation}`;
+      await refresh();
+    }
+
+    async function runPolicySelfTest() {
+      document.getElementById("self-test-state").textContent = "Running self-test";
+      const response = await fetch("/api/policies/self-test", {
+        method: "POST",
+        headers: authHeaders()
+      });
+      const payload = await response.json().catch(() => ({ message: "self-test failed" }));
+
+      if (!response.ok) {
+        document.getElementById("self-test-state").textContent = payload.message || "Self-test failed";
+        return;
+      }
+
+      renderPolicyRuntime(payload.policy_runtime);
+      document.getElementById("self-test-results").innerHTML = (payload.results || []).map((result) => {
+        const color = result.outcome === "block" ? "border-red-400/40 text-red-100" : result.outcome === "monitor" ? "border-amber-400/40 text-amber-100" : "border-zinc-700 text-zinc-200";
+        return `
+          <div class="rounded-md border ${color} bg-zinc-950/50 px-4 py-3">
+            <p class="text-sm font-semibold">${text(result.name)}</p>
+            <p class="mt-2 text-lg font-semibold uppercase">${text(result.outcome)}</p>
+            <p class="mt-1 text-xs text-zinc-400">${text(result.rule_name)}</p>
+          </div>
+        `;
+      }).join("");
+      document.getElementById("self-test-state").textContent =
+        `Self-test completed on PID ${payload.process_id}`;
     }
 
     async function loadDiagnostics() {
@@ -951,7 +1175,11 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
       window.location.href = "/login";
     });
     document.getElementById("save-policies").addEventListener("click", savePolicies);
+    document.getElementById("run-policy-self-test").addEventListener("click", runPolicySelfTest);
     document.getElementById("load-diagnostics").addEventListener("click", loadDiagnostics);
+    document.querySelectorAll(".policy-preset").forEach((button) => {
+      button.addEventListener("click", () => applyPreset(button.dataset.preset));
+    });
 
     refresh();
     loadPolicies();

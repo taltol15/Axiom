@@ -126,7 +126,7 @@ pub struct ArchivePolicyConfig {
     pub rar: PolicyMode,
     #[serde(default = "default_block_mode")]
     pub seven_zip: PolicyMode,
-    #[serde(default = "default_monitor_mode")]
+    #[serde(default = "default_block_mode")]
     pub zip: PolicyMode,
     #[serde(default = "default_block_mode")]
     pub encrypted_zip: PolicyMode,
@@ -137,7 +137,7 @@ impl Default for ArchivePolicyConfig {
         Self {
             rar: PolicyMode::Block,
             seven_zip: PolicyMode::Block,
-            zip: PolicyMode::Monitor,
+            zip: PolicyMode::Block,
             encrypted_zip: PolicyMode::Block,
         }
     }

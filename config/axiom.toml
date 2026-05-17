@@ -13,7 +13,7 @@ encrypted_payload = "monitor"
 [policy.archive]
 rar = "block"
 seven_zip = "block"
-zip = "monitor"
+zip = "block"
 encrypted_zip = "block"
 
 [policy.entropy]

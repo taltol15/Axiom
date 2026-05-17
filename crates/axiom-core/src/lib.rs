@@ -13,12 +13,15 @@ use serde::Serialize;
 
 const MAX_RETAINED_THREAT_EVENTS: usize = 128;
 const ARCHIVE_MAX_PATTERN_LEN: usize = 8;
+const STREAM_INSPECTION_TAIL_LEN: usize = 4096;
 
 #[derive(Debug)]
 pub struct AppState {
     started_at: SystemTime,
     counters: TrafficCounters,
     policy: RwLock<StreamPolicy>,
+    policy_generation: AtomicU64,
+    policy_updated_at_unix_timestamp_seconds: AtomicU64,
     route_stats: Mutex<HashMap<String, RouteRuntimeStats>>,
     recent_threats: Mutex<VecDeque<ThreatEvent>>,
 }
@@ -29,6 +32,8 @@ impl AppState {
             started_at: SystemTime::now(),
             counters: TrafficCounters::default(),
             policy: RwLock::new(policy),
+            policy_generation: AtomicU64::new(1),
+            policy_updated_at_unix_timestamp_seconds: AtomicU64::new(unix_timestamp_seconds()),
             route_stats: Mutex::new(HashMap::new()),
             recent_threats: Mutex::new(VecDeque::with_capacity(MAX_RETAINED_THREAT_EVENTS)),
         }
@@ -171,16 +176,40 @@ impl AppState {
             .clone()
     }
 
-    pub fn update_policy(&self, policy: PolicyConfig) {
-        let mut guard = self.policy.write().expect("stream policy lock poisoned");
-        *guard = StreamPolicy::from_config(policy);
+    pub fn update_policy(&self, policy: PolicyConfig) -> PolicyRuntimeSnapshot {
+        {
+            let mut guard = self.policy.write().expect("stream policy lock poisoned");
+            *guard = StreamPolicy::from_config(policy);
+        }
+
+        let updated_at = unix_timestamp_seconds();
+        self.policy_updated_at_unix_timestamp_seconds
+            .store(updated_at, Ordering::Relaxed);
+        self.policy_generation.fetch_add(1, Ordering::Relaxed);
+        self.policy_runtime_snapshot()
     }
 
     pub fn max_pattern_len(&self) -> usize {
-        self.policy
+        let policy_len = self
+            .policy
             .read()
             .expect("stream policy lock poisoned")
-            .max_pattern_len()
+            .max_pattern_len();
+
+        policy_len.max(STREAM_INSPECTION_TAIL_LEN)
+    }
+
+    pub fn policy_runtime_snapshot(&self) -> PolicyRuntimeSnapshot {
+        let policy = self.policy_config();
+        PolicyRuntimeSnapshot {
+            generation: self.policy_generation.load(Ordering::Relaxed),
+            last_updated_unix_timestamp_seconds: self
+                .policy_updated_at_unix_timestamp_seconds
+                .load(Ordering::Relaxed),
+            blocking_rules: blocking_rules(&policy),
+            monitoring_rules: monitoring_rules(&policy),
+            active_policy: policy,
+        }
     }
 
     pub fn snapshot(&self) -> StatusSnapshot {
@@ -209,6 +238,7 @@ impl AppState {
             bytes_server_to_client: self.counters.bytes_server_to_client.load(Ordering::Relaxed),
             monitored_threats: self.counters.monitored_threats.load(Ordering::Relaxed),
             blocked_threats: self.counters.blocked_threats.load(Ordering::Relaxed),
+            policy_runtime: self.policy_runtime_snapshot(),
             route_stats: self.route_snapshots(),
             recent_threats,
         }
@@ -290,8 +320,18 @@ pub struct StatusSnapshot {
     pub bytes_server_to_client: u64,
     pub monitored_threats: u64,
     pub blocked_threats: u64,
+    pub policy_runtime: PolicyRuntimeSnapshot,
     pub route_stats: Vec<RouteStatsSnapshot>,
     pub recent_threats: Vec<ThreatEvent>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PolicyRuntimeSnapshot {
+    pub generation: u64,
+    pub last_updated_unix_timestamp_seconds: u64,
+    pub blocking_rules: Vec<String>,
+    pub monitoring_rules: Vec<String>,
+    pub active_policy: PolicyConfig,
 }
 
 #[derive(Debug, Default)]
@@ -356,7 +396,7 @@ impl From<&RouteRuntimeStats> for RouteStatsSnapshot {
 
 pub type TrafficSnapshot = StatusSnapshot;
 
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum TrafficDirection {
     ClientToServer,
@@ -434,7 +474,7 @@ impl StreamPolicy {
             return detection.into_result(context, chunk.len(), entropy);
         }
 
-        if let Some(detection) = self.detect_archive_policy_violation(chunk) {
+        if let Some(detection) = self.detect_archive_policy_violation(context, chunk) {
             return detection.into_result(context, chunk.len(), entropy);
         }
 
@@ -470,7 +510,7 @@ impl StreamPolicy {
         let signature_len = self
             .signatures
             .iter()
-            .map(|signature| signature.pattern.len())
+            .flat_map(|signature| signature.patterns.iter().map(Vec::len))
             .max()
             .unwrap_or(0);
 
@@ -493,12 +533,49 @@ impl StreamPolicy {
     }
 
     fn match_signature<'a>(&'a self, chunk: &[u8]) -> Option<&'a RuntimeSignature> {
-        self.signatures.iter().find(|signature| {
-            signature.mode.is_enabled() && contains_bytes(chunk, &signature.pattern)
-        })
+        self.signatures
+            .iter()
+            .find(|signature| signature.mode.is_enabled() && signature.matches(chunk))
     }
 
-    fn detect_archive_policy_violation(&self, chunk: &[u8]) -> Option<PolicyDetection> {
+    fn detect_archive_policy_violation(
+        &self,
+        context: &InspectionContext<'_>,
+        chunk: &[u8],
+    ) -> Option<PolicyDetection> {
+        if context.direction == TrafficDirection::ClientToServer {
+            if contains_ascii_or_utf16le_case_insensitive(chunk, ".rar")
+                && self.config.archive.rar.is_enabled()
+            {
+                return Some(PolicyDetection {
+                    action: self.config.archive.rar,
+                    rule_name: "RAR archive".to_string(),
+                    reason: "RAR filename extension detected in SMB create/write flow".to_string(),
+                });
+            }
+
+            if (contains_ascii_or_utf16le_case_insensitive(chunk, ".7z")
+                || contains_ascii_or_utf16le_case_insensitive(chunk, ".7zip"))
+                && self.config.archive.seven_zip.is_enabled()
+            {
+                return Some(PolicyDetection {
+                    action: self.config.archive.seven_zip,
+                    rule_name: "7z archive".to_string(),
+                    reason: "7z filename extension detected in SMB create/write flow".to_string(),
+                });
+            }
+
+            if contains_ascii_or_utf16le_case_insensitive(chunk, ".zip")
+                && self.config.archive.zip.is_enabled()
+            {
+                return Some(PolicyDetection {
+                    action: self.config.archive.zip,
+                    rule_name: "ZIP archive".to_string(),
+                    reason: "ZIP filename extension detected in SMB create/write flow".to_string(),
+                });
+            }
+        }
+
         if let Some(mode) = encrypted_zip_mode(chunk, self.config.archive.encrypted_zip)
             && mode.is_enabled()
         {
@@ -562,15 +639,33 @@ impl From<PolicyConfig> for StreamPolicy {
 #[derive(Debug, Clone)]
 struct RuntimeSignature {
     name: String,
-    pattern: Vec<u8>,
+    patterns: Vec<Vec<u8>>,
     mode: PolicyMode,
+}
+
+impl RuntimeSignature {
+    fn matches(&self, chunk: &[u8]) -> bool {
+        self.patterns
+            .iter()
+            .any(|pattern| contains_bytes(chunk, pattern))
+    }
 }
 
 impl From<&axiom_config::SignaturePolicyConfig> for RuntimeSignature {
     fn from(value: &axiom_config::SignaturePolicyConfig) -> Self {
+        let raw_pattern = value.pattern.as_bytes().to_vec();
+        let mut patterns = vec![raw_pattern];
+
+        if value.pattern.is_ascii() {
+            let utf16le_pattern = utf16le_bytes(&value.pattern);
+            if !patterns.iter().any(|pattern| pattern == &utf16le_pattern) {
+                patterns.push(utf16le_pattern);
+            }
+        }
+
         Self {
             name: value.name.clone(),
-            pattern: value.pattern.as_bytes().to_vec(),
+            patterns,
             mode: value.mode,
         }
     }
@@ -655,6 +750,46 @@ fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
             .any(|window| window == needle)
 }
 
+fn contains_ascii_or_utf16le_case_insensitive(haystack: &[u8], needle: &str) -> bool {
+    contains_ascii_case_insensitive(haystack, needle.as_bytes())
+        || contains_utf16le_ascii_case_insensitive(haystack, needle.as_bytes())
+}
+
+fn contains_ascii_case_insensitive(haystack: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty()
+        && haystack.windows(needle.len()).any(|window| {
+            window
+                .iter()
+                .zip(needle.iter())
+                .all(|(left, right)| left.eq_ignore_ascii_case(right))
+        })
+}
+
+fn utf16le_bytes(value: &str) -> Vec<u8> {
+    value
+        .encode_utf16()
+        .flat_map(|unit| unit.to_le_bytes())
+        .collect()
+}
+
+fn contains_utf16le_ascii_case_insensitive(haystack: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() {
+        return false;
+    }
+
+    let encoded_len = needle.len() * 2;
+    if haystack.len() < encoded_len {
+        return false;
+    }
+
+    (0..=haystack.len() - encoded_len).any(|start| {
+        needle.iter().enumerate().all(|(index, expected)| {
+            let byte_index = start + index * 2;
+            haystack[byte_index + 1] == 0 && haystack[byte_index].eq_ignore_ascii_case(expected)
+        })
+    })
+}
+
 fn contains_smb_encrypted_transform_header(chunk: &[u8]) -> bool {
     contains_bytes(chunk, b"\xFDSMB")
 }
@@ -705,6 +840,47 @@ fn looks_like_smb_negotiate_or_session_setup(chunk: &[u8]) -> bool {
     command == 0 || command == 1
 }
 
+fn blocking_rules(policy: &PolicyConfig) -> Vec<String> {
+    summarize_rules(policy, PolicyMode::Block)
+}
+
+fn monitoring_rules(policy: &PolicyConfig) -> Vec<String> {
+    summarize_rules(policy, PolicyMode::Monitor)
+}
+
+fn summarize_rules(policy: &PolicyConfig, mode: PolicyMode) -> Vec<String> {
+    let mut rules = Vec::new();
+
+    if policy.smb.encrypted_payload == mode {
+        rules.push("SMB encrypted payload".to_string());
+    }
+    if policy.archive.rar == mode {
+        rules.push("RAR archives".to_string());
+    }
+    if policy.archive.seven_zip == mode {
+        rules.push("7z archives".to_string());
+    }
+    if policy.archive.zip == mode {
+        rules.push("ZIP archives".to_string());
+    }
+    if policy.archive.encrypted_zip == mode {
+        rules.push("Encrypted ZIP archives".to_string());
+    }
+    if policy.entropy.mode == mode {
+        rules.push("High entropy payloads".to_string());
+    }
+
+    rules.extend(
+        policy
+            .signatures
+            .iter()
+            .filter(|signature| signature.mode == mode)
+            .map(|signature| format!("Signature: {}", signature.name)),
+    );
+
+    rules
+}
+
 #[cfg(test)]
 mod tests {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -726,13 +902,30 @@ mod tests {
 
     #[test]
     fn monitors_zip_when_zip_policy_is_monitor() {
-        let policy = StreamPolicy::default();
+        let policy = StreamPolicy::from_config(PolicyConfig {
+            archive: ArchivePolicyConfig {
+                zip: PolicyMode::Monitor,
+                ..ArchivePolicyConfig::default()
+            },
+            ..PolicyConfig::default()
+        });
         let context = test_context();
         let chunk = b"prefixPK\x03\x04\x14\x00\x00\x00plain-zip";
 
         let result = policy.inspect_chunk(&context, chunk);
 
         assert!(matches!(result, InspectionResult::Monitor { .. }));
+    }
+
+    #[test]
+    fn blocks_zip_by_default() {
+        let policy = StreamPolicy::default();
+        let context = test_context();
+        let chunk = b"prefixPK\x03\x04\x14\x00\x00\x00plain-zip";
+
+        let result = policy.inspect_chunk(&context, chunk);
+
+        assert!(matches!(result, InspectionResult::Block { .. }));
     }
 
     #[test]
@@ -793,6 +986,30 @@ mod tests {
         let result = policy.inspect_chunk(&context, chunk);
 
         assert!(matches!(result, InspectionResult::Allow { .. }));
+    }
+
+    #[test]
+    fn blocks_archive_filename_extension_in_utf16le_smb_create() {
+        let policy = StreamPolicy::default();
+        let context = test_context();
+        let mut chunk = b"\x00\x00\x00\x90\xfeSMBcreate-request-padding".to_vec();
+        chunk.extend_from_slice(&utf16le_bytes("Finance Backup.RaR"));
+
+        let result = policy.inspect_chunk(&context, &chunk);
+
+        assert!(matches!(result, InspectionResult::Block { .. }));
+    }
+
+    #[test]
+    fn blocks_utf16le_signature_variant() {
+        let policy = StreamPolicy::default();
+        let context = test_context();
+        let mut chunk = b"\x00\x00\x00\x90\xfeSMBwrite-request-padding".to_vec();
+        chunk.extend_from_slice(&utf16le_bytes("AXIOM_TEST_THREAT"));
+
+        let result = policy.inspect_chunk(&context, &chunk);
+
+        assert!(matches!(result, InspectionResult::Block { .. }));
     }
 
     fn test_context() -> InspectionContext<'static> {
