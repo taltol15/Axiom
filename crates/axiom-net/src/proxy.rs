@@ -1,10 +1,16 @@
-use std::{collections::HashSet, io, net::SocketAddr, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    io,
+    net::SocketAddr,
+    sync::{Arc, Mutex},
+};
 
 use anyhow::Context;
 use axiom_config::ProxyListenerConfig;
 use axiom_core::{
-    InspectionContext, InspectionResult, RuntimeState, ThreatEvent, TrafficDirection,
-    contains_smb2_server_side_copy_request, extract_smb_file_paths, extract_smb2_write_lengths,
+    InspectionContext, InspectionResult, RuntimeState, Smb2CreateRequest, Smb2CreateResponse,
+    Smb2WriteRequest, ThreatEvent, TrafficDirection, contains_smb2_server_side_copy_request,
+    extract_smb2_create_requests, extract_smb2_create_responses, extract_smb2_write_requests,
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
@@ -62,6 +68,7 @@ pub async fn run_proxy_listener(
             direction: TrafficDirection::ClientToServer,
             peer_addr,
             target_addr: route.target_addr(),
+            file_path_hint: None,
         };
         state.record_connection_opened(&connection_context);
         let guard = ConnectionGuard::new(
@@ -130,10 +137,12 @@ async fn relay_bidirectional(
     let target_addr = route.target_addr();
     let (client_reader, client_writer) = client_stream.into_split();
     let (server_reader, server_writer) = server_stream.into_split();
+    let telemetry = Arc::new(ConnectionTelemetry::default());
 
     let client_to_server = relay_direction(
         Arc::clone(&route),
         Arc::clone(&state),
+        Arc::clone(&telemetry),
         peer_addr,
         target_addr,
         TrafficDirection::ClientToServer,
@@ -144,6 +153,7 @@ async fn relay_bidirectional(
     let server_to_client = relay_direction(
         route,
         state,
+        telemetry,
         peer_addr,
         target_addr,
         TrafficDirection::ServerToClient,
@@ -157,6 +167,7 @@ async fn relay_bidirectional(
 async fn relay_direction<R, W>(
     route: Arc<ProxyListenerConfig>,
     state: Arc<RuntimeState>,
+    telemetry: Arc<ConnectionTelemetry>,
     peer_addr: SocketAddr,
     target_addr: SocketAddr,
     direction: TrafficDirection,
@@ -169,7 +180,6 @@ where
 {
     let mut buffer = vec![0_u8; 64 * 1024];
     let mut inspection_window = InspectionWindow::new(state.max_pattern_len());
-    let mut observed_files = HashSet::new();
 
     loop {
         let bytes_read = reader.read(&mut buffer).await?;
@@ -181,26 +191,54 @@ where
         state.record_inspection(bytes_read as u64);
         state.record_route_inspection(&route.name, bytes_read as u64);
         state.record_stream_bytes(&route.name, direction, bytes_read as u64);
-        let inspection_bytes = inspection_window.merge(&buffer[..bytes_read]);
+        let chunk = &buffer[..bytes_read];
+        let inspection_bytes = inspection_window.merge(chunk);
+        let create_requests = if direction == TrafficDirection::ClientToServer {
+            extract_smb2_create_requests(chunk)
+        } else {
+            Vec::new()
+        };
+        let write_requests = if direction == TrafficDirection::ClientToServer {
+            extract_smb2_write_requests(chunk)
+        } else {
+            Vec::new()
+        };
+        let file_path_hint = if direction == TrafficDirection::ClientToServer {
+            create_requests
+                .first()
+                .map(|request| request.file_path.clone())
+                .or_else(|| {
+                    write_requests
+                        .iter()
+                        .find_map(|request| telemetry.file_path_for_id(&request.file_id))
+                })
+                .or_else(|| telemetry.latest_write_file_path())
+        } else {
+            None
+        };
+
         let context = InspectionContext {
             route_name: &route.name,
             interface: route.interface(),
             direction,
             peer_addr,
             target_addr,
+            file_path_hint: file_path_hint.as_deref(),
         };
 
         if direction == TrafficDirection::ClientToServer {
-            for file_path in extract_smb_file_paths(&inspection_bytes) {
-                if observed_files.insert(file_path.clone()) {
-                    state.record_file_observed(&context, file_path, bytes_read as u64);
-                }
+            for create_request in create_requests {
+                telemetry.observe_create_request(&state, &context, create_request, bytes_read);
             }
-            for write_length in extract_smb2_write_lengths(&inspection_bytes) {
-                state.record_smb_write_payload(&route.name, write_length as u64);
+            for write_request in write_requests {
+                telemetry.observe_write_request(&state, &context, write_request);
             }
-            if contains_smb2_server_side_copy_request(&inspection_bytes) {
+            if contains_smb2_server_side_copy_request(chunk) {
                 state.record_server_side_copy_requested(&context);
+            }
+        } else {
+            for create_response in extract_smb2_create_responses(chunk) {
+                telemetry.observe_create_response(create_response);
             }
         }
 
@@ -262,6 +300,92 @@ fn record_blocked_event(state: &RuntimeState, event: ThreatEvent) {
     state.record_blocked_threat(event);
 }
 
+#[derive(Debug, Default)]
+struct ConnectionTelemetry {
+    pending_create_paths: Mutex<HashMap<u64, String>>,
+    open_file_paths: Mutex<HashMap<[u8; 16], String>>,
+    observed_file_paths: Mutex<HashSet<String>>,
+    latest_write_file_path: Mutex<Option<String>>,
+}
+
+impl ConnectionTelemetry {
+    fn observe_create_request(
+        &self,
+        state: &RuntimeState,
+        context: &InspectionContext<'_>,
+        request: Smb2CreateRequest,
+        bytes_read: usize,
+    ) {
+        self.pending_create_paths
+            .lock()
+            .expect("pending create path mutex poisoned")
+            .insert(request.message_id, request.file_path.clone());
+
+        let mut observed = self
+            .observed_file_paths
+            .lock()
+            .expect("observed file path mutex poisoned");
+        if observed.insert(request.file_path.clone()) {
+            state.record_file_observed(context, request.file_path, bytes_read as u64);
+        }
+    }
+
+    fn observe_create_response(&self, response: Smb2CreateResponse) {
+        let Some(file_path) = self
+            .pending_create_paths
+            .lock()
+            .expect("pending create path mutex poisoned")
+            .remove(&response.message_id)
+        else {
+            return;
+        };
+
+        self.open_file_paths
+            .lock()
+            .expect("open file path mutex poisoned")
+            .insert(response.file_id, file_path);
+    }
+
+    fn file_path_for_id(&self, file_id: &[u8; 16]) -> Option<String> {
+        self.open_file_paths
+            .lock()
+            .expect("open file path mutex poisoned")
+            .get(file_id)
+            .cloned()
+    }
+
+    fn latest_write_file_path(&self) -> Option<String> {
+        self.latest_write_file_path
+            .lock()
+            .expect("latest write file path mutex poisoned")
+            .clone()
+    }
+
+    fn observe_write_request(
+        &self,
+        state: &RuntimeState,
+        context: &InspectionContext<'_>,
+        request: Smb2WriteRequest,
+    ) {
+        let file_path = self
+            .open_file_paths
+            .lock()
+            .expect("open file path mutex poisoned")
+            .get(&request.file_id)
+            .cloned();
+
+        if let Some(file_path) = file_path {
+            *self
+                .latest_write_file_path
+                .lock()
+                .expect("latest write file path mutex poisoned") = Some(file_path.clone());
+            state.record_file_write_payload(context, &file_path, request.length as u64);
+        } else {
+            state.record_smb_write_payload(context.route_name, request.length as u64);
+        }
+    }
+}
+
 struct ConnectionGuard {
     state: Arc<RuntimeState>,
     route_name: String,
@@ -298,6 +422,7 @@ impl Drop for ConnectionGuard {
             direction: TrafficDirection::ClientToServer,
             peer_addr: self.peer_addr,
             target_addr: self.target_addr,
+            file_path_hint: None,
         };
         self.state.record_connection_closed(&context);
     }

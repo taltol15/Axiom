@@ -207,6 +207,7 @@ async fn api_policy_self_test(headers: HeaderMap, State(state): State<Arc<WebSta
         direction: TrafficDirection::ClientToServer,
         peer_addr: "127.0.0.1:44500".parse().expect("static address is valid"),
         target_addr: "127.0.0.1:445".parse().expect("static address is valid"),
+        file_path_hint: Some("policy-self-test.bin"),
     };
 
     let tests = [
@@ -900,6 +901,33 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
     <section class="mt-8 rounded-lg border border-zinc-800 bg-zinc-900">
       <div class="flex flex-col gap-2 border-b border-zinc-800 px-6 py-5 md:flex-row md:items-end md:justify-between">
         <div>
+          <h2 class="text-xl font-semibold text-white">File Transfer Ledger</h2>
+          <p id="file-activity-state" class="mt-1 text-sm text-zinc-400">Waiting for per-file SMB activity</p>
+        </div>
+        <p id="file-activity-count" class="text-sm text-zinc-500">0 tracked files</p>
+      </div>
+
+      <div class="overflow-x-auto">
+        <table class="min-w-full divide-y divide-zinc-800">
+          <thead class="bg-zinc-950/60">
+            <tr>
+              <th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-zinc-400">File</th>
+              <th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-zinc-400">Client</th>
+              <th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-zinc-400">Target</th>
+              <th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-zinc-400">SMB Writes</th>
+              <th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-zinc-400">Events</th>
+              <th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-zinc-400">Last Result</th>
+              <th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-zinc-400">Updated</th>
+            </tr>
+          </thead>
+          <tbody id="file-activity-body" class="divide-y divide-zinc-800"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="mt-8 rounded-lg border border-zinc-800 bg-zinc-900">
+      <div class="flex flex-col gap-2 border-b border-zinc-800 px-6 py-5 md:flex-row md:items-end md:justify-between">
+        <div>
           <h2 class="text-xl font-semibold text-white">Global Activity Log</h2>
           <p id="audit-state" class="mt-1 text-sm text-zinc-400">Waiting for SMB activity</p>
         </div>
@@ -1015,6 +1043,40 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
         })()}
       `).join("");
 
+      const fileActivity = stats.file_activity || [];
+      const fileActivityBody = document.getElementById("file-activity-body");
+      document.getElementById("file-activity-count").textContent = `${fileActivity.length} tracked files`;
+      document.getElementById("file-activity-state").textContent = fileActivity.length
+        ? `Latest file update ${formatTime(fileActivity[0].last_activity_unix_timestamp_seconds)}`
+        : "Waiting for per-file SMB activity";
+
+      if (!fileActivity.length) {
+        fileActivityBody.innerHTML = `<tr><td colspan="7" class="px-6 py-6 text-sm text-zinc-400">No file-level SMB activity recorded.</td></tr>`;
+      } else {
+        fileActivityBody.innerHTML = fileActivity.slice(0, 80).map((activity) => {
+          const isBlocked = Number(activity.blocked_events || 0) > 0 || activity.last_action === "block";
+          const isMonitored = Number(activity.monitored_events || 0) > 0 || activity.last_action === "monitor";
+          const resultClass = isBlocked ? "border-red-400/40 bg-red-500/10 text-red-100" : isMonitored ? "border-amber-400/40 bg-amber-500/10 text-amber-100" : "border-emerald-400/40 bg-emerald-500/10 text-emerald-100";
+          return `
+            <tr class="hover:bg-zinc-800/40">
+              <td class="max-w-xs px-6 py-4 text-sm font-medium text-white">
+                <p class="truncate">${text(activity.file_path)}</p>
+                <p class="mt-1 text-xs text-zinc-500">${text(activity.route_name)} · ${text(activity.interface)}</p>
+              </td>
+              <td class="whitespace-nowrap px-6 py-4 text-sm text-zinc-300">${text(activity.peer_addr)}</td>
+              <td class="whitespace-nowrap px-6 py-4 text-sm text-cyan-200">${text(activity.target_addr)}</td>
+              <td class="whitespace-nowrap px-6 py-4 text-sm text-lime-200">${formatBytes(activity.smb_write_bytes || 0)} · ${text(activity.smb_write_requests || 0)} writes</td>
+              <td class="whitespace-nowrap px-6 py-4 text-sm text-zinc-300">${text(activity.observed_events || 0)} seen · ${text(activity.blocked_events || 0)} blocked · ${text(activity.monitored_events || 0)} monitored</td>
+              <td class="min-w-72 px-6 py-4 text-sm text-zinc-300">
+                <span class="rounded-full border px-2.5 py-1 text-xs font-semibold uppercase ${resultClass}">${text(activity.last_action)}</span>
+                <p class="mt-2 line-clamp-2 text-zinc-400">${text(activity.last_reason)}${activity.last_rule_name ? ` · ${text(activity.last_rule_name)}` : ""}</p>
+              </td>
+              <td class="whitespace-nowrap px-6 py-4 text-xs text-zinc-500">${formatTime(activity.last_activity_unix_timestamp_seconds)}</td>
+            </tr>
+          `;
+        }).join("");
+      }
+
       const auditLog = document.getElementById("audit-log");
       const auditEvents = stats.recent_audit_events || [];
       document.getElementById("audit-count").textContent = `${stats.audit_events || 0} audit events`;
@@ -1057,6 +1119,7 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
               <p class="font-medium ${event.action === "block" ? "text-red-200" : "text-amber-200"}">${text(event.action).toUpperCase()} · ${text(event.reason)}</p>
               <p class="text-xs text-zinc-500">${new Date(event.unix_timestamp_seconds * 1000).toLocaleString()}</p>
             </div>
+            ${event.file_path ? `<p class="mt-2 text-sm font-medium text-white">${text(event.file_path)}</p>` : ""}
             <p class="mt-2 text-sm text-zinc-400">${text(event.rule_name)} · ${text(event.route_name)} · ${text(event.interface)} · ${text(event.direction)} · ${text(event.peer_addr)} · entropy ${Number(event.entropy || 0).toFixed(3)}</p>
           </div>
         `).join("");

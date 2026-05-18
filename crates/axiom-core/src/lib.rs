@@ -15,6 +15,7 @@ use serde::Serialize;
 
 const MAX_RETAINED_THREAT_EVENTS: usize = 128;
 const MAX_RETAINED_AUDIT_EVENTS: usize = 512;
+const MAX_TRACKED_FILE_ACTIVITIES: usize = 512;
 const ARCHIVE_MAX_PATTERN_LEN: usize = 8;
 const STREAM_INSPECTION_TAIL_LEN: usize = 4096;
 const AUDIT_LOG_PATH: &str = "/var/log/axiom/audit.jsonl";
@@ -27,6 +28,7 @@ pub struct AppState {
     policy_generation: AtomicU64,
     policy_updated_at_unix_timestamp_seconds: AtomicU64,
     route_stats: Mutex<HashMap<String, RouteRuntimeStats>>,
+    file_activity: Mutex<HashMap<String, FileActivityStats>>,
     recent_threats: Mutex<VecDeque<ThreatEvent>>,
     recent_audit_events: Mutex<VecDeque<AuditEvent>>,
 }
@@ -40,6 +42,7 @@ impl AppState {
             policy_generation: AtomicU64::new(1),
             policy_updated_at_unix_timestamp_seconds: AtomicU64::new(unix_timestamp_seconds()),
             route_stats: Mutex::new(HashMap::new()),
+            file_activity: Mutex::new(HashMap::new()),
             recent_threats: Mutex::new(VecDeque::with_capacity(MAX_RETAINED_THREAT_EVENTS)),
             recent_audit_events: Mutex::new(VecDeque::with_capacity(MAX_RETAINED_AUDIT_EVENTS)),
         }
@@ -196,6 +199,13 @@ impl AppState {
         self.counters
             .observed_file_events
             .fetch_add(1, Ordering::Relaxed);
+        self.record_file_activity(context, file_path.clone(), |activity| {
+            activity.observed_events += 1;
+            activity.last_action = "observe".to_string();
+            activity.last_reason = "SMB file open/create observed".to_string();
+            activity.last_rule_name = None;
+            activity.last_bytes_in_chunk = Some(bytes_in_chunk);
+        });
         self.push_audit_event(AuditEvent::from_context(
             context,
             AuditEventKind::FileObserved,
@@ -218,6 +228,23 @@ impl AppState {
         self.with_route_stats(route_name, |route| {
             route.smb_write_requests += 1;
             route.smb_write_bytes += bytes;
+        });
+    }
+
+    pub fn record_file_write_payload(
+        &self,
+        context: &InspectionContext<'_>,
+        file_path: &str,
+        bytes: u64,
+    ) {
+        self.record_smb_write_payload(context.route_name, bytes);
+        self.record_file_activity(context, file_path.to_string(), |activity| {
+            activity.smb_write_requests += 1;
+            activity.smb_write_bytes += bytes;
+            activity.last_action = "write".to_string();
+            activity.last_reason = "SMB WRITE payload observed".to_string();
+            activity.last_rule_name = None;
+            activity.last_bytes_in_chunk = Some(bytes);
         });
     }
 
@@ -247,6 +274,7 @@ impl AppState {
         self.with_route_stats(&event.route_name, |route| {
             route.monitored_events += 1;
         });
+        self.record_file_activity_for_threat(&event);
         self.push_audit_event(AuditEvent::from_threat(
             &event,
             AuditEventKind::PolicyDetection,
@@ -263,6 +291,7 @@ impl AppState {
         self.with_route_stats(&event.route_name, |route| {
             route.blocked_events += 1;
         });
+        self.record_file_activity_for_threat(&event);
         self.push_audit_event(AuditEvent::from_threat(
             &event,
             AuditEventKind::PolicyBlocked,
@@ -374,6 +403,7 @@ impl AppState {
             policy_runtime: self.policy_runtime_snapshot(),
             audit_log_path: AUDIT_LOG_PATH.to_string(),
             route_stats: self.route_snapshots(),
+            file_activity: self.file_activity_snapshots(),
             recent_threats,
             recent_audit_events,
         }
@@ -419,6 +449,90 @@ impl AppState {
         route.last_activity_unix_timestamp_seconds = Some(unix_timestamp_seconds());
     }
 
+    fn record_file_activity(
+        &self,
+        context: &InspectionContext<'_>,
+        file_path: String,
+        update: impl FnOnce(&mut FileActivityStats),
+    ) {
+        let key = file_activity_key(context.route_name, context.peer_addr, &file_path);
+        let mut file_activity = self
+            .file_activity
+            .lock()
+            .expect("file activity mutex poisoned");
+
+        if !file_activity.contains_key(&key)
+            && file_activity.len() >= MAX_TRACKED_FILE_ACTIVITIES
+            && let Some(oldest_key) = file_activity
+                .iter()
+                .min_by_key(|(_, activity)| activity.last_activity_unix_timestamp_seconds)
+                .map(|(activity_key, _)| activity_key.clone())
+        {
+            file_activity.remove(&oldest_key);
+        }
+
+        let now = unix_timestamp_seconds();
+        let activity = file_activity
+            .entry(key)
+            .and_modify(|activity| {
+                activity.route_name = context.route_name.to_string();
+                activity.interface = context.interface.to_string();
+                activity.peer_addr = context.peer_addr;
+                activity.target_addr = context.target_addr;
+                activity.file_path = file_path.clone();
+            })
+            .or_insert_with(|| FileActivityStats {
+                file_path: file_path.clone(),
+                route_name: context.route_name.to_string(),
+                interface: context.interface.to_string(),
+                peer_addr: context.peer_addr,
+                target_addr: context.target_addr,
+                observed_events: 0,
+                blocked_events: 0,
+                monitored_events: 0,
+                smb_write_requests: 0,
+                smb_write_bytes: 0,
+                last_action: "observe".to_string(),
+                last_reason: String::new(),
+                last_rule_name: None,
+                last_bytes_in_chunk: None,
+                last_activity_unix_timestamp_seconds: now,
+            });
+
+        update(activity);
+        activity.last_activity_unix_timestamp_seconds = now;
+    }
+
+    fn record_file_activity_for_threat(&self, event: &ThreatEvent) {
+        let Some(file_path) = event
+            .file_path
+            .clone()
+            .or_else(|| extract_file_path_hint(&event.reason))
+        else {
+            return;
+        };
+        let file_path_hint = file_path.clone();
+        let context = InspectionContext {
+            route_name: &event.route_name,
+            interface: &event.interface,
+            direction: event.direction,
+            peer_addr: event.peer_addr,
+            target_addr: event.target_addr,
+            file_path_hint: Some(&file_path_hint),
+        };
+        self.record_file_activity(&context, file_path, |activity| {
+            match event.action {
+                PolicyMode::Block => activity.blocked_events += 1,
+                PolicyMode::Monitor => activity.monitored_events += 1,
+                PolicyMode::Disabled => {}
+            }
+            activity.last_action = policy_mode_label(event.action).to_string();
+            activity.last_reason = event.reason.clone();
+            activity.last_rule_name = Some(event.rule_name.clone());
+            activity.last_bytes_in_chunk = Some(event.bytes_in_chunk as u64);
+        });
+    }
+
     fn route_snapshots(&self) -> Vec<RouteStatsSnapshot> {
         let mut snapshots: Vec<_> = self
             .route_stats
@@ -429,6 +543,24 @@ impl AppState {
             .collect();
 
         snapshots.sort_by(|left, right| left.route_name.cmp(&right.route_name));
+        snapshots
+    }
+
+    fn file_activity_snapshots(&self) -> Vec<FileActivityStats> {
+        let mut snapshots: Vec<_> = self
+            .file_activity
+            .lock()
+            .expect("file activity mutex poisoned")
+            .values()
+            .cloned()
+            .collect();
+
+        snapshots.sort_by(|left, right| {
+            right
+                .last_activity_unix_timestamp_seconds
+                .cmp(&left.last_activity_unix_timestamp_seconds)
+                .then_with(|| left.file_path.cmp(&right.file_path))
+        });
         snapshots
     }
 }
@@ -487,8 +619,28 @@ pub struct StatusSnapshot {
     pub policy_runtime: PolicyRuntimeSnapshot,
     pub audit_log_path: String,
     pub route_stats: Vec<RouteStatsSnapshot>,
+    pub file_activity: Vec<FileActivityStats>,
     pub recent_threats: Vec<ThreatEvent>,
     pub recent_audit_events: Vec<AuditEvent>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct FileActivityStats {
+    pub file_path: String,
+    pub route_name: String,
+    pub interface: String,
+    pub peer_addr: SocketAddr,
+    pub target_addr: SocketAddr,
+    pub observed_events: u64,
+    pub blocked_events: u64,
+    pub monitored_events: u64,
+    pub smb_write_requests: u64,
+    pub smb_write_bytes: u64,
+    pub last_action: String,
+    pub last_reason: String,
+    pub last_rule_name: Option<String>,
+    pub last_bytes_in_chunk: Option<u64>,
+    pub last_activity_unix_timestamp_seconds: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -594,6 +746,7 @@ pub struct ThreatEvent {
     pub direction: TrafficDirection,
     pub peer_addr: SocketAddr,
     pub target_addr: SocketAddr,
+    pub file_path: Option<String>,
     pub reason: String,
     pub bytes_in_chunk: usize,
     pub entropy: f64,
@@ -654,7 +807,10 @@ impl AuditEvent {
             direction: event.direction,
             peer_addr: event.peer_addr,
             target_addr: event.target_addr,
-            file_path: extract_file_path_hint(&event.reason),
+            file_path: event
+                .file_path
+                .clone()
+                .or_else(|| extract_file_path_hint(&event.reason)),
             action: policy_mode_label(event.action).to_string(),
             reason: event.reason.clone(),
             bytes_in_chunk: Some(event.bytes_in_chunk as u64),
@@ -703,6 +859,7 @@ impl ThreatEvent {
             direction: context.direction,
             peer_addr: context.peer_addr,
             target_addr: context.target_addr,
+            file_path: context.file_path_hint.map(ToString::to_string),
             reason,
             bytes_in_chunk,
             entropy,
@@ -1008,6 +1165,7 @@ pub struct InspectionContext<'a> {
     pub direction: TrafficDirection,
     pub peer_addr: SocketAddr,
     pub target_addr: SocketAddr,
+    pub file_path_hint: Option<&'a str>,
 }
 
 pub type InspectContext<'a> = InspectionContext<'a>;
@@ -1020,6 +1178,24 @@ pub enum InspectionResult {
 }
 
 pub type InspectOutcome = InspectionResult;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Smb2CreateRequest {
+    pub message_id: u64,
+    pub file_path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Smb2CreateResponse {
+    pub message_id: u64,
+    pub file_id: [u8; 16],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Smb2WriteRequest {
+    pub file_id: [u8; 16],
+    pub length: u32,
+}
 
 pub fn calculate_shannon_entropy(bytes: &[u8]) -> f64 {
     if bytes.is_empty() {
@@ -1051,6 +1227,18 @@ fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
 
 pub fn extract_smb_file_paths(chunk: &[u8]) -> Vec<String> {
     let mut paths = Vec::new();
+
+    for request in extract_smb2_create_requests(chunk) {
+        if !paths.iter().any(|existing| existing == &request.file_path) {
+            paths.push(request.file_path);
+        }
+    }
+
+    paths
+}
+
+pub fn extract_smb2_create_requests(chunk: &[u8]) -> Vec<Smb2CreateRequest> {
+    let mut requests = Vec::new();
     let mut search_start = 0;
 
     while let Some(relative_offset) = find_bytes(&chunk[search_start..], b"\xFESMB") {
@@ -1063,6 +1251,10 @@ pub fn extract_smb_file_paths(chunk: &[u8]) -> Vec<String> {
         if command != 5 {
             continue;
         }
+
+        let Some(message_id) = read_u64_le(chunk, header_offset + 24) else {
+            continue;
+        };
 
         let body_offset = header_offset + 64;
         let Some(structure_size) = read_u16_le(chunk, body_offset) else {
@@ -1090,17 +1282,79 @@ pub fn extract_smb_file_paths(chunk: &[u8]) -> Vec<String> {
         };
 
         if let Some(path) = decode_utf16le_path(name_bytes)
-            && !paths.iter().any(|existing| existing == &path)
+            && !requests
+                .iter()
+                .any(|existing: &Smb2CreateRequest| existing.message_id == message_id)
         {
-            paths.push(path);
+            requests.push(Smb2CreateRequest {
+                message_id,
+                file_path: path,
+            });
         }
     }
 
-    paths
+    requests
+}
+
+pub fn extract_smb2_create_responses(chunk: &[u8]) -> Vec<Smb2CreateResponse> {
+    let mut responses = Vec::new();
+    let mut search_start = 0;
+
+    while let Some(relative_offset) = find_bytes(&chunk[search_start..], b"\xFESMB") {
+        let header_offset = search_start + relative_offset;
+        search_start = header_offset + 4;
+
+        let Some(command) = read_u16_le(chunk, header_offset + 12) else {
+            continue;
+        };
+        if command != 5 {
+            continue;
+        }
+
+        let Some(status) = read_u32_le(chunk, header_offset + 8) else {
+            continue;
+        };
+        if status != 0 {
+            continue;
+        }
+
+        let Some(message_id) = read_u64_le(chunk, header_offset + 24) else {
+            continue;
+        };
+
+        let body_offset = header_offset + 64;
+        let Some(structure_size) = read_u16_le(chunk, body_offset) else {
+            continue;
+        };
+        if structure_size != 89 {
+            continue;
+        }
+
+        let Some(file_id_bytes) = chunk.get(body_offset + 64..body_offset + 80) else {
+            continue;
+        };
+        let Ok(file_id) = <[u8; 16]>::try_from(file_id_bytes) else {
+            continue;
+        };
+
+        responses.push(Smb2CreateResponse {
+            message_id,
+            file_id,
+        });
+    }
+
+    responses
 }
 
 pub fn extract_smb2_write_lengths(chunk: &[u8]) -> Vec<u32> {
-    let mut lengths = Vec::new();
+    extract_smb2_write_requests(chunk)
+        .into_iter()
+        .map(|request| request.length)
+        .collect()
+}
+
+pub fn extract_smb2_write_requests(chunk: &[u8]) -> Vec<Smb2WriteRequest> {
+    let mut requests = Vec::new();
     let mut search_start = 0;
 
     while let Some(relative_offset) = find_bytes(&chunk[search_start..], b"\xFESMB") {
@@ -1122,14 +1376,24 @@ pub fn extract_smb2_write_lengths(chunk: &[u8]) -> Vec<u32> {
             continue;
         }
 
-        if let Some(length) = read_u32_le(chunk, body_offset + 4)
-            && length > 0
-        {
-            lengths.push(length);
+        let Some(length) = read_u32_le(chunk, body_offset + 4) else {
+            continue;
+        };
+        if length == 0 {
+            continue;
         }
+
+        let Some(file_id_bytes) = chunk.get(body_offset + 16..body_offset + 32) else {
+            continue;
+        };
+        let Ok(file_id) = <[u8; 16]>::try_from(file_id_bytes) else {
+            continue;
+        };
+
+        requests.push(Smb2WriteRequest { file_id, length });
     }
 
-    lengths
+    requests
 }
 
 pub fn contains_smb2_server_side_copy_request(chunk: &[u8]) -> bool {
@@ -1185,6 +1449,13 @@ fn read_u32_le(bytes: &[u8], offset: usize) -> Option<u32> {
     Some(u32::from_le_bytes([quad[0], quad[1], quad[2], quad[3]]))
 }
 
+fn read_u64_le(bytes: &[u8], offset: usize) -> Option<u64> {
+    let octet = bytes.get(offset..offset + 8)?;
+    Some(u64::from_le_bytes([
+        octet[0], octet[1], octet[2], octet[3], octet[4], octet[5], octet[6], octet[7],
+    ]))
+}
+
 fn decode_utf16le_path(bytes: &[u8]) -> Option<String> {
     if bytes.len() < 2 || !bytes.len().is_multiple_of(2) {
         return None;
@@ -1219,6 +1490,10 @@ fn extract_file_path_hint(reason: &str) -> Option<String> {
     let start = reason.find('\'')?;
     let end = reason[start + 1..].find('\'')?;
     Some(reason[start + 1..start + 1 + end].to_string())
+}
+
+fn file_activity_key(route_name: &str, peer_addr: SocketAddr, file_path: &str) -> String {
+    format!("{route_name}|{}|{file_path}", peer_addr.ip())
 }
 
 fn policy_mode_label(mode: PolicyMode) -> &'static str {
@@ -1507,6 +1782,36 @@ mod tests {
     }
 
     #[test]
+    fn extracts_smb2_write_request_file_id() {
+        let chunk = smb2_write_request(65_536);
+
+        let requests = extract_smb2_write_requests(&chunk);
+
+        assert_eq!(
+            requests,
+            vec![Smb2WriteRequest {
+                file_id: test_file_id(),
+                length: 65_536,
+            }]
+        );
+    }
+
+    #[test]
+    fn extracts_smb2_create_response_file_id() {
+        let chunk = smb2_create_response(42, test_file_id());
+
+        let responses = extract_smb2_create_responses(&chunk);
+
+        assert_eq!(
+            responses,
+            vec![Smb2CreateResponse {
+                message_id: 42,
+                file_id: test_file_id(),
+            }]
+        );
+    }
+
+    #[test]
     fn detects_smb2_server_side_copy_request() {
         let chunk = smb2_ioctl_request(0x0014_40F2);
 
@@ -1543,6 +1848,7 @@ mod tests {
             direction: TrafficDirection::ClientToServer,
             peer_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 49152),
             target_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 445),
+            file_path_hint: None,
         }
     }
 
@@ -1587,6 +1893,28 @@ mod tests {
             .copy_from_slice(&9_u16.to_le_bytes());
         packet[body_offset..body_offset + 2].copy_from_slice(&49_u16.to_le_bytes());
         packet[body_offset + 4..body_offset + 8].copy_from_slice(&length.to_le_bytes());
+        packet[body_offset + 16..body_offset + 32].copy_from_slice(&test_file_id());
+
+        packet
+    }
+
+    fn smb2_create_response(message_id: u64, file_id: [u8; 16]) -> Vec<u8> {
+        let smb_header_offset = 4;
+        let body_offset = smb_header_offset + 64;
+        let packet_len = body_offset + 88;
+        let netbios_len = (packet_len - 4) as u32;
+        let mut packet = vec![0_u8; packet_len];
+
+        packet[0] = ((netbios_len >> 16) & 0xff) as u8;
+        packet[1] = ((netbios_len >> 8) & 0xff) as u8;
+        packet[2] = (netbios_len & 0xff) as u8;
+        packet[smb_header_offset..smb_header_offset + 4].copy_from_slice(b"\xFESMB");
+        packet[smb_header_offset + 12..smb_header_offset + 14]
+            .copy_from_slice(&5_u16.to_le_bytes());
+        packet[smb_header_offset + 24..smb_header_offset + 32]
+            .copy_from_slice(&message_id.to_le_bytes());
+        packet[body_offset..body_offset + 2].copy_from_slice(&89_u16.to_le_bytes());
+        packet[body_offset + 64..body_offset + 80].copy_from_slice(&file_id);
 
         packet
     }
@@ -1608,5 +1936,12 @@ mod tests {
         packet[body_offset + 4..body_offset + 8].copy_from_slice(&control_code.to_le_bytes());
 
         packet
+    }
+
+    fn test_file_id() -> [u8; 16] {
+        [
+            0x10, 0x11, 0x12, 0x13, 0x20, 0x21, 0x22, 0x23, 0x30, 0x31, 0x32, 0x33, 0x40, 0x41,
+            0x42, 0x43,
+        ]
     }
 }
