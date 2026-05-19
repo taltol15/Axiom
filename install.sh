@@ -85,9 +85,10 @@ install_missing_dependencies() {
   ${SUDO} env DEBIAN_FRONTEND=noninteractive apt-get install -y \
     ca-certificates \
     build-essential \
+    binutils \
     pkg-config
 
-  for command_name in ip systemctl setcap sha256sum sysctl curl tar gzip; do
+  for command_name in ip systemctl setcap sha256sum sysctl curl tar gzip cc ld.bfd; do
     if ! command -v "${command_name}" >/dev/null 2>&1; then
       echo "Required command '${command_name}' is still unavailable after dependency installation." >&2
       exit 1
@@ -522,7 +523,16 @@ write_config() {
 build_and_install_binary() {
   echo
   echo "Building Axiom release binary..."
-  (cd "${PROJECT_ROOT}" && cargo build --release -p axiom-daemon)
+  local axiom_rustflags="-C linker=cc -C link-self-contained=no -C link-arg=-fuse-ld=bfd"
+  if [[ -n "${RUSTFLAGS:-}" ]]; then
+    axiom_rustflags="${RUSTFLAGS} ${axiom_rustflags}"
+  fi
+
+  echo "Using system linker for release build: cc with ld.bfd"
+  (
+    cd "${PROJECT_ROOT}"
+    RUSTFLAGS="${axiom_rustflags}" cargo build --release -p axiom-daemon
+  )
 
   ${SUDO} install -m 0755 -o root -g root "${BINARY_SOURCE}" "${BINARY_PATH}"
   ${SUDO} setcap 'cap_net_bind_service,cap_net_raw+ep' "${BINARY_PATH}"
