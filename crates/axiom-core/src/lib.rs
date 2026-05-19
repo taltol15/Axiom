@@ -1239,12 +1239,8 @@ pub fn extract_smb_file_paths(chunk: &[u8]) -> Vec<String> {
 
 pub fn extract_smb2_create_requests(chunk: &[u8]) -> Vec<Smb2CreateRequest> {
     let mut requests = Vec::new();
-    let mut search_start = 0;
 
-    while let Some(relative_offset) = find_bytes(&chunk[search_start..], b"\xFESMB") {
-        let header_offset = search_start + relative_offset;
-        search_start = header_offset + 4;
-
+    for header_offset in smb2_header_offsets(chunk) {
         let Some(command) = read_u16_le(chunk, header_offset + 12) else {
             continue;
         };
@@ -1298,12 +1294,8 @@ pub fn extract_smb2_create_requests(chunk: &[u8]) -> Vec<Smb2CreateRequest> {
 
 pub fn extract_smb2_create_responses(chunk: &[u8]) -> Vec<Smb2CreateResponse> {
     let mut responses = Vec::new();
-    let mut search_start = 0;
 
-    while let Some(relative_offset) = find_bytes(&chunk[search_start..], b"\xFESMB") {
-        let header_offset = search_start + relative_offset;
-        search_start = header_offset + 4;
-
+    for header_offset in smb2_header_offsets(chunk) {
         let Some(command) = read_u16_le(chunk, header_offset + 12) else {
             continue;
         };
@@ -1355,12 +1347,8 @@ pub fn extract_smb2_write_lengths(chunk: &[u8]) -> Vec<u32> {
 
 pub fn extract_smb2_write_requests(chunk: &[u8]) -> Vec<Smb2WriteRequest> {
     let mut requests = Vec::new();
-    let mut search_start = 0;
 
-    while let Some(relative_offset) = find_bytes(&chunk[search_start..], b"\xFESMB") {
-        let header_offset = search_start + relative_offset;
-        search_start = header_offset + 4;
-
+    for header_offset in smb2_header_offsets(chunk) {
         let Some(command) = read_u16_le(chunk, header_offset + 12) else {
             continue;
         };
@@ -1397,12 +1385,7 @@ pub fn extract_smb2_write_requests(chunk: &[u8]) -> Vec<Smb2WriteRequest> {
 }
 
 pub fn contains_smb2_server_side_copy_request(chunk: &[u8]) -> bool {
-    let mut search_start = 0;
-
-    while let Some(relative_offset) = find_bytes(&chunk[search_start..], b"\xFESMB") {
-        let header_offset = search_start + relative_offset;
-        search_start = header_offset + 4;
-
+    for header_offset in smb2_header_offsets(chunk) {
         let Some(command) = read_u16_le(chunk, header_offset + 12) else {
             continue;
         };
@@ -1429,14 +1412,46 @@ pub fn contains_smb2_server_side_copy_request(chunk: &[u8]) -> bool {
     false
 }
 
-fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    (!needle.is_empty())
-        .then(|| {
-            haystack
-                .windows(needle.len())
-                .position(|window| window == needle)
-        })
-        .flatten()
+fn smb2_header_offsets(chunk: &[u8]) -> Vec<usize> {
+    let Some(first_offset) = first_smb2_header_offset(chunk) else {
+        return Vec::new();
+    };
+
+    let mut offsets = Vec::new();
+    let mut header_offset = first_offset;
+
+    loop {
+        if chunk.get(header_offset..header_offset + 4) != Some(b"\xFESMB") {
+            break;
+        }
+        offsets.push(header_offset);
+
+        let Some(next_command) = read_u32_le(chunk, header_offset + 20).map(usize::try_from) else {
+            break;
+        };
+        let Ok(next_command) = next_command else {
+            break;
+        };
+        if next_command == 0 {
+            break;
+        }
+
+        let next_offset = header_offset.saturating_add(next_command);
+        if next_offset <= header_offset || next_offset + 64 > chunk.len() {
+            break;
+        }
+        header_offset = next_offset;
+    }
+
+    offsets
+}
+
+fn first_smb2_header_offset(chunk: &[u8]) -> Option<usize> {
+    if chunk.get(4..8) == Some(b"\xFESMB") || chunk.get(4..8) == Some(b"\xFDSMB") {
+        return (chunk.get(4..8) == Some(b"\xFESMB")).then_some(4);
+    }
+
+    chunk.windows(4).position(|window| window == b"\xFESMB")
 }
 
 fn read_u16_le(bytes: &[u8], offset: usize) -> Option<u16> {

@@ -2,7 +2,7 @@ use std::{
     collections::{HashMap, HashSet},
     io,
     net::SocketAddr,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex as StdMutex},
 };
 
 use anyhow::Context;
@@ -13,12 +13,19 @@ use axiom_core::{
     extract_smb2_create_requests, extract_smb2_create_responses, extract_smb2_write_requests,
 };
 use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
-    net::TcpStream,
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::{
+        TcpStream,
+        tcp::{OwnedReadHalf, OwnedWriteHalf},
+    },
+    sync::Mutex as AsyncMutex,
 };
 use tracing::{debug, info, warn};
 
 use crate::listener::{bind_tcp_listener_to_interface, connect_tcp_via_interface};
+
+const MAX_SMB_TCP_FRAME_LEN: usize = 16 * 1024 * 1024 + 4;
+const STATUS_ACCESS_DENIED: u32 = 0xC000_0022;
 
 pub async fn run_proxy_listener(
     route: ProxyListenerConfig,
@@ -137,9 +144,11 @@ async fn relay_bidirectional(
     let target_addr = route.target_addr();
     let (client_reader, client_writer) = client_stream.into_split();
     let (server_reader, server_writer) = server_stream.into_split();
+    let client_writer = Arc::new(AsyncMutex::new(client_writer));
+    let server_writer = Arc::new(AsyncMutex::new(server_writer));
     let telemetry = Arc::new(ConnectionTelemetry::default());
 
-    let client_to_server = relay_direction(
+    let client_to_server = relay_smb_frame_direction(
         Arc::clone(&route),
         Arc::clone(&state),
         Arc::clone(&telemetry),
@@ -147,10 +156,11 @@ async fn relay_bidirectional(
         target_addr,
         TrafficDirection::ClientToServer,
         client_reader,
-        server_writer,
+        Arc::clone(&server_writer),
+        Some(Arc::clone(&client_writer)),
     );
 
-    let server_to_client = relay_direction(
+    let server_to_client = relay_smb_frame_direction(
         route,
         state,
         telemetry,
@@ -159,141 +169,184 @@ async fn relay_bidirectional(
         TrafficDirection::ServerToClient,
         server_reader,
         client_writer,
+        None,
     );
 
     tokio::try_join!(client_to_server, server_to_client).map(|_| ())
 }
 
-async fn relay_direction<R, W>(
+async fn relay_smb_frame_direction(
     route: Arc<ProxyListenerConfig>,
     state: Arc<RuntimeState>,
     telemetry: Arc<ConnectionTelemetry>,
     peer_addr: SocketAddr,
     target_addr: SocketAddr,
     direction: TrafficDirection,
-    mut reader: R,
-    mut writer: W,
-) -> io::Result<()>
-where
-    R: AsyncRead + Unpin,
-    W: AsyncWrite + Unpin,
-{
-    let mut buffer = vec![0_u8; 64 * 1024];
+    mut reader: OwnedReadHalf,
+    writer: Arc<AsyncMutex<OwnedWriteHalf>>,
+    block_response_writer: Option<Arc<AsyncMutex<OwnedWriteHalf>>>,
+) -> io::Result<()> {
+    let mut buffer = vec![0_u8; 128 * 1024];
+    let mut framer = SmbTcpFramer::default();
     let mut inspection_window = InspectionWindow::new(state.max_pattern_len());
 
     loop {
         let bytes_read = reader.read(&mut buffer).await?;
         if bytes_read == 0 {
-            writer.shutdown().await?;
+            writer.lock().await.shutdown().await?;
             return Ok(());
         }
 
-        state.record_inspection(bytes_read as u64);
-        state.record_route_inspection(&route.name, bytes_read as u64);
         state.record_stream_bytes(&route.name, direction, bytes_read as u64);
         let chunk = &buffer[..bytes_read];
-        let inspection_bytes = inspection_window.merge(chunk);
-        let create_requests = if direction == TrafficDirection::ClientToServer {
-            extract_smb2_create_requests(chunk)
-        } else {
-            Vec::new()
-        };
-        let write_requests = if direction == TrafficDirection::ClientToServer {
-            extract_smb2_write_requests(chunk)
-        } else {
-            Vec::new()
-        };
-        let file_path_hint = if direction == TrafficDirection::ClientToServer {
-            create_requests
-                .first()
-                .map(|request| request.file_path.clone())
-                .or_else(|| {
-                    write_requests
-                        .iter()
-                        .find_map(|request| telemetry.file_path_for_id(&request.file_id))
-                })
-                .or_else(|| telemetry.latest_write_file_path())
-        } else {
-            None
-        };
+        let frames = framer.push(chunk)?;
 
-        let context = InspectionContext {
-            route_name: &route.name,
-            interface: route.interface(),
-            direction,
-            peer_addr,
-            target_addr,
-            file_path_hint: file_path_hint.as_deref(),
-        };
-
-        if direction == TrafficDirection::ClientToServer {
-            for create_request in create_requests {
-                telemetry.observe_create_request(&state, &context, create_request, bytes_read);
-            }
-            for write_request in write_requests {
-                telemetry.observe_write_request(&state, &context, write_request);
-            }
-            if contains_smb2_server_side_copy_request(chunk) {
-                state.record_server_side_copy_requested(&context);
-            }
-        } else {
-            for create_response in extract_smb2_create_responses(chunk) {
-                telemetry.observe_create_response(create_response);
-            }
-        }
-
-        match state.inspect_chunk(&context, &inspection_bytes) {
-            InspectionResult::Allow { entropy } => {
-                debug!(
-                    route = route.name,
-                    ?direction,
-                    bytes = bytes_read,
-                    entropy,
-                    "forwarding inspected SMB chunk"
-                );
-                writer.write_all(&buffer[..bytes_read]).await?;
-                inspection_window.remember(&buffer[..bytes_read]);
-                state.record_allowed_chunk();
-                state.record_bytes(direction, bytes_read as u64);
-                state.record_route_bytes(&route.name, direction, bytes_read as u64);
-            }
-            InspectionResult::Monitor { event } => {
-                let reason = event.reason.clone();
-                warn!(
-                    route = route.name,
-                    interface = route.interface(),
-                    ?direction,
-                    peer = %peer_addr,
-                    target = %target_addr,
-                    reason,
-                    "monitored SMB stream policy event"
-                );
-                state.record_monitored_threat(event);
-                writer.write_all(&buffer[..bytes_read]).await?;
-                inspection_window.remember(&buffer[..bytes_read]);
-                state.record_allowed_chunk();
-                state.record_bytes(direction, bytes_read as u64);
-                state.record_route_bytes(&route.name, direction, bytes_read as u64);
-            }
-            InspectionResult::Block { event } => {
-                let reason = event.reason.clone();
-                record_blocked_event(&state, event);
-                warn!(
-                    route = route.name,
-                    interface = route.interface(),
-                    ?direction,
-                    peer = %peer_addr,
-                    target = %target_addr,
-                    reason,
-                    "blocked SMB stream"
-                );
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "stream blocked by Axiom policy",
-                ));
-            }
+        for frame in frames {
+            inspect_and_forward_frame(
+                &route,
+                &state,
+                &telemetry,
+                peer_addr,
+                target_addr,
+                direction,
+                &writer,
+                block_response_writer.as_ref(),
+                &mut inspection_window,
+                frame,
+            )
+            .await?;
         }
     }
+}
+
+async fn inspect_and_forward_frame(
+    route: &ProxyListenerConfig,
+    state: &RuntimeState,
+    telemetry: &ConnectionTelemetry,
+    peer_addr: SocketAddr,
+    target_addr: SocketAddr,
+    direction: TrafficDirection,
+    writer: &Arc<AsyncMutex<OwnedWriteHalf>>,
+    block_response_writer: Option<&Arc<AsyncMutex<OwnedWriteHalf>>>,
+    inspection_window: &mut InspectionWindow,
+    frame: Vec<u8>,
+) -> io::Result<()> {
+    state.record_inspection(frame.len() as u64);
+    state.record_route_inspection(&route.name, frame.len() as u64);
+
+    let inspection_bytes = inspection_window.merge(&frame);
+    let create_requests = if direction == TrafficDirection::ClientToServer {
+        extract_smb2_create_requests(&frame)
+    } else {
+        Vec::new()
+    };
+    let write_requests = if direction == TrafficDirection::ClientToServer {
+        extract_smb2_write_requests(&frame)
+    } else {
+        Vec::new()
+    };
+    let file_path_hint = if direction == TrafficDirection::ClientToServer {
+        create_requests
+            .first()
+            .map(|request| request.file_path.clone())
+            .or_else(|| {
+                write_requests
+                    .iter()
+                    .find_map(|request| telemetry.file_path_for_id(&request.file_id))
+            })
+            .or_else(|| telemetry.latest_write_file_path())
+    } else {
+        None
+    };
+
+    let context = InspectionContext {
+        route_name: &route.name,
+        interface: route.interface(),
+        direction,
+        peer_addr,
+        target_addr,
+        file_path_hint: file_path_hint.as_deref(),
+    };
+
+    if direction == TrafficDirection::ClientToServer {
+        for create_request in create_requests {
+            telemetry.observe_create_request(state, &context, create_request, frame.len());
+        }
+        for write_request in write_requests {
+            telemetry.observe_write_request(state, &context, write_request);
+        }
+        if contains_smb2_server_side_copy_request(&frame) {
+            state.record_server_side_copy_requested(&context);
+        }
+    } else {
+        for create_response in extract_smb2_create_responses(&frame) {
+            telemetry.observe_create_response(create_response);
+        }
+    }
+
+    match state.inspect_chunk(&context, &inspection_bytes) {
+        InspectionResult::Allow { entropy } => {
+            debug!(
+                route = route.name,
+                ?direction,
+                bytes = frame.len(),
+                entropy,
+                "forwarding inspected SMB frame"
+            );
+            writer.lock().await.write_all(&frame).await?;
+            inspection_window.remember(&frame);
+            state.record_allowed_chunk();
+            state.record_bytes(direction, frame.len() as u64);
+            state.record_route_bytes(&route.name, direction, frame.len() as u64);
+        }
+        InspectionResult::Monitor { event } => {
+            let reason = event.reason.clone();
+            warn!(
+                route = route.name,
+                interface = route.interface(),
+                ?direction,
+                peer = %peer_addr,
+                target = %target_addr,
+                reason,
+                "monitored SMB stream policy event"
+            );
+            state.record_monitored_threat(event);
+            writer.lock().await.write_all(&frame).await?;
+            inspection_window.remember(&frame);
+            state.record_allowed_chunk();
+            state.record_bytes(direction, frame.len() as u64);
+            state.record_route_bytes(&route.name, direction, frame.len() as u64);
+        }
+        InspectionResult::Block { event } => {
+            let reason = event.reason.clone();
+            record_blocked_event(state, event);
+            warn!(
+                route = route.name,
+                interface = route.interface(),
+                ?direction,
+                peer = %peer_addr,
+                target = %target_addr,
+                reason,
+                "blocked SMB frame"
+            );
+
+            if direction == TrafficDirection::ClientToServer
+                && let Some(response_writer) = block_response_writer
+                && let Some(response) = build_smb2_error_response(&frame, STATUS_ACCESS_DENIED)
+            {
+                let mut client_writer = response_writer.lock().await;
+                client_writer.write_all(&response).await?;
+                client_writer.shutdown().await?;
+            }
+
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "stream blocked by Axiom policy",
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 fn record_blocked_event(state: &RuntimeState, event: ThreatEvent) {
@@ -301,11 +354,110 @@ fn record_blocked_event(state: &RuntimeState, event: ThreatEvent) {
 }
 
 #[derive(Debug, Default)]
+struct SmbTcpFramer {
+    pending: Vec<u8>,
+}
+
+impl SmbTcpFramer {
+    fn push(&mut self, chunk: &[u8]) -> io::Result<Vec<Vec<u8>>> {
+        self.pending.extend_from_slice(chunk);
+        let mut frames = Vec::new();
+
+        loop {
+            if self.pending.len() < 4 {
+                break;
+            }
+
+            if self.pending[0] != 0 {
+                if let Some(offset) = find_smb_tcp_frame_start(&self.pending) {
+                    if offset > 0 {
+                        self.pending.drain(..offset);
+                    }
+                } else if self.pending.len() > 4 {
+                    let retained = self.pending.split_off(self.pending.len() - 4);
+                    self.pending = retained;
+                    break;
+                } else {
+                    break;
+                }
+            }
+
+            if self.pending.len() < 4 {
+                break;
+            }
+
+            let frame_len = ((self.pending[1] as usize) << 16)
+                | ((self.pending[2] as usize) << 8)
+                | self.pending[3] as usize;
+            if frame_len == 0 {
+                self.pending.drain(..4);
+                continue;
+            }
+
+            let total_len = frame_len + 4;
+            if total_len > MAX_SMB_TCP_FRAME_LEN {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("SMB frame length {total_len} exceeds supported maximum"),
+                ));
+            }
+
+            if self.pending.len() < total_len {
+                break;
+            }
+
+            frames.push(self.pending.drain(..total_len).collect());
+        }
+
+        Ok(frames)
+    }
+}
+
+fn find_smb_tcp_frame_start(bytes: &[u8]) -> Option<usize> {
+    bytes.windows(8).position(|window| {
+        window[0] == 0
+            && (window.get(4..8) == Some(b"\xFESMB") || window.get(4..8) == Some(b"\xFDSMB"))
+    })
+}
+
+fn build_smb2_error_response(request_frame: &[u8], status: u32) -> Option<Vec<u8>> {
+    let header_offset = request_frame
+        .windows(4)
+        .position(|window| window == b"\xFESMB")?;
+    let request_header = request_frame.get(header_offset..header_offset + 64)?;
+
+    let smb_payload_len = 64 + 8;
+    let mut response = vec![0_u8; 4 + smb_payload_len];
+    response[1] = ((smb_payload_len >> 16) & 0xff) as u8;
+    response[2] = ((smb_payload_len >> 8) & 0xff) as u8;
+    response[3] = (smb_payload_len & 0xff) as u8;
+
+    let header = &mut response[4..68];
+    header[0..4].copy_from_slice(b"\xFESMB");
+    header[4..6].copy_from_slice(&64_u16.to_le_bytes());
+    header[6..8].copy_from_slice(&request_header[6..8]);
+    header[8..12].copy_from_slice(&status.to_le_bytes());
+    header[12..14].copy_from_slice(&request_header[12..14]);
+    header[14..16].copy_from_slice(&1_u16.to_le_bytes());
+    header[16..20].copy_from_slice(&1_u32.to_le_bytes());
+    header[24..32].copy_from_slice(&request_header[24..32]);
+    header[32..36].copy_from_slice(&request_header[32..36]);
+    header[36..40].copy_from_slice(&request_header[36..40]);
+    header[40..48].copy_from_slice(&request_header[40..48]);
+
+    let body = &mut response[68..76];
+    body[0..2].copy_from_slice(&9_u16.to_le_bytes());
+    body[4..8].copy_from_slice(&0_u32.to_le_bytes());
+
+    Some(response)
+}
+
+#[derive(Debug, Default)]
 struct ConnectionTelemetry {
-    pending_create_paths: Mutex<HashMap<u64, String>>,
-    open_file_paths: Mutex<HashMap<[u8; 16], String>>,
-    observed_file_paths: Mutex<HashSet<String>>,
-    latest_write_file_path: Mutex<Option<String>>,
+    pending_create_paths: StdMutex<HashMap<u64, String>>,
+    open_file_paths: StdMutex<HashMap<[u8; 16], String>>,
+    observed_file_paths: StdMutex<HashSet<String>>,
+    latest_write_file_path: StdMutex<Option<String>>,
 }
 
 impl ConnectionTelemetry {
@@ -462,5 +614,68 @@ impl InspectionWindow {
         self.tail.clear();
         self.tail
             .extend_from_slice(&chunk[chunk.len().saturating_sub(retained)..]);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn smb_tcp_framer_reassembles_split_frames() {
+        let frame = smb2_test_frame(5, 99);
+        let split_at = 13;
+        let mut framer = SmbTcpFramer::default();
+
+        assert!(framer.push(&frame[..split_at]).unwrap().is_empty());
+        let frames = framer.push(&frame[split_at..]).unwrap();
+
+        assert_eq!(frames, vec![frame]);
+    }
+
+    #[test]
+    fn smb_tcp_framer_extracts_multiple_frames() {
+        let first = smb2_test_frame(5, 1);
+        let second = smb2_test_frame(9, 2);
+        let mut combined = first.clone();
+        combined.extend_from_slice(&second);
+        let mut framer = SmbTcpFramer::default();
+
+        let frames = framer.push(&combined).unwrap();
+
+        assert_eq!(frames, vec![first, second]);
+    }
+
+    #[test]
+    fn smb2_error_response_preserves_message_context() {
+        let request = smb2_test_frame(5, 42);
+
+        let response = build_smb2_error_response(&request, STATUS_ACCESS_DENIED).unwrap();
+
+        assert_eq!(&response[4..8], b"\xFESMB");
+        assert_eq!(
+            u32::from_le_bytes(response[12..16].try_into().unwrap()),
+            STATUS_ACCESS_DENIED
+        );
+        assert_eq!(u16::from_le_bytes(response[16..18].try_into().unwrap()), 5);
+        assert_eq!(u32::from_le_bytes(response[20..24].try_into().unwrap()), 1);
+        assert_eq!(u64::from_le_bytes(response[28..36].try_into().unwrap()), 42);
+        assert_eq!(u16::from_le_bytes(response[68..70].try_into().unwrap()), 9);
+    }
+
+    fn smb2_test_frame(command: u16, message_id: u64) -> Vec<u8> {
+        let smb_payload_len = 64 + 8;
+        let mut frame = vec![0_u8; 4 + smb_payload_len];
+
+        frame[1] = ((smb_payload_len >> 16) & 0xff) as u8;
+        frame[2] = ((smb_payload_len >> 8) & 0xff) as u8;
+        frame[3] = (smb_payload_len & 0xff) as u8;
+        frame[4..8].copy_from_slice(b"\xFESMB");
+        frame[8..10].copy_from_slice(&64_u16.to_le_bytes());
+        frame[16..18].copy_from_slice(&command.to_le_bytes());
+        frame[28..36].copy_from_slice(&message_id.to_le_bytes());
+        frame[68..70].copy_from_slice(&9_u16.to_le_bytes());
+
+        frame
     }
 }

@@ -730,6 +730,84 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Axiom Dashboard</title>
   <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    body {
+      background:
+        linear-gradient(180deg, #eef5f8 0%, #f7fafc 44%, #edf2f7 100%);
+      color: #111827;
+    }
+
+    header {
+      background: #0f172a !important;
+      border-color: #1e293b !important;
+      box-shadow: 0 18px 46px rgba(15, 23, 42, 0.18);
+    }
+
+    header h1,
+    header button,
+    header .text-zinc-200 {
+      color: #f8fafc !important;
+    }
+
+    main > section,
+    main article {
+      background: rgba(255, 255, 255, 0.92) !important;
+      border-color: #d8e2ea !important;
+      box-shadow: 0 12px 30px rgba(15, 23, 42, 0.07);
+    }
+
+    main article {
+      min-height: 132px;
+    }
+
+    main .text-white,
+    main .text-zinc-100,
+    main .text-zinc-200,
+    main .text-zinc-300 {
+      color: #111827 !important;
+    }
+
+    main .text-zinc-400,
+    main .text-zinc-500 {
+      color: #64748b !important;
+    }
+
+    main .bg-zinc-950,
+    main .bg-zinc-950\/50,
+    main .bg-zinc-950\/60,
+    main .bg-zinc-900,
+    main .hover\:bg-zinc-800\/40:hover {
+      background-color: #ffffff !important;
+    }
+
+    main .border-zinc-700,
+    main .border-zinc-800,
+    main .divide-zinc-800 > :not([hidden]) ~ :not([hidden]) {
+      border-color: #d8e2ea !important;
+    }
+
+    select,
+    input {
+      background: #f8fafc !important;
+      color: #111827 !important;
+      border-color: #cbd5e1 !important;
+    }
+
+    textarea,
+    pre {
+      background: #101827 !important;
+      color: #dbeafe !important;
+      border-color: #263247 !important;
+    }
+
+    table thead {
+      background: #f1f5f9 !important;
+    }
+
+    .policy-preset {
+      background: #ffffff !important;
+    }
+  </style>
 </head>
 <body class="min-h-screen bg-zinc-950 text-zinc-100">
   <header class="border-b border-zinc-800 bg-zinc-950/95">
@@ -745,15 +823,15 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
   <main class="mx-auto max-w-7xl px-6 py-8">
     <section class="grid gap-5 md:grid-cols-4 xl:grid-cols-8">
       <article class="rounded-lg border border-zinc-800 bg-zinc-900 p-6">
-        <p class="text-sm text-zinc-400">Forwarded Bytes</p>
+        <p class="text-sm text-zinc-400">Forwarded Traffic</p>
         <p id="forwarded-bytes" class="mt-4 text-4xl font-semibold text-white">0 B</p>
       </article>
       <article class="rounded-lg border border-zinc-800 bg-zinc-900 p-6">
-        <p class="text-sm text-zinc-400">Socket Bytes Read</p>
+        <p class="text-sm text-zinc-400">Wire Traffic Seen</p>
         <p id="stream-bytes" class="mt-4 text-4xl font-semibold text-sky-200">0 B</p>
       </article>
       <article class="rounded-lg border border-zinc-800 bg-zinc-900 p-6">
-        <p class="text-sm text-zinc-400">SMB Write Bytes</p>
+        <p class="text-sm text-zinc-400">Uploaded File Bytes</p>
         <p id="smb-write-bytes" class="mt-4 text-4xl font-semibold text-lime-200">0 B</p>
       </article>
       <article class="rounded-lg border border-zinc-800 bg-zinc-900 p-6">
