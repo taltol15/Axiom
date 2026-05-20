@@ -88,7 +88,8 @@ install_missing_dependencies() {
     ca-certificates \
     build-essential \
     binutils \
-    pkg-config
+    pkg-config \
+    whiptail
 
   for command_name in ip systemctl setcap sha256sum sysctl curl tar gzip cc ld.bfd; do
     if ! command -v "${command_name}" >/dev/null 2>&1; then
@@ -186,7 +187,100 @@ print_interfaces() {
   echo
 }
 
+use_tui() {
+  [[ "${AXIOM_INSTALLER_CLI:-0}" != "1" ]] \
+    && [[ -t 0 ]] \
+    && command -v whiptail >/dev/null 2>&1
+}
+
+ui_error() {
+  local message="$1"
+  if use_tui; then
+    whiptail --title "Axiom installer" --msgbox "${message}" 10 72
+  else
+    echo "${message}" >&2
+  fi
+}
+
+ui_input() {
+  local prompt="$1"
+  local default_value="${2:-}"
+
+  if use_tui; then
+    whiptail --title "Axiom installer" --inputbox "${prompt}" 10 76 "${default_value}" 3>&1 1>&2 2>&3
+  else
+    return 1
+  fi
+}
+
+ui_password() {
+  local prompt="$1"
+
+  if use_tui; then
+    whiptail --title "Axiom installer" --passwordbox "${prompt}" 10 76 3>&1 1>&2 2>&3
+  else
+    return 1
+  fi
+}
+
+interface_summary() {
+  local interface_name="$1"
+  local state
+  local ipv4
+
+  state="$(get_interface_state "${interface_name}")"
+  ipv4="$(get_interface_ipv4 "${interface_name}")"
+  if [[ -z "${ipv4}" ]]; then
+    ipv4="-"
+  fi
+
+  printf "%s  state=%s  ipv4=%s" "${interface_name}" "${state}" "${ipv4}"
+}
+
+select_interface_tui() {
+  local prompt="$1"
+  local choices=()
+  local index
+  local selection
+
+  for index in "${!INTERFACES[@]}"; do
+    choices+=("$((index + 1))" "$(interface_summary "${INTERFACES[${index}]}")")
+  done
+
+  selection="$(whiptail --title "Axiom installer" --menu "${prompt}" 22 88 12 "${choices[@]}" 3>&1 1>&2 2>&3)" || return 1
+  printf "%s" "${INTERFACES[$((selection - 1))]}"
+}
+
+select_proxy_interfaces_tui() {
+  local choices=()
+  local index
+  local raw_selection
+  local selection
+
+  for index in "${!INTERFACES[@]}"; do
+    choices+=("$((index + 1))" "$(interface_summary "${INTERFACES[${index}]}")" "OFF")
+  done
+
+  raw_selection="$(whiptail --title "Axiom installer" --separate-output --checklist "Select the SMB Proxy interfaces" 22 88 12 "${choices[@]}" 3>&1 1>&2 2>&3)" || return 1
+  mapfile -t selections <<< "${raw_selection}"
+
+  SELECTED_PROXY_INTERFACES=()
+  for selection in "${selections[@]}"; do
+    if [[ "${selection}" =~ ^[0-9]+$ ]] && ((selection >= 1 && selection <= ${#INTERFACES[@]})); then
+      SELECTED_PROXY_INTERFACES+=("${INTERFACES[$((selection - 1))]}")
+    fi
+  done
+
+  ((${#SELECTED_PROXY_INTERFACES[@]} > 0))
+}
+
 select_management_interface() {
+  if use_tui; then
+    if MANAGEMENT_INTERFACE="$(select_interface_tui "Select the interface for the Web Management UI")"; then
+      return
+    fi
+  fi
+
   while true; do
     print_interfaces
     read -r -p "Select the interface for the Web Management UI [number]: " selection
@@ -199,6 +293,12 @@ select_management_interface() {
 }
 
 select_proxy_interfaces() {
+  if use_tui; then
+    if select_proxy_interfaces_tui; then
+      return
+    fi
+  fi
+
   while true; do
     print_interfaces
     read -r -p "Select the interfaces for the Proxy [comma-separated numbers]: " raw_selection
@@ -235,6 +335,12 @@ select_proxy_interfaces() {
 }
 
 select_dns_interface() {
+  if use_tui; then
+    if DNS_INTERFACE="$(select_interface_tui "Select the interface for the DNS Security Gateway")"; then
+      return
+    fi
+  fi
+
   while true; do
     print_interfaces
     read -r -p "Select the interface for the DNS Security Gateway [number]: " selection
@@ -270,7 +376,10 @@ prompt_ipv4() {
   local value
 
   while true; do
-    if [[ -n "${default_value}" ]]; then
+    if use_tui; then
+      value="$(ui_input "${prompt}" "${default_value}")" || exit 1
+      value="${value:-${default_value}}"
+    elif [[ -n "${default_value}" ]]; then
       printf "%s [%s]: " "${prompt}" "${default_value}" >&2
       read -r value
       value="${value:-${default_value}}"
@@ -283,7 +392,7 @@ prompt_ipv4() {
       printf "%s" "${value}"
       return
     fi
-    echo "Invalid IPv4 address." >&2
+    ui_error "Invalid IPv4 address."
   done
 }
 
@@ -293,15 +402,19 @@ prompt_port() {
   local value
 
   while true; do
-    printf "%s [%s]: " "${prompt}" "${default_value}" >&2
-    read -r value
+    if use_tui; then
+      value="$(ui_input "${prompt}" "${default_value}")" || exit 1
+    else
+      printf "%s [%s]: " "${prompt}" "${default_value}" >&2
+      read -r value
+    fi
     value="${value:-${default_value}}"
 
     if [[ "${value}" =~ ^[0-9]+$ ]] && ((value >= 1 && value <= 65535)); then
       printf "%s" "${value}"
       return
     fi
-    echo "Invalid TCP port." >&2
+    ui_error "Invalid TCP/UDP port."
   done
 }
 
@@ -311,7 +424,14 @@ prompt_yes_no() {
   local value
   local suffix
 
-  if [[ "${default_value}" == "yes" ]]; then
+  if use_tui; then
+    local default_option=()
+    if [[ "${default_value}" != "yes" ]]; then
+      default_option=(--defaultno)
+    fi
+    whiptail --title "Axiom installer" "${default_option[@]}" --yesno "${prompt}" 10 76
+    return $?
+  elif [[ "${default_value}" == "yes" ]]; then
     suffix="Y/n"
   else
     suffix="y/N"
@@ -334,7 +454,7 @@ prompt_yes_no() {
         return 1
         ;;
       *)
-        echo "Please answer yes or no." >&2
+        ui_error "Please answer yes or no."
         ;;
     esac
   done
@@ -345,8 +465,12 @@ prompt_optional_vlan() {
   local value
 
   while true; do
-    printf "%s [empty for none]: " "${prompt}" >&2
-    read -r value
+    if use_tui; then
+      value="$(ui_input "${prompt} (empty for none)" "")" || exit 1
+    else
+      printf "%s [empty for none]: " "${prompt}" >&2
+      read -r value
+    fi
     if [[ -z "${value}" ]]; then
       printf ""
       return
@@ -356,22 +480,32 @@ prompt_optional_vlan() {
       printf "%s" "${value}"
       return
     fi
-    echo "Invalid VLAN ID." >&2
+    ui_error "Invalid VLAN ID."
   done
 }
 
 prompt_dns_upstreams() {
   local prompt="$1"
+  local default_value="${2:-}"
   local raw_value
   local upstream
 
   while true; do
-    printf "%s [comma-separated IPv4 or IPv4:port]: " "${prompt}" >&2
-    read -r raw_value
+    if use_tui; then
+      raw_value="$(ui_input "${prompt} (comma-separated IPv4 or IPv4:port)" "${default_value}")" || exit 1
+    else
+      if [[ -n "${default_value}" ]]; then
+        printf "%s [comma-separated IPv4 or IPv4:port] [%s]: " "${prompt}" "${default_value}" >&2
+      else
+        printf "%s [comma-separated IPv4 or IPv4:port]: " "${prompt}" >&2
+      fi
+      read -r raw_value
+    fi
+    raw_value="${raw_value:-${default_value}}"
     raw_value="${raw_value// /}"
 
     if [[ -z "${raw_value}" ]]; then
-      echo "At least one upstream DNS server is required when DNS is enabled." >&2
+      ui_error "At least one upstream DNS server is required when DNS is enabled."
       continue
     fi
 
@@ -389,13 +523,13 @@ prompt_dns_upstreams() {
       fi
 
       if ! is_ipv4 "${ip}"; then
-        echo "Invalid upstream DNS IPv4: ${ip}" >&2
+        ui_error "Invalid upstream DNS IPv4: ${ip}"
         valid="false"
         break
       fi
 
       if [[ ! "${port}" =~ ^[0-9]+$ ]] || ((port < 1 || port > 65535)); then
-        echo "Invalid upstream DNS port: ${port}" >&2
+        ui_error "Invalid upstream DNS port: ${port}"
         valid="false"
         break
       fi
@@ -410,18 +544,77 @@ prompt_dns_upstreams() {
   done
 }
 
+configure_dns_upstreams() {
+  local mode
+
+  if use_tui; then
+    mode="$(whiptail --title "Axiom installer" --menu "Choose DNS upstream mode" 16 82 6 \
+      "internal" "Internal/DC DNS resolvers" \
+      "cloudflare" "Cloudflare public DNS: 1.1.1.1, 1.0.0.1" \
+      "google" "Google public DNS: 8.8.8.8, 8.8.4.4" \
+      "quad9" "Quad9 security DNS: 9.9.9.9, 149.112.112.112" \
+      "custom" "Custom recursive resolvers" \
+      3>&1 1>&2 2>&3)" || exit 1
+  else
+    echo
+    echo "DNS upstream mode:"
+    echo "  1) Internal/DC DNS resolvers"
+    echo "  2) Cloudflare public DNS (1.1.1.1, 1.0.0.1)"
+    echo "  3) Google public DNS (8.8.8.8, 8.8.4.4)"
+    echo "  4) Quad9 security DNS (9.9.9.9, 149.112.112.112)"
+    echo "  5) Custom recursive resolvers"
+    while true; do
+      read -r -p "Select DNS upstream mode [1-5]: " mode
+      case "${mode}" in
+        1) mode="internal"; break ;;
+        2) mode="cloudflare"; break ;;
+        3) mode="google"; break ;;
+        4) mode="quad9"; break ;;
+        5) mode="custom"; break ;;
+        *) echo "Invalid DNS upstream mode." ;;
+      esac
+    done
+  fi
+
+  case "${mode}" in
+    internal)
+      prompt_dns_upstreams "Internal/DC DNS servers"
+      ;;
+    cloudflare)
+      DNS_UPSTREAMS=("1.1.1.1:53" "1.0.0.1:53")
+      ;;
+    google)
+      DNS_UPSTREAMS=("8.8.8.8:53" "8.8.4.4:53")
+      ;;
+    quad9)
+      DNS_UPSTREAMS=("9.9.9.9:53" "149.112.112.112:53")
+      ;;
+    custom)
+      prompt_dns_upstreams "Custom upstream DNS servers" "8.8.8.8,1.1.1.1"
+      ;;
+    *)
+      ui_error "Invalid DNS upstream mode."
+      configure_dns_upstreams
+      ;;
+  esac
+}
+
 prompt_nonempty() {
   local prompt="$1"
   local value
 
   while true; do
-    printf "%s: " "${prompt}" >&2
-    read -r value
+    if use_tui; then
+      value="$(ui_input "${prompt}" "")" || exit 1
+    else
+      printf "%s: " "${prompt}" >&2
+      read -r value
+    fi
     if [[ -n "${value}" ]]; then
       printf "%s" "${value}"
       return
     fi
-    echo "Value must not be empty." >&2
+    ui_error "Value must not be empty."
   done
 }
 
@@ -431,18 +624,23 @@ prompt_admin_credentials() {
   local password
   local confirmation
   while true; do
-    read -r -s -p "Set Web UI admin password: " password
-    echo
-    read -r -s -p "Confirm Web UI admin password: " confirmation
-    echo
+    if use_tui; then
+      password="$(ui_password "Set Web UI admin password")" || exit 1
+      confirmation="$(ui_password "Confirm Web UI admin password")" || exit 1
+    else
+      read -r -s -p "Set Web UI admin password: " password
+      echo
+      read -r -s -p "Confirm Web UI admin password: " confirmation
+      echo
+    fi
 
     if [[ -z "${password}" ]]; then
-      echo "Password must not be empty."
+      ui_error "Password must not be empty."
       continue
     fi
 
     if [[ "${password}" != "${confirmation}" ]]; then
-      echo "Passwords do not match."
+      ui_error "Passwords do not match."
       continue
     fi
 
@@ -540,7 +738,7 @@ collect_configuration() {
   DNS_THREAT_FEED_URLS=()
 
   echo
-  if prompt_yes_no "Enable Axiom DNS Security Gateway in front of your DC DNS" "yes"; then
+  if prompt_yes_no "Enable Axiom DNS Security Gateway" "yes"; then
     DNS_ENABLED="true"
     select_dns_interface
 
@@ -554,7 +752,7 @@ collect_configuration() {
     DNS_UDP_PORT="$(prompt_port "DNS UDP port" "${DNS_DEFAULT_PORT}")"
     DNS_TCP_PORT="$(prompt_port "DNS TCP port" "${DNS_DEFAULT_PORT}")"
     DNS_UPSTREAM_INTERFACE="${DNS_INTERFACE}"
-    prompt_dns_upstreams "Upstream DC/internal DNS servers"
+    configure_dns_upstreams
 
     if prompt_yes_no "Enable the built-in URLhaus DNS threat feed" "yes"; then
       DNS_THREAT_FEED_URLS=("${DNS_DEFAULT_THREAT_FEED_URL}")

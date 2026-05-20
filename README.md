@@ -29,6 +29,11 @@ Axiom listens on UDP/TCP 53, checks domains against local policy and configured
 threat feeds, caches safe responses, and forwards allowed queries to the
 configured internal DC/upstream DNS servers.
 
+Organizations without internal DNS can select public recursive upstreams during
+installation, including Cloudflare, Google, Quad9, or custom resolver IPs.
+When `whiptail` is available, the installer uses a terminal GUI/TUI; set
+`AXIOM_INSTALLER_CLI=1` to force the plain CLI wizard.
+
 ## Policies
 
 The management UI includes runtime policy controls for SMB archive detection,
