@@ -9,10 +9,12 @@ rust-version.workspace = true
 [dependencies]
 anyhow.workspace = true
 axiom-config = { path = "../axiom-config" }
+axiom-control = { path = "../axiom-control" }
 axiom-core = { path = "../axiom-core" }
 axiom-dns = { path = "../axiom-dns" }
 axiom-net = { path = "../axiom-net" }
 axiom-web = { path = "../axiom-web" }
+axum.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true

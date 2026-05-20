@@ -11,6 +11,9 @@ use anyhow::Context;
 use axiom_config::{
     AdminCredentials, AxiomConfig, DnsPolicyConfig, NodeRole, PolicyConfig, ProxyListenerConfig,
 };
+use axiom_control::{
+    ControlApplyResponse, ControlPolicyBundle, EncryptedEnvelope, decrypt_payload, encrypt_payload,
+};
 use axiom_core::{
     DnsPolicyRuntimeSnapshot, InspectionContext, InspectionResult, PolicyRuntimeSnapshot,
     RuntimeState, StatusSnapshot, TrafficDirection,
@@ -167,6 +170,7 @@ async fn api_node_report(
         version: report.version,
         last_seen_unix_timestamp_seconds: unix_timestamp_seconds(),
         management_url: report.management_url,
+        control_url: report.control_url,
         proxy_listeners: report.proxy_listeners,
         dns: report.dns,
         stats: report.stats,
@@ -263,13 +267,15 @@ async fn api_update_policies(
             .into_response();
     }
 
-    let runtime_policy = state.runtime.update_policy(policy);
+    let runtime_policy = state.runtime.update_policy(policy.clone());
+    let node_push_results = push_policy_bundle_to_nodes(state.as_ref(), Some(policy), None).await;
 
     Json(PolicyUpdateResponse {
         message: "policy updated and applied to the running engine",
         process_id: std::process::id(),
         config_path: state.config_path.display().to_string(),
         policy_runtime: runtime_policy,
+        node_push_results,
     })
     .into_response()
 }
@@ -331,13 +337,15 @@ async fn api_update_dns_policy(
             .into_response();
     }
 
-    let dns_policy_runtime = state.runtime.update_dns_policy(policy);
+    let dns_policy_runtime = state.runtime.update_dns_policy(policy.clone());
+    let node_push_results = push_policy_bundle_to_nodes(state.as_ref(), None, Some(policy)).await;
 
     Json(DnsPolicyUpdateResponse {
         message: "DNS policy updated and applied to the running resolver",
         process_id: std::process::id(),
         config_path: state.config_path.display().to_string(),
         dns_policy_runtime,
+        node_push_results,
     })
     .into_response()
 }
@@ -741,6 +749,200 @@ fn fleet_node_snapshots(state: &WebState) -> Vec<FleetNodeStatus> {
     nodes
 }
 
+async fn push_policy_bundle_to_nodes(
+    state: &WebState,
+    policy: Option<PolicyConfig>,
+    dns_policy: Option<DnsPolicyConfig>,
+) -> Vec<NodePushResult> {
+    let target_nodes: Vec<_> = fleet_node_snapshots(state)
+        .into_iter()
+        .filter(|node| {
+            (policy.is_some() && node.role == NodeRole::SmbProxy)
+                || (dns_policy.is_some() && node.role == NodeRole::Dns)
+        })
+        .collect();
+
+    if target_nodes.is_empty() {
+        return Vec::new();
+    }
+
+    let shared_secret = {
+        let config = state.config.lock().expect("web config mutex poisoned");
+        config.node.enrollment_token.clone()
+    };
+    let Some(shared_secret) = shared_secret.filter(|token| !token.trim().is_empty()) else {
+        return target_nodes
+            .into_iter()
+            .map(|node| NodePushResult {
+                node_id: node.node_id,
+                role: node.role,
+                control_url: node.control_url,
+                accepted: false,
+                message: "management enrollment token is not configured".to_string(),
+            })
+            .collect();
+    };
+
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(6))
+        .user_agent("AxiomManagementControl/0.1")
+        .build()
+    {
+        Ok(client) => client,
+        Err(error) => {
+            return target_nodes
+                .into_iter()
+                .map(|node| NodePushResult {
+                    node_id: node.node_id,
+                    role: node.role,
+                    control_url: node.control_url,
+                    accepted: false,
+                    message: format!("failed building control client: {error}"),
+                })
+                .collect();
+        }
+    };
+
+    let mut results = Vec::with_capacity(target_nodes.len());
+    for node in target_nodes {
+        results.push(
+            push_policy_bundle_to_node(
+                &client,
+                &shared_secret,
+                node,
+                policy.clone(),
+                dns_policy.clone(),
+            )
+            .await,
+        );
+    }
+
+    results
+}
+
+async fn push_policy_bundle_to_node(
+    client: &reqwest::Client,
+    shared_secret: &str,
+    node: FleetNodeStatus,
+    policy: Option<PolicyConfig>,
+    dns_policy: Option<DnsPolicyConfig>,
+) -> NodePushResult {
+    let node_id = node.node_id.clone();
+    let role = node.role;
+    let control_url = node.control_url.clone();
+    let Some(control_url_value) = control_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return NodePushResult {
+            node_id,
+            role,
+            control_url,
+            accepted: false,
+            message: "node did not publish a control URL yet".to_string(),
+        };
+    };
+
+    let command = ControlPolicyBundle {
+        command_id: format!(
+            "{}-{}-{}",
+            unix_timestamp_seconds(),
+            std::process::id(),
+            node_id
+        ),
+        issued_unix_timestamp_seconds: unix_timestamp_seconds(),
+        policy,
+        dns_policy,
+    };
+
+    let envelope = match encrypt_payload(&node_id, shared_secret, &command) {
+        Ok(envelope) => envelope,
+        Err(error) => {
+            return NodePushResult {
+                node_id,
+                role,
+                control_url,
+                accepted: false,
+                message: format!("failed encrypting policy bundle: {error}"),
+            };
+        }
+    };
+
+    let url = format!(
+        "{}/api/control/policies",
+        control_url_value.trim_end_matches('/')
+    );
+    let response = match client
+        .post(url)
+        .bearer_auth(shared_secret)
+        .json(&envelope)
+        .send()
+        .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            return NodePushResult {
+                node_id,
+                role,
+                control_url,
+                accepted: false,
+                message: format!("control push request failed: {error}"),
+            };
+        }
+    };
+
+    if !response.status().is_success() {
+        return NodePushResult {
+            node_id,
+            role,
+            control_url,
+            accepted: false,
+            message: format!("node returned HTTP {}", response.status()),
+        };
+    }
+
+    let response_envelope: EncryptedEnvelope = match response.json().await {
+        Ok(envelope) => envelope,
+        Err(error) => {
+            return NodePushResult {
+                node_id,
+                role,
+                control_url,
+                accepted: false,
+                message: format!("failed decoding encrypted node response: {error}"),
+            };
+        }
+    };
+
+    if response_envelope.node_id != node_id {
+        return NodePushResult {
+            node_id,
+            role,
+            control_url,
+            accepted: false,
+            message: "node response identity mismatch".to_string(),
+        };
+    }
+
+    match decrypt_payload::<ControlApplyResponse>(shared_secret, &response_envelope) {
+        Ok(response) => NodePushResult {
+            node_id,
+            role,
+            control_url,
+            accepted: response.accepted,
+            message: response.message,
+        },
+        Err(error) => NodePushResult {
+            node_id,
+            role,
+            control_url,
+            accepted: false,
+            message: format!("failed decrypting node response: {error}"),
+        },
+    }
+}
+
 fn smb_deployment_warnings(config: &AxiomConfig, stats: &StatusSnapshot) -> Vec<String> {
     if config.proxy_listeners.is_empty() {
         return Vec::new();
@@ -848,6 +1050,7 @@ struct FleetNodeStatus {
     version: String,
     last_seen_unix_timestamp_seconds: u64,
     management_url: Option<String>,
+    control_url: Option<String>,
     proxy_listeners: Vec<ProxyListenerStatus>,
     dns: DnsStatus,
     stats: serde_json::Value,
@@ -861,6 +1064,7 @@ struct NodeReport {
     hostname: String,
     version: String,
     management_url: Option<String>,
+    control_url: Option<String>,
     proxy_listeners: Vec<ProxyListenerStatus>,
     dns: DnsStatus,
     stats: serde_json::Value,
@@ -1007,6 +1211,7 @@ struct PolicyUpdateResponse {
     process_id: u32,
     config_path: String,
     policy_runtime: PolicyRuntimeSnapshot,
+    node_push_results: Vec<NodePushResult>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1015,6 +1220,16 @@ struct DnsPolicyUpdateResponse {
     process_id: u32,
     config_path: String,
     dns_policy_runtime: DnsPolicyRuntimeSnapshot,
+    node_push_results: Vec<NodePushResult>,
+}
+
+#[derive(Debug, Serialize)]
+struct NodePushResult {
+    node_id: String,
+    role: NodeRole,
+    control_url: Option<String>,
+    accepted: bool,
+    message: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -1865,7 +2080,8 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
         const trafficTitle = node.role === "dns" ? `${dnsQueries} DNS queries` : formatBytes(wireBytes);
         const services = [
           (node.proxy_listeners || []).length ? `${(node.proxy_listeners || []).length} SMB routes` : null,
-          node.dns?.enabled ? `DNS ${text(node.dns.listen_udp_addr)}` : null
+          node.dns?.enabled ? `DNS ${text(node.dns.listen_udp_addr)}` : null,
+          node.control_url ? `Control ${text(node.control_url)}` : null
         ].filter(Boolean).join(" · ");
 
         return `
@@ -2321,7 +2537,7 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
 
       await loadDnsPolicy();
       document.getElementById("dns-policy-state").textContent =
-        `Saved and active on PID ${payload.process_id} · generation ${payload.dns_policy_runtime.generation}`;
+        `Saved and active on PID ${payload.process_id} · generation ${payload.dns_policy_runtime.generation} · ${describePushResults(payload.node_push_results)}`;
       await refresh();
     }
 
@@ -2400,6 +2616,27 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
       document.getElementById("policy-state").textContent = `${name} preset selected; save to apply`;
     }
 
+    function describePushResults(results) {
+      const items = Array.isArray(results) ? results : [];
+      if (!items.length) {
+        return "no remote nodes targeted";
+      }
+
+      const accepted = items.filter((item) => item.accepted).length;
+      const failed = items.length - accepted;
+      const failures = items
+        .filter((item) => !item.accepted)
+        .slice(0, 2)
+        .map((item) => `${item.node_id}: ${item.message}`)
+        .join(" · ");
+
+      if (failed === 0) {
+        return `pushed to ${accepted}/${items.length} remote nodes`;
+      }
+
+      return `pushed to ${accepted}/${items.length} remote nodes · ${failures}`;
+    }
+
     async function savePolicies() {
       document.getElementById("policy-state").textContent = "Saving policies";
       const response = await fetch("/api/policies", {
@@ -2417,7 +2654,7 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
       await loadPolicies();
       renderPolicyRuntime(payload.policy_runtime);
       document.getElementById("policy-state").textContent =
-        `Saved and active on PID ${payload.process_id} · generation ${payload.policy_runtime.generation}`;
+        `Saved and active on PID ${payload.process_id} · generation ${payload.policy_runtime.generation} · ${describePushResults(payload.node_push_results)}`;
       await refresh();
     }
 

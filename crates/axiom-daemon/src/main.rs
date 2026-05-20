@@ -1,8 +1,24 @@
-use std::{env, fs, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    collections::VecDeque,
+    env, fs,
+    path::PathBuf,
+    sync::{Arc, Mutex},
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use anyhow::Context;
-use axiom_config::{AxiomConfig, DnsConfig, ProxyListenerConfig};
+use axiom_config::{AxiomConfig, DnsConfig, NodeRole, ProxyListenerConfig};
+use axiom_control::{
+    ControlApplyResponse, ControlPolicyBundle, EncryptedEnvelope, decrypt_payload, encrypt_payload,
+};
 use axiom_core::{RuntimeState, StreamPolicy};
+use axum::{
+    Json, Router,
+    extract::State,
+    http::{HeaderMap, StatusCode, header},
+    response::{IntoResponse, Response},
+    routing::post,
+};
 use serde_json::json;
 use tokio::task::JoinSet;
 use tracing::{error, info, warn};
@@ -49,6 +65,10 @@ async fn main() -> anyhow::Result<()> {
     }
 
     if config.node.role.runs_agent() {
+        let control_config = config.clone();
+        let control_runtime = Arc::clone(&runtime);
+        tasks.spawn(async move { run_node_control_server(control_config, control_runtime).await });
+
         let agent_config = config.clone();
         let agent_runtime = Arc::clone(&runtime);
         tasks.spawn(async move { run_node_agent(agent_config, agent_runtime).await });
@@ -95,6 +115,194 @@ async fn main() -> anyhow::Result<()> {
     while tasks.join_next().await.is_some() {}
     info!("Axiom daemon stopped");
     Ok(())
+}
+
+struct NodeControlState {
+    runtime: Arc<RuntimeState>,
+    node_id: String,
+    role: NodeRole,
+    shared_secret: String,
+    seen_commands: Mutex<VecDeque<String>>,
+}
+
+async fn run_node_control_server(
+    config: AxiomConfig,
+    runtime: Arc<RuntimeState>,
+) -> anyhow::Result<()> {
+    let control = config.node.control.clone();
+    if !control.enabled {
+        return Err(anyhow::anyhow!(
+            "node control listener is disabled for agent role"
+        ));
+    }
+
+    let shared_secret = config
+        .node
+        .enrollment_token
+        .clone()
+        .context("node.enrollment_token is required for node control")?;
+    let listener =
+        axiom_net::bind_tcp_listener_to_interface(&control.interface, control.listen_addr(), 1024)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed binding node control listener to interface '{}' at {}",
+                    control.interface,
+                    control.listen_addr()
+                )
+            })?;
+    let state = Arc::new(NodeControlState {
+        runtime,
+        node_id: config.node.node_id.clone(),
+        role: config.node.role,
+        shared_secret,
+        seen_commands: Mutex::new(VecDeque::new()),
+    });
+    let app = Router::new()
+        .route("/api/control/policies", post(api_apply_control_policy))
+        .with_state(state);
+
+    info!(
+        node_id = config.node.node_id,
+        role = config.node.role.as_str(),
+        interface = control.interface,
+        listen_addr = %control.listen_addr(),
+        "Axiom node control listener started"
+    );
+
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+
+async fn api_apply_control_policy(
+    headers: HeaderMap,
+    State(state): State<Arc<NodeControlState>>,
+    Json(envelope): Json<EncryptedEnvelope>,
+) -> Response {
+    if !bearer_token_matches(&headers, &state.shared_secret) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+
+    if envelope.node_id != state.node_id {
+        warn!(
+            expected = state.node_id,
+            received = envelope.node_id,
+            "rejected control payload for a different node"
+        );
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+
+    let command: ControlPolicyBundle = match decrypt_payload(&state.shared_secret, &envelope) {
+        Ok(command) => command,
+        Err(error) => {
+            warn!(?error, "rejected unauthenticated control payload");
+            return StatusCode::BAD_REQUEST.into_response();
+        }
+    };
+
+    if command_seen(&state, &command.command_id) {
+        let response = ControlApplyResponse {
+            accepted: true,
+            message: "duplicate command ignored".to_string(),
+            applied_unix_timestamp_seconds: unix_timestamp_seconds(),
+            policy_generation: state.runtime.policy_runtime_snapshot().generation,
+            dns_policy_generation: state.runtime.dns_policy_runtime_snapshot().generation,
+        };
+        return encrypted_control_response(&state, response);
+    }
+
+    let command_id = command.command_id.clone();
+
+    if let Some(policy) = command.policy {
+        if let Err(error) = policy.validate() {
+            warn!(?error, "rejected invalid pushed SMB policy");
+            return StatusCode::BAD_REQUEST.into_response();
+        }
+        state.runtime.update_policy(policy);
+    }
+
+    if let Some(dns_policy) = command.dns_policy {
+        if let Err(error) = dns_policy.validate() {
+            warn!(?error, "rejected invalid pushed DNS policy");
+            return StatusCode::BAD_REQUEST.into_response();
+        }
+        state.runtime.update_dns_policy(dns_policy);
+    }
+
+    let response = ControlApplyResponse {
+        accepted: true,
+        message: format!("policy push applied on {}", state.role.as_str()),
+        applied_unix_timestamp_seconds: unix_timestamp_seconds(),
+        policy_generation: state.runtime.policy_runtime_snapshot().generation,
+        dns_policy_generation: state.runtime.dns_policy_runtime_snapshot().generation,
+    };
+
+    info!(
+        node_id = state.node_id,
+        command_id, "applied pushed control policy bundle"
+    );
+    encrypted_control_response(&state, response)
+}
+
+fn encrypted_control_response(
+    state: &NodeControlState,
+    response: ControlApplyResponse,
+) -> Response {
+    match encrypt_payload(&state.node_id, &state.shared_secret, &response) {
+        Ok(envelope) => Json(envelope).into_response(),
+        Err(error) => {
+            warn!(?error, "failed encrypting control response");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+fn command_seen(state: &NodeControlState, command_id: &str) -> bool {
+    let mut seen_commands = state
+        .seen_commands
+        .lock()
+        .expect("node control command cache mutex poisoned");
+
+    if seen_commands.iter().any(|seen| seen == command_id) {
+        return true;
+    }
+
+    if seen_commands.len() >= 256 {
+        seen_commands.pop_front();
+    }
+    seen_commands.push_back(command_id.to_string());
+    false
+}
+
+fn bearer_token_matches(headers: &HeaderMap, expected_token: &str) -> bool {
+    if let Some(header_value) = headers.get(header::AUTHORIZATION)
+        && let Ok(value) = header_value.to_str()
+        && let Some(token) = value.strip_prefix("Bearer ")
+    {
+        return constant_time_eq(token.as_bytes(), expected_token.as_bytes());
+    }
+
+    false
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+
+    let mut diff = 0_u8;
+    for (left, right) in left.iter().zip(right.iter()) {
+        diff |= left ^ right;
+    }
+
+    diff == 0
+}
+
+fn unix_timestamp_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_else(|_| Duration::from_secs(0))
+        .as_secs()
 }
 
 async fn run_node_agent(config: AxiomConfig, runtime: Arc<RuntimeState>) -> anyhow::Result<()> {
@@ -207,6 +415,7 @@ async fn post_node_report(
         "hostname": hostname(),
         "version": env!("CARGO_PKG_VERSION"),
         "management_url": config.node.management_url,
+        "control_url": node_control_url(config),
         "proxy_listeners": config.proxy_listeners.iter().map(proxy_listener_status).collect::<Vec<_>>(),
         "dns": dns_status(&config.dns),
         "stats": runtime.snapshot(),
@@ -228,6 +437,15 @@ async fn post_node_report(
     }
 
     Ok(())
+}
+
+fn node_control_url(config: &AxiomConfig) -> Option<String> {
+    if !config.node.control.enabled {
+        return None;
+    }
+
+    let listen_addr = config.node.control.listen_addr();
+    Some(format!("http://{listen_addr}"))
 }
 
 fn proxy_listener_status(listener: &ProxyListenerConfig) -> serde_json::Value {

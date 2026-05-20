@@ -24,9 +24,12 @@ standalone_lab  Single-machine lab mode
 ```
 
 The management server prints an enrollment token at the end of installation.
-Use that token when installing DNS and SMB nodes. Data-plane nodes connect
-outbound to the management server, pull policies, and post heartbeat/statistics,
-so the admin only needs to sign in to the management server dashboard.
+Use that token when installing DNS and SMB nodes. Data-plane nodes post
+heartbeat/statistics to the management server and also expose a small control
+listener for policy push. When an admin clicks Save, the management server
+actively pushes the updated policy to the relevant DNS or SMB node. Control
+payloads and replies are encrypted with ChaCha20-Poly1305 and authenticated with
+the enrollment token; periodic pull remains as a recovery fallback.
 
 ## Run
 

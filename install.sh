@@ -11,6 +11,7 @@ SERVICE_PATH="/etc/systemd/system/axiom.service"
 SERVICE_USER="axiom"
 SERVICE_GROUP="axiom"
 MANAGEMENT_DEFAULT_PORT="8443"
+NODE_CONTROL_DEFAULT_PORT="9443"
 SMB_DEFAULT_PORT="445"
 DNS_DEFAULT_PORT="53"
 LISTEN_DEFAULT_IP="0.0.0.0"
@@ -723,6 +724,34 @@ configure_agent_registration() {
   NODE_ENROLLMENT_TOKEN="$(prompt_nonempty "Enrollment token from the Axiom management server")"
 }
 
+select_node_control_interface() {
+  if use_tui; then
+    if NODE_CONTROL_INTERFACE="$(select_interface_tui "Select the interface that should accept encrypted management push requests")"; then
+      return
+    fi
+  fi
+
+  while true; do
+    print_interfaces
+    read -r -p "Select the interface for encrypted management push requests [number]: " selection
+    if [[ "${selection}" =~ ^[0-9]+$ ]] && ((selection >= 1 && selection <= ${#INTERFACES[@]})); then
+      NODE_CONTROL_INTERFACE="${INTERFACES[$((selection - 1))]}"
+      return
+    fi
+    echo "Invalid interface selection."
+  done
+}
+
+configure_node_control_listener() {
+  NODE_CONTROL_ENABLED="true"
+  select_node_control_interface
+
+  local discovered_control_ip
+  discovered_control_ip="$(get_interface_ipv4 "${NODE_CONTROL_INTERFACE}")"
+  NODE_CONTROL_BIND_IP="$(prompt_ipv4 "Node control listen IPv4 for ${NODE_CONTROL_INTERFACE}" "${discovered_control_ip}")"
+  NODE_CONTROL_PORT="$(prompt_port "Node control TCP port" "${NODE_CONTROL_DEFAULT_PORT}")"
+}
+
 configure_node_identity() {
   local default_id
   local default_name
@@ -853,6 +882,10 @@ collect_configuration() {
   NODE_ENROLLMENT_TOKEN=""
   NODE_ID=""
   NODE_DISPLAY_NAME=""
+  NODE_CONTROL_ENABLED="false"
+  NODE_CONTROL_INTERFACE=""
+  NODE_CONTROL_BIND_IP=""
+  NODE_CONTROL_PORT="${NODE_CONTROL_DEFAULT_PORT}"
   PROXY_NAMES=()
   PROXY_INTERFACES=()
   PROXY_VLANS=()
@@ -880,12 +913,14 @@ collect_configuration() {
       configure_agent_management_stub
       configure_agent_registration
       configure_node_identity
+      configure_node_control_listener
       configure_dns_gateway
       ;;
     smb_proxy)
       configure_agent_management_stub
       configure_agent_registration
       configure_node_identity
+      configure_node_control_listener
       configure_proxy_listeners
       ;;
     standalone_lab)
@@ -938,6 +973,14 @@ write_config() {
       echo "enrollment_token = \"$(toml_escape "${NODE_ENROLLMENT_TOKEN}")\""
     fi
     echo "heartbeat_interval_seconds = 5"
+    echo
+    echo "[node.control]"
+    echo "enabled = ${NODE_CONTROL_ENABLED}"
+    if [[ "${NODE_CONTROL_ENABLED}" == "true" ]]; then
+      echo "interface = \"$(toml_escape "${NODE_CONTROL_INTERFACE}")\""
+      echo "bind_ip = \"$(toml_escape "${NODE_CONTROL_BIND_IP}")\""
+      echo "port = ${NODE_CONTROL_PORT}"
+    fi
     echo
     echo "[management]"
     echo "interface = \"$(toml_escape "${MANAGEMENT_INTERFACE}")\""
@@ -1168,6 +1211,9 @@ print_summary() {
   else
     echo "Management server: ${NODE_MANAGEMENT_URL}"
     echo "Node ID: ${NODE_ID}"
+    if [[ "${NODE_CONTROL_ENABLED}" == "true" ]]; then
+      echo "Node control API: http://${NODE_CONTROL_BIND_IP}:${NODE_CONTROL_PORT}/ (encrypted policy payloads)"
+    fi
   fi
   if [[ "${DNS_ENABLED}" == "true" ]]; then
     echo "DNS Gateway: ${DNS_BIND_IP}:${DNS_UDP_PORT}/udp and ${DNS_BIND_IP}:${DNS_TCP_PORT}/tcp -> ${DNS_UPSTREAMS[*]}"

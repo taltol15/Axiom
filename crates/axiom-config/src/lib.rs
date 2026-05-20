@@ -114,6 +114,8 @@ pub struct NodeConfig {
     pub enrollment_token: Option<String>,
     #[serde(default = "default_heartbeat_interval_seconds")]
     pub heartbeat_interval_seconds: u64,
+    #[serde(default)]
+    pub control: NodeControlConfig,
 }
 
 impl Default for NodeConfig {
@@ -125,6 +127,7 @@ impl Default for NodeConfig {
             management_url: None,
             enrollment_token: None,
             heartbeat_interval_seconds: default_heartbeat_interval_seconds(),
+            control: NodeControlConfig::default(),
         }
     }
 }
@@ -157,6 +160,8 @@ impl NodeConfig {
             ));
         }
 
+        self.control.validate()?;
+
         Ok(())
     }
 
@@ -183,6 +188,67 @@ impl NodeConfig {
                 "{} role requires node.enrollment_token",
                 self.role.as_str()
             )));
+        }
+
+        if !self.control.enabled {
+            return Err(ConfigError::Invalid(format!(
+                "{} role requires node.control.enabled = true for management push",
+                self.role.as_str()
+            )));
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct NodeControlConfig {
+    #[serde(default = "default_node_control_enabled")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub interface: String,
+    pub bind_ip: Option<IpAddr>,
+    #[serde(default = "default_node_control_port")]
+    pub port: u16,
+}
+
+impl Default for NodeControlConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_node_control_enabled(),
+            interface: String::new(),
+            bind_ip: None,
+            port: default_node_control_port(),
+        }
+    }
+}
+
+impl NodeControlConfig {
+    pub fn listen_addr(&self) -> SocketAddr {
+        SocketAddr::new(
+            self.bind_ip
+                .unwrap_or(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))),
+            self.port,
+        )
+    }
+
+    fn validate(&self) -> Result<(), ConfigError> {
+        if !self.enabled {
+            return Ok(());
+        }
+
+        validate_interface_name(&self.interface, "node control interface")?;
+
+        if self.bind_ip.is_none() {
+            return Err(ConfigError::Invalid(
+                "node.control.bind_ip is required when node control is enabled".to_string(),
+            ));
+        }
+
+        if self.port == 0 {
+            return Err(ConfigError::Invalid(
+                "node.control.port must be greater than zero".to_string(),
+            ));
         }
 
         Ok(())
@@ -859,6 +925,14 @@ fn default_node_display_name() -> String {
 
 fn default_heartbeat_interval_seconds() -> u64 {
     5
+}
+
+fn default_node_control_enabled() -> bool {
+    false
+}
+
+fn default_node_control_port() -> u16 {
+    9443
 }
 
 fn default_signatures() -> Vec<SignaturePolicyConfig> {
