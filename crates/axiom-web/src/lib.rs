@@ -843,146 +843,198 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
     .policy-preset {
       background: #ffffff !important;
     }
+
+    .dashboard-view {
+      display: none;
+    }
+
+    .dashboard-view.active {
+      display: block;
+    }
+
+    .top-nav-button.active {
+      background: #34d399;
+      border-color: #34d399;
+      color: #0f172a !important;
+    }
   </style>
 </head>
 <body class="min-h-screen bg-zinc-950 text-zinc-100">
   <header class="border-b border-zinc-800 bg-zinc-950/95">
-    <div class="mx-auto flex max-w-7xl items-center justify-between px-6 py-5">
+    <div class="mx-auto flex max-w-7xl flex-col gap-5 px-6 py-5 lg:flex-row lg:items-center lg:justify-between">
       <div>
         <p class="text-sm font-medium uppercase tracking-[0.28em] text-emerald-300">Axiom</p>
-        <h1 class="mt-1 text-2xl font-semibold text-white">SMB + DNS Security Dashboard</h1>
+        <h1 class="mt-1 text-2xl font-semibold text-white">Axiom Dashboard</h1>
       </div>
-      <button id="logout" class="rounded-md border border-zinc-700 px-4 py-2 text-sm text-zinc-200 transition hover:border-red-400 hover:text-red-200">Log out</button>
+      <div class="flex flex-col gap-3 lg:items-end">
+        <nav class="flex flex-wrap gap-2" aria-label="Dashboard sections">
+          <button data-view="overview" class="top-nav-button active rounded-md border border-zinc-700 px-3 py-2 text-sm font-medium text-zinc-200 transition hover:border-emerald-300 hover:text-emerald-100">Overview</button>
+          <button data-view="smb" class="top-nav-button rounded-md border border-zinc-700 px-3 py-2 text-sm font-medium text-zinc-200 transition hover:border-emerald-300 hover:text-emerald-100">SMB Protection</button>
+          <button data-view="dns" class="top-nav-button rounded-md border border-zinc-700 px-3 py-2 text-sm font-medium text-zinc-200 transition hover:border-emerald-300 hover:text-emerald-100">DNS Security</button>
+          <button data-view="audit" class="top-nav-button rounded-md border border-zinc-700 px-3 py-2 text-sm font-medium text-zinc-200 transition hover:border-emerald-300 hover:text-emerald-100">Global Audit Log</button>
+        </nav>
+        <button id="logout" class="self-start rounded-md border border-zinc-700 px-4 py-2 text-sm text-zinc-200 transition hover:border-red-400 hover:text-red-200 lg:self-end">Log out</button>
+      </div>
     </div>
   </header>
 
   <main class="mx-auto max-w-7xl px-6 py-8">
-    <section class="grid gap-5 md:grid-cols-4 xl:grid-cols-8">
-      <article class="rounded-lg border border-zinc-800 bg-zinc-900 p-6">
-        <p class="text-sm text-zinc-400">Forwarded Traffic</p>
-        <p id="forwarded-bytes" class="mt-4 text-4xl font-semibold text-white">0 B</p>
-      </article>
-      <article class="rounded-lg border border-zinc-800 bg-zinc-900 p-6">
-        <p class="text-sm text-zinc-400">Wire Traffic Seen</p>
-        <p id="stream-bytes" class="mt-4 text-4xl font-semibold text-sky-200">0 B</p>
-      </article>
-      <article class="rounded-lg border border-zinc-800 bg-zinc-900 p-6">
-        <p class="text-sm text-zinc-400">Uploaded File Bytes</p>
-        <p id="smb-write-bytes" class="mt-4 text-4xl font-semibold text-lime-200">0 B</p>
-      </article>
-      <article class="rounded-lg border border-zinc-800 bg-zinc-900 p-6">
-        <p class="text-sm text-zinc-400">Active Connections</p>
-        <p id="active-connections" class="mt-4 text-4xl font-semibold text-cyan-200">0</p>
-      </article>
-      <article class="rounded-lg border border-zinc-800 bg-zinc-900 p-6">
-        <p class="text-sm text-zinc-400">Blocked Threats</p>
-        <p id="blocked-threats" class="mt-4 text-4xl font-semibold text-red-300">0</p>
-      </article>
-      <article class="rounded-lg border border-zinc-800 bg-zinc-900 p-6">
-        <p class="text-sm text-zinc-400">Monitored Detections</p>
-        <p id="monitored-threats" class="mt-4 text-4xl font-semibold text-amber-200">0</p>
-      </article>
-      <article class="rounded-lg border border-zinc-800 bg-zinc-900 p-6">
-        <p class="text-sm text-zinc-400">Inspected Chunks</p>
-        <p id="inspected-chunks" class="mt-4 text-4xl font-semibold text-emerald-200">0</p>
-      </article>
-      <article class="rounded-lg border border-zinc-800 bg-zinc-900 p-6">
-        <p class="text-sm text-zinc-400">Observed Files</p>
-        <p id="observed-files" class="mt-4 text-4xl font-semibold text-violet-200">0</p>
-      </article>
-      <article class="rounded-lg border border-zinc-800 bg-zinc-900 p-6">
-        <p class="text-sm text-zinc-400">Server-side Copies</p>
-        <p id="server-side-copies" class="mt-4 text-4xl font-semibold text-orange-200">0</p>
-      </article>
-      <article class="rounded-lg border border-zinc-800 bg-zinc-900 p-6">
-        <p class="text-sm text-zinc-400">DNS Queries</p>
-        <p id="dns-queries" class="mt-4 text-4xl font-semibold text-sky-200">0</p>
-      </article>
-      <article class="rounded-lg border border-zinc-800 bg-zinc-900 p-6">
-        <p class="text-sm text-zinc-400">DNS Blocked</p>
-        <p id="dns-blocked" class="mt-4 text-4xl font-semibold text-red-300">0</p>
-      </article>
-      <article class="rounded-lg border border-zinc-800 bg-zinc-900 p-6">
-        <p class="text-sm text-zinc-400">DNS Cache Hits</p>
-        <p id="dns-cache-hits" class="mt-4 text-4xl font-semibold text-emerald-200">0</p>
-      </article>
-      <article class="rounded-lg border border-zinc-800 bg-zinc-900 p-6">
-        <p class="text-sm text-zinc-400">DNS Upstream Errors</p>
-        <p id="dns-upstream-errors" class="mt-4 text-4xl font-semibold text-orange-200">0</p>
-      </article>
+    <section id="view-overview" class="dashboard-view active">
+      <div class="grid gap-5 md:grid-cols-2 xl:grid-cols-4">
+        <article class="rounded-lg border border-zinc-800 bg-zinc-900 p-6">
+          <p class="text-sm text-zinc-400">SMB Protected Traffic</p>
+          <p id="overview-smb-traffic" class="mt-4 text-4xl font-semibold text-white">0 B</p>
+          <p id="overview-smb-detail" class="mt-2 text-xs text-zinc-500">Waiting for SMB telemetry</p>
+        </article>
+        <article class="rounded-lg border border-zinc-800 bg-zinc-900 p-6">
+          <p class="text-sm text-zinc-400">DNS Queries</p>
+          <p id="overview-dns-queries" class="mt-4 text-4xl font-semibold text-sky-200">0</p>
+          <p id="overview-dns-detail" class="mt-2 text-xs text-zinc-500">Waiting for DNS telemetry</p>
+        </article>
+        <article class="rounded-lg border border-zinc-800 bg-zinc-900 p-6">
+          <p class="text-sm text-zinc-400">Blocked SMB Threats</p>
+          <p id="overview-blocked-smb" class="mt-4 text-4xl font-semibold text-red-300">0</p>
+          <p id="overview-smb-policy-detail" class="mt-2 text-xs text-zinc-500">No SMB blocks recorded</p>
+        </article>
+        <article class="rounded-lg border border-zinc-800 bg-zinc-900 p-6">
+          <p class="text-sm text-zinc-400">Blocked DNS Domains</p>
+          <p id="overview-blocked-dns" class="mt-4 text-4xl font-semibold text-red-300">0</p>
+          <p id="overview-dns-policy-detail" class="mt-2 text-xs text-zinc-500">No DNS blocks recorded</p>
+        </article>
+      </div>
+
+      <section class="mt-8 rounded-lg border border-emerald-500/20 bg-emerald-500/5 px-6 py-5">
+        <div class="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
+          <div>
+            <p class="text-sm font-semibold uppercase tracking-wider text-emerald-300">Runtime Enforcement</p>
+            <h2 id="runtime-policy-state" class="mt-2 text-xl font-semibold text-white">Loading active policy</h2>
+            <p id="runtime-policy-detail" class="mt-1 text-sm text-zinc-300"></p>
+          </div>
+          <div class="flex flex-col gap-1 text-sm text-zinc-500 lg:text-right">
+            <p id="management-info"></p>
+            <p id="refresh-state">Waiting for telemetry</p>
+          </div>
+        </div>
+      </section>
+
+      <section class="mt-8 rounded-lg border border-zinc-800 bg-zinc-900">
+        <div class="flex flex-col gap-2 border-b border-zinc-800 px-6 py-5 md:flex-row md:items-end md:justify-between">
+          <div>
+            <h2 class="text-xl font-semibold text-white">Service Map</h2>
+            <p class="mt-1 text-sm text-zinc-400">Management, SMB proxy routes, and DNS listener status.</p>
+          </div>
+        </div>
+        <div class="grid gap-4 p-6 lg:grid-cols-2">
+          <div>
+            <h3 class="text-sm font-semibold uppercase tracking-wider text-zinc-400">SMB Proxy Routes</h3>
+            <div class="mt-4 overflow-x-auto">
+              <table class="min-w-full divide-y divide-zinc-800">
+                <thead class="bg-zinc-950/60">
+                  <tr>
+                    <th class="px-4 py-3 text-left text-xs font-medium uppercase tracking-wider text-zinc-400">Route</th>
+                    <th class="px-4 py-3 text-left text-xs font-medium uppercase tracking-wider text-zinc-400">Interface</th>
+                    <th class="px-4 py-3 text-left text-xs font-medium uppercase tracking-wider text-zinc-400">Target</th>
+                    <th class="px-4 py-3 text-left text-xs font-medium uppercase tracking-wider text-zinc-400">Bytes</th>
+                  </tr>
+                </thead>
+                <tbody id="mapping-body" class="divide-y divide-zinc-800"></tbody>
+              </table>
+            </div>
+          </div>
+          <div>
+            <h3 class="text-sm font-semibold uppercase tracking-wider text-zinc-400">DNS Gateway</h3>
+            <div class="mt-4 grid gap-4">
+              <div class="rounded-md border border-zinc-800 bg-zinc-950/50 p-4">
+                <p class="text-xs font-semibold uppercase tracking-wider text-zinc-500">Listener</p>
+                <p id="dns-listener" class="mt-2 text-sm font-medium text-white">—</p>
+              </div>
+              <div class="rounded-md border border-zinc-800 bg-zinc-950/50 p-4">
+                <p class="text-xs font-semibold uppercase tracking-wider text-zinc-500">Upstreams</p>
+                <p id="dns-upstreams" class="mt-2 text-sm font-medium text-cyan-200">—</p>
+              </div>
+              <div class="rounded-md border border-zinc-800 bg-zinc-950/50 p-4">
+                <p class="text-xs font-semibold uppercase tracking-wider text-zinc-500">Policy</p>
+                <p id="dns-policy" class="mt-2 text-sm font-medium text-white">—</p>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
     </section>
 
-    <section class="mt-8 rounded-lg border border-zinc-800 bg-zinc-900">
-      <div class="flex flex-col gap-2 border-b border-zinc-800 px-6 py-5 md:flex-row md:items-end md:justify-between">
-        <div>
-          <h2 class="text-xl font-semibold text-white">DNS Security Gateway</h2>
-          <p id="dns-state" class="mt-1 text-sm text-zinc-400">Waiting for DNS telemetry</p>
+    <section id="view-smb" class="dashboard-view">
+      <section class="rounded-lg border border-zinc-800 bg-zinc-900">
+        <div class="flex flex-col gap-2 border-b border-zinc-800 px-6 py-5 md:flex-row md:items-end md:justify-between">
+          <div>
+            <h2 class="text-xl font-semibold text-white">Live SMB Connections</h2>
+            <p id="live-connection-state" class="mt-1 text-sm text-zinc-400">Waiting for active SMB sessions</p>
+          </div>
+          <p id="live-connection-count" class="text-sm text-zinc-500">0 live connections</p>
         </div>
-        <p id="dns-config" class="text-sm text-zinc-500"></p>
-      </div>
-      <div class="grid gap-4 border-b border-zinc-800 px-6 py-5 md:grid-cols-4">
-        <div>
-          <p class="text-xs font-semibold uppercase tracking-wider text-zinc-500">Listener</p>
-          <p id="dns-listener" class="mt-2 text-sm font-medium text-white">—</p>
-        </div>
-        <div>
-          <p class="text-xs font-semibold uppercase tracking-wider text-zinc-500">Upstreams / DC DNS</p>
-          <p id="dns-upstreams" class="mt-2 text-sm font-medium text-cyan-200">—</p>
-        </div>
-        <div>
-          <p class="text-xs font-semibold uppercase tracking-wider text-zinc-500">Threat Feeds</p>
-          <p id="dns-feeds" class="mt-2 text-sm font-medium text-emerald-200">—</p>
-        </div>
-        <div>
-          <p class="text-xs font-semibold uppercase tracking-wider text-zinc-500">Policy</p>
-          <p id="dns-policy" class="mt-2 text-sm font-medium text-white">—</p>
-        </div>
-      </div>
-      <div class="overflow-x-auto">
-        <table class="min-w-full divide-y divide-zinc-800">
-          <thead class="bg-zinc-950/60">
-            <tr>
-              <th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-zinc-400">Client</th>
-              <th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-zinc-400">Domain</th>
-              <th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-zinc-400">Type</th>
-              <th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-zinc-400">Action</th>
-              <th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-zinc-400">Upstream</th>
-              <th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-zinc-400">Latency</th>
-              <th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-zinc-400">Time</th>
-            </tr>
-          </thead>
-          <tbody id="dns-events-body" class="divide-y divide-zinc-800"></tbody>
-        </table>
-      </div>
-    </section>
 
-    <section class="mt-6 rounded-lg border border-emerald-500/20 bg-emerald-500/5 px-6 py-5">
-      <div class="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
-        <div>
-          <p class="text-sm font-semibold uppercase tracking-wider text-emerald-300">Runtime Enforcement</p>
-          <h2 id="runtime-policy-state" class="mt-2 text-xl font-semibold text-white">Loading active policy</h2>
-          <p id="runtime-policy-detail" class="mt-1 text-sm text-zinc-300"></p>
+        <div class="overflow-x-auto">
+          <table class="min-w-full divide-y divide-zinc-800">
+            <thead class="bg-zinc-950/60">
+              <tr>
+                <th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-zinc-400">Client</th>
+                <th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-zinc-400">Target</th>
+                <th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-zinc-400">Route</th>
+                <th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-zinc-400">Current File</th>
+                <th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-zinc-400">Wire Traffic</th>
+                <th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-zinc-400">Forwarded</th>
+                <th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-zinc-400">SMB Writes</th>
+                <th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-zinc-400">Last Activity</th>
+              </tr>
+            </thead>
+            <tbody id="live-connections-body" class="divide-y divide-zinc-800"></tbody>
+          </table>
         </div>
-        <div class="flex flex-col gap-3 sm:flex-row sm:items-center">
-          <button id="run-policy-self-test" class="rounded-md border border-emerald-400/40 px-4 py-2 text-sm font-semibold text-emerald-100 transition hover:border-emerald-300 hover:bg-emerald-400/10">Run policy self-test</button>
-          <p id="self-test-state" class="text-sm text-zinc-400">Self-test not run</p>
-        </div>
-      </div>
-      <div id="self-test-results" class="mt-4 grid gap-3 md:grid-cols-4"></div>
-    </section>
+      </section>
 
-    <section class="mt-8 rounded-lg border border-zinc-800 bg-zinc-900">
+      <section class="mt-8 rounded-lg border border-zinc-800 bg-zinc-900">
+        <div class="flex flex-col gap-2 border-b border-zinc-800 px-6 py-5 md:flex-row md:items-end md:justify-between">
+          <div>
+            <h2 class="text-xl font-semibold text-white">File Transfer Ledger</h2>
+            <p id="file-activity-state" class="mt-1 text-sm text-zinc-400">Waiting for per-file SMB activity</p>
+          </div>
+          <p id="file-activity-count" class="text-sm text-zinc-500">0 tracked files</p>
+        </div>
+
+        <div class="overflow-x-auto">
+          <table class="min-w-full divide-y divide-zinc-800">
+            <thead class="bg-zinc-950/60">
+              <tr>
+                <th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-zinc-400">File</th>
+                <th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-zinc-400">Client</th>
+                <th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-zinc-400">Target</th>
+                <th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-zinc-400">SMB Writes</th>
+                <th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-zinc-400">Events</th>
+                <th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-zinc-400">Last Result</th>
+                <th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-zinc-400">Updated</th>
+              </tr>
+            </thead>
+            <tbody id="file-activity-body" class="divide-y divide-zinc-800"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="mt-8 rounded-lg border border-zinc-800 bg-zinc-900">
       <div class="flex flex-col gap-4 border-b border-zinc-800 px-6 py-5 md:flex-row md:items-center md:justify-between">
         <div>
-          <h2 class="text-xl font-semibold text-white">Policy Controls</h2>
+          <h2 class="text-xl font-semibold text-white">SMB Policies</h2>
           <p id="policy-state" class="mt-1 text-sm text-zinc-400">Loading policies</p>
         </div>
         <div class="flex flex-wrap gap-2">
+          <button id="run-policy-self-test" class="rounded-md border border-emerald-400/40 px-3 py-2 text-sm font-semibold text-emerald-100 transition hover:border-emerald-300 hover:bg-emerald-400/10">Run self-test</button>
           <button data-preset="monitor" class="policy-preset rounded-md border border-zinc-700 px-3 py-2 text-sm text-zinc-200 transition hover:border-cyan-300 hover:text-cyan-100">Monitor only</button>
           <button data-preset="balanced" class="policy-preset rounded-md border border-zinc-700 px-3 py-2 text-sm text-zinc-200 transition hover:border-emerald-300 hover:text-emerald-100">Balanced</button>
           <button data-preset="strict" class="policy-preset rounded-md border border-zinc-700 px-3 py-2 text-sm text-zinc-200 transition hover:border-red-300 hover:text-red-100">Strict</button>
           <button id="save-policies" class="rounded-md bg-emerald-400 px-4 py-2 text-sm font-semibold text-zinc-950 transition hover:bg-emerald-300">Save and apply</button>
         </div>
+      </div>
+      <div class="border-b border-zinc-800 px-6 py-4">
+        <p id="self-test-state" class="text-sm text-zinc-400">Self-test not run</p>
+        <div id="self-test-results" class="mt-4 grid gap-3 md:grid-cols-4"></div>
       </div>
 
       <div class="grid gap-6 p-6 lg:grid-cols-[1fr_1fr]">
@@ -1043,42 +1095,16 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
         </div>
       </div>
     </section>
-
-    <section class="mt-8 rounded-lg border border-zinc-800 bg-zinc-900">
-      <div class="flex flex-col gap-2 border-b border-zinc-800 px-6 py-5 md:flex-row md:items-end md:justify-between">
-        <div>
-          <h2 class="text-xl font-semibold text-white">NIC Mappings</h2>
-          <p id="management-info" class="mt-1 text-sm text-zinc-400"></p>
-        </div>
-        <p id="refresh-state" class="text-sm text-zinc-500">Waiting for telemetry</p>
-      </div>
-
-      <div class="overflow-x-auto">
-        <table class="min-w-full divide-y divide-zinc-800">
-          <thead class="bg-zinc-950/60">
-            <tr>
-              <th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-zinc-400">Route</th>
-              <th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-zinc-400">Interface</th>
-              <th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-zinc-400">VLAN</th>
-              <th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-zinc-400">Listen</th>
-              <th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-zinc-400">Target File Server</th>
-              <th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-zinc-400">Connections</th>
-              <th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-zinc-400">Inspected</th>
-              <th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-zinc-400">Route Bytes</th>
-            </tr>
-          </thead>
-          <tbody id="mapping-body" class="divide-y divide-zinc-800"></tbody>
-        </table>
-      </div>
     </section>
 
-    <section class="mt-8 rounded-lg border border-zinc-800 bg-zinc-900">
+    <section id="view-dns" class="dashboard-view">
+      <section class="rounded-lg border border-zinc-800 bg-zinc-900">
       <div class="flex flex-col gap-2 border-b border-zinc-800 px-6 py-5 md:flex-row md:items-end md:justify-between">
         <div>
-          <h2 class="text-xl font-semibold text-white">Live SMB Connections</h2>
-          <p id="live-connection-state" class="mt-1 text-sm text-zinc-400">Waiting for active SMB sessions</p>
+          <h2 class="text-xl font-semibold text-white">Live DNS Queries</h2>
+          <p id="dns-state" class="mt-1 text-sm text-zinc-400">Waiting for DNS telemetry</p>
         </div>
-        <p id="live-connection-count" class="text-sm text-zinc-500">0 live connections</p>
+        <p id="dns-config" class="text-sm text-zinc-500"></p>
       </div>
 
       <div class="overflow-x-auto">
@@ -1086,66 +1112,70 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
           <thead class="bg-zinc-950/60">
             <tr>
               <th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-zinc-400">Client</th>
-              <th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-zinc-400">Target</th>
-              <th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-zinc-400">Route</th>
-              <th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-zinc-400">Current File</th>
-              <th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-zinc-400">Wire Traffic</th>
-              <th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-zinc-400">Forwarded</th>
-              <th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-zinc-400">SMB Writes</th>
-              <th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-zinc-400">Last Activity</th>
+              <th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-zinc-400">Domain</th>
+              <th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-zinc-400">Type</th>
+              <th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-zinc-400">Action</th>
+              <th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-zinc-400">Upstream</th>
+              <th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-zinc-400">Latency</th>
+              <th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-zinc-400">Time</th>
             </tr>
           </thead>
-          <tbody id="live-connections-body" class="divide-y divide-zinc-800"></tbody>
+          <tbody id="dns-events-body" class="divide-y divide-zinc-800"></tbody>
         </table>
       </div>
     </section>
 
-    <section class="mt-8 rounded-lg border border-zinc-800 bg-zinc-900">
-      <div class="flex flex-col gap-2 border-b border-zinc-800 px-6 py-5 md:flex-row md:items-end md:justify-between">
-        <div>
-          <h2 class="text-xl font-semibold text-white">File Transfer Ledger</h2>
-          <p id="file-activity-state" class="mt-1 text-sm text-zinc-400">Waiting for per-file SMB activity</p>
+    <section class="mt-8 grid gap-6 lg:grid-cols-2">
+      <section class="rounded-lg border border-zinc-800 bg-zinc-900">
+        <div class="border-b border-zinc-800 px-6 py-5">
+          <h2 class="text-xl font-semibold text-white">Top Queried Domains</h2>
         </div>
-        <p id="file-activity-count" class="text-sm text-zinc-500">0 tracked files</p>
-      </div>
-
-      <div class="overflow-x-auto">
-        <table class="min-w-full divide-y divide-zinc-800">
-          <thead class="bg-zinc-950/60">
-            <tr>
-              <th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-zinc-400">File</th>
-              <th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-zinc-400">Client</th>
-              <th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-zinc-400">Target</th>
-              <th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-zinc-400">SMB Writes</th>
-              <th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-zinc-400">Events</th>
-              <th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-zinc-400">Last Result</th>
-              <th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-zinc-400">Updated</th>
-            </tr>
-          </thead>
-          <tbody id="file-activity-body" class="divide-y divide-zinc-800"></tbody>
-        </table>
-      </div>
-    </section>
-
-    <section class="mt-8 rounded-lg border border-zinc-800 bg-zinc-900">
-      <div class="flex flex-col gap-2 border-b border-zinc-800 px-6 py-5 md:flex-row md:items-end md:justify-between">
-        <div>
-          <h2 class="text-xl font-semibold text-white">Global Activity Log</h2>
-          <p id="audit-state" class="mt-1 text-sm text-zinc-400">Waiting for SMB activity</p>
+        <div id="top-domains" class="divide-y divide-zinc-800"></div>
+      </section>
+      <section class="rounded-lg border border-zinc-800 bg-zinc-900">
+        <div class="border-b border-zinc-800 px-6 py-5">
+          <h2 class="text-xl font-semibold text-white">Top Clients</h2>
         </div>
-        <p id="audit-count" class="text-sm text-zinc-500">0 audit events</p>
-      </div>
-      <div id="audit-log" class="divide-y divide-zinc-800"></div>
+        <div id="top-clients" class="divide-y divide-zinc-800"></div>
+      </section>
     </section>
 
-    <section class="mt-8 rounded-lg border border-zinc-800 bg-zinc-900">
-      <div class="border-b border-zinc-800 px-6 py-5">
-        <h2 class="text-xl font-semibold text-white">Recent Policy Events</h2>
-      </div>
-      <div id="threats" class="divide-y divide-zinc-800"></div>
+    <section class="mt-8 grid gap-6 lg:grid-cols-3">
+      <section class="rounded-lg border border-zinc-800 bg-zinc-900">
+        <div class="border-b border-zinc-800 px-6 py-5">
+          <h2 class="text-xl font-semibold text-white">Blocked Domains</h2>
+        </div>
+        <div id="blocked-domains" class="divide-y divide-zinc-800"></div>
+      </section>
+      <section class="rounded-lg border border-zinc-800 bg-zinc-900">
+        <div class="border-b border-zinc-800 px-6 py-5">
+          <h2 class="text-xl font-semibold text-white">Upstream Resolver Health</h2>
+        </div>
+        <div id="upstream-health" class="divide-y divide-zinc-800"></div>
+      </section>
+      <section class="rounded-lg border border-zinc-800 bg-zinc-900">
+        <div class="border-b border-zinc-800 px-6 py-5">
+          <h2 class="text-xl font-semibold text-white">DNS Policies</h2>
+        </div>
+        <div id="dns-policy-summary" class="divide-y divide-zinc-800"></div>
+      </section>
+    </section>
     </section>
 
-    <section class="mt-8 rounded-lg border border-zinc-800 bg-zinc-900">
+    <section id="view-audit" class="dashboard-view">
+      <section class="rounded-lg border border-zinc-800 bg-zinc-900">
+        <div class="flex flex-col gap-2 border-b border-zinc-800 px-6 py-5 md:flex-row md:items-end md:justify-between">
+          <div>
+            <h2 class="text-xl font-semibold text-white">Global Audit Log</h2>
+            <p id="audit-state" class="mt-1 text-sm text-zinc-400">Waiting for SMB and DNS activity</p>
+            <p class="mt-1 text-xs text-zinc-500">SMB + DNS events in one timeline</p>
+          </div>
+          <p id="audit-count" class="text-sm text-zinc-500">0 events</p>
+        </div>
+        <div id="audit-log" class="divide-y divide-zinc-800"></div>
+      </section>
+
+      <section class="mt-8 rounded-lg border border-zinc-800 bg-zinc-900">
       <div class="flex flex-col gap-4 border-b border-zinc-800 px-6 py-5 md:flex-row md:items-center md:justify-between">
         <div>
           <h2 class="text-xl font-semibold text-white">Runtime Diagnostics</h2>
@@ -1154,6 +1184,7 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
         <button id="load-diagnostics" class="rounded-md border border-zinc-700 px-4 py-2 text-sm text-zinc-200 transition hover:border-emerald-300 hover:text-emerald-200">Load diagnostics</button>
       </div>
       <pre id="diagnostics-output" class="max-h-96 overflow-auto whitespace-pre-wrap px-6 py-5 text-xs leading-5 text-zinc-300"></pre>
+    </section>
     </section>
   </main>
 
@@ -1194,6 +1225,131 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
         `${blocking.length} blocking rules · ${monitoring.length} monitor rules · applied ${formatTime(runtime.last_updated_unix_timestamp_seconds)}`;
     }
 
+    function setActiveView(name) {
+      const knownViews = new Set(["overview", "smb", "dns", "audit"]);
+      if (!knownViews.has(name)) name = "overview";
+      document.querySelectorAll(".dashboard-view").forEach((section) => {
+        section.classList.toggle("active", section.id === `view-${name}`);
+      });
+      document.querySelectorAll(".top-nav-button").forEach((button) => {
+        button.classList.toggle("active", button.dataset.view === name);
+      });
+      localStorage.setItem("axiomDashboardView", name);
+    }
+
+    function actionBadgeClass(action) {
+      if (action === "block") return "border-red-400/40 bg-red-500/10 text-red-100";
+      if (action === "monitor") return "border-amber-400/40 bg-amber-500/10 text-amber-100";
+      return "border-emerald-400/40 bg-emerald-500/10 text-emerald-100";
+    }
+
+    function renderList(containerId, rows, emptyText) {
+      const container = document.getElementById(containerId);
+      if (!rows.length) {
+        container.innerHTML = `<div class="px-6 py-5 text-sm text-zinc-400">${emptyText}</div>`;
+        return;
+      }
+
+      container.innerHTML = rows.map((row) => `
+        <div class="flex items-start justify-between gap-4 px-6 py-4">
+          <div class="min-w-0">
+            <p class="truncate text-sm font-semibold text-white">${text(row.title)}</p>
+            <p class="mt-1 text-xs text-zinc-500">${text(row.detail)}</p>
+          </div>
+          <p class="shrink-0 text-sm font-semibold ${row.tone || "text-zinc-300"}">${text(row.value)}</p>
+        </div>
+      `).join("");
+    }
+
+    function topCounts(items, keyFn, limit = 10) {
+      const counts = new Map();
+      items.forEach((item) => {
+        const key = keyFn(item);
+        if (!key) return;
+        counts.set(key, (counts.get(key) || 0) + 1);
+      });
+      return [...counts.entries()]
+        .sort((a, b) => b[1] - a[1] || String(a[0]).localeCompare(String(b[0])))
+        .slice(0, limit)
+        .map(([title, value]) => ({ title, value, detail: "recent window" }));
+    }
+
+    function renderDnsSummary(dns, dnsEvents, stats) {
+      renderList(
+        "top-domains",
+        topCounts(dnsEvents, (event) => event.query_name),
+        "No DNS domains observed yet."
+      );
+
+      renderList(
+        "top-clients",
+        topCounts(dnsEvents, (event) => event.client_addr),
+        "No DNS clients observed yet."
+      );
+
+      renderList(
+        "blocked-domains",
+        dnsEvents
+          .filter((event) => event.action === "block")
+          .slice()
+          .reverse()
+          .slice(0, 10)
+          .map((event) => ({
+            title: event.query_name,
+            detail: `${text(event.client_addr)} · ${text(event.reason)}`,
+            value: "blocked",
+            tone: "text-red-200"
+          })),
+        "No DNS blocks recorded in the recent window."
+      );
+
+      const upstreamRows = (dns.upstreams || []).map((upstream) => {
+        const events = dnsEvents.filter((event) => event.upstream_addr === upstream);
+        const avgLatency = events.length
+          ? Math.round(events.reduce((sum, event) => sum + Number(event.latency_millis || 0), 0) / events.length)
+          : null;
+        return {
+          title: upstream,
+          detail: events.length ? `${events.length} recent queries · avg ${avgLatency} ms` : "configured, waiting for traffic",
+          value: events.length ? "healthy" : "standby",
+          tone: events.length ? "text-emerald-200" : "text-zinc-400"
+        };
+      });
+      if (!upstreamRows.length && dns.enabled) {
+        upstreamRows.push({
+          title: "No upstream resolvers configured",
+          detail: "DNS forwarding cannot run until an upstream resolver exists.",
+          value: "needs setup",
+          tone: "text-red-200"
+        });
+      }
+      renderList("upstream-health", upstreamRows, "DNS gateway is disabled.");
+
+      renderList(
+        "dns-policy-summary",
+        dns.enabled
+          ? [
+              {
+                title: "Block response",
+                detail: "How blocked DNS requests are answered.",
+                value: dns.block_response
+              },
+              {
+                title: "Threat feeds",
+                detail: `${dns.blocked_domains || 0} static blocks · ${dns.monitored_domains || 0} monitored domains`,
+                value: (dns.threat_feed_urls || []).length
+              },
+              {
+                title: "Runtime counters",
+                detail: `${stats.dns_cache_hits || 0} cache hits · ${stats.dns_upstream_errors || 0} upstream errors`,
+                value: `${stats.dns_blocked_queries || 0} blocked`
+              }
+            ]
+          : [],
+        "DNS policies are disabled."
+      );
+    }
+
     async function refresh() {
       const response = await fetch("/api/status", {
         headers: authHeaders()
@@ -1210,19 +1366,18 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
       const forwardedBytes = Number(stats.bytes_client_to_server || 0) + Number(stats.bytes_server_to_client || 0);
       const streamBytes = Number(stats.stream_bytes_client_to_server || 0) + Number(stats.stream_bytes_server_to_client || 0);
 
-      document.getElementById("forwarded-bytes").textContent = formatBytes(forwardedBytes);
-      document.getElementById("stream-bytes").textContent = formatBytes(streamBytes);
-      document.getElementById("smb-write-bytes").textContent = formatBytes(stats.smb_write_bytes || 0);
-      document.getElementById("active-connections").textContent = stats.active_connections;
-      document.getElementById("blocked-threats").textContent = stats.blocked_threats;
-      document.getElementById("monitored-threats").textContent = stats.monitored_threats;
-      document.getElementById("inspected-chunks").textContent = stats.inspected_chunks;
-      document.getElementById("observed-files").textContent = stats.observed_file_events || 0;
-      document.getElementById("server-side-copies").textContent = stats.server_side_copy_requests || 0;
-      document.getElementById("dns-queries").textContent = stats.dns_queries || 0;
-      document.getElementById("dns-blocked").textContent = stats.dns_blocked_queries || 0;
-      document.getElementById("dns-cache-hits").textContent = stats.dns_cache_hits || 0;
-      document.getElementById("dns-upstream-errors").textContent = stats.dns_upstream_errors || 0;
+      document.getElementById("overview-smb-traffic").textContent = formatBytes(forwardedBytes);
+      document.getElementById("overview-smb-detail").textContent =
+        `${formatBytes(streamBytes)} wire · ${formatBytes(stats.smb_write_bytes || 0)} uploaded · ${stats.active_connections || 0} active`;
+      document.getElementById("overview-dns-queries").textContent = stats.dns_queries || 0;
+      document.getElementById("overview-dns-detail").textContent =
+        `${stats.dns_cache_hits || 0} cache hits · ${stats.dns_upstream_errors || 0} upstream errors`;
+      document.getElementById("overview-blocked-smb").textContent = stats.blocked_threats || 0;
+      document.getElementById("overview-smb-policy-detail").textContent =
+        `${stats.monitored_threats || 0} monitored · ${stats.inspected_chunks || 0} inspected chunks · ${stats.observed_file_events || 0} files`;
+      document.getElementById("overview-blocked-dns").textContent = stats.dns_blocked_queries || 0;
+      document.getElementById("overview-dns-policy-detail").textContent =
+        `${stats.dns_monitored_queries || 0} monitored · ${stats.dns_udp_queries || 0} UDP · ${stats.dns_tcp_queries || 0} TCP`;
       document.getElementById("management-info").textContent = `${data.management_interface} at ${data.management_bind_addr}`;
       document.getElementById("refresh-state").textContent = `PID ${data.process_id} · ${data.config_path} · updated ${new Date().toLocaleTimeString()}`;
       renderPolicyRuntime(stats.policy_runtime);
@@ -1235,17 +1390,15 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
       document.getElementById("dns-config").textContent = dns.enabled ? `${dns.interface} · ${dns.listen_udp_addr}` : "not configured";
       document.getElementById("dns-listener").textContent = dns.enabled ? `UDP ${dns.listen_udp_addr} · TCP ${dns.listen_tcp_addr}` : "disabled";
       document.getElementById("dns-upstreams").textContent = dns.enabled ? (dns.upstreams || []).join(", ") : "—";
-      document.getElementById("dns-feeds").textContent = dns.enabled
-        ? `${(dns.threat_feed_urls || []).length} feeds · ${dns.blocked_domains || 0} static blocks`
-        : "—";
       document.getElementById("dns-policy").textContent = dns.enabled ? `block response: ${dns.block_response}` : "—";
+      renderDnsSummary(dns, dnsEvents, stats);
 
       const dnsEventsBody = document.getElementById("dns-events-body");
       if (!dnsEvents.length) {
         dnsEventsBody.innerHTML = `<tr><td colspan="7" class="px-6 py-6 text-sm text-zinc-400">No DNS queries recorded yet.</td></tr>`;
       } else {
         dnsEventsBody.innerHTML = dnsEvents.slice().reverse().slice(0, 80).map((event) => {
-          const actionClass = event.action === "block" ? "border-red-400/40 bg-red-500/10 text-red-100" : event.action === "monitor" ? "border-amber-400/40 bg-amber-500/10 text-amber-100" : "border-emerald-400/40 bg-emerald-500/10 text-emerald-100";
+          const actionClass = actionBadgeClass(event.action);
           return `
             <tr class="hover:bg-zinc-800/40">
               <td class="whitespace-nowrap px-6 py-4 text-sm font-medium text-white">${text(event.client_addr)} · ${text(event.protocol).toUpperCase()}</td>
@@ -1312,14 +1465,19 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
           const routeStreamBytes = Number(runtime.stream_bytes_client_to_server || 0) + Number(runtime.stream_bytes_server_to_client || 0);
           return `
         <tr class="hover:bg-zinc-800/40">
-          <td class="whitespace-nowrap px-6 py-4 text-sm font-medium text-white">${text(route.name)}</td>
-          <td class="whitespace-nowrap px-6 py-4 text-sm text-emerald-200">${text(route.source_interface)}</td>
-          <td class="whitespace-nowrap px-6 py-4 text-sm text-zinc-300">${text(route.client_vlan)}</td>
-          <td class="whitespace-nowrap px-6 py-4 text-sm text-zinc-300">${text(route.listen_addr)}</td>
-          <td class="whitespace-nowrap px-6 py-4 text-sm text-cyan-200">${text(route.target_file_server_addr)}</td>
-          <td class="whitespace-nowrap px-6 py-4 text-sm text-zinc-300">${text(runtime.active_connections || 0)} active / ${text(runtime.total_connections || 0)} total</td>
-          <td class="whitespace-nowrap px-6 py-4 text-sm text-zinc-300">${text(runtime.inspected_chunks || 0)} chunks</td>
-          <td class="whitespace-nowrap px-6 py-4 text-sm text-zinc-300">${formatBytes(routeBytes)} fwd / ${formatBytes(routeStreamBytes)} read</td>
+          <td class="px-4 py-4 text-sm font-medium text-white">
+            <p>${text(route.name)}</p>
+            <p class="mt-1 text-xs text-zinc-500">${text(route.listen_addr)}</p>
+          </td>
+          <td class="px-4 py-4 text-sm text-emerald-200">
+            <p>${text(route.source_interface)}</p>
+            <p class="mt-1 text-xs text-zinc-500">VLAN ${text(route.client_vlan)}</p>
+          </td>
+          <td class="px-4 py-4 text-sm text-cyan-200">${text(route.target_file_server_addr)}</td>
+          <td class="px-4 py-4 text-sm text-zinc-300">
+            <p>${formatBytes(routeBytes)} forwarded</p>
+            <p class="mt-1 text-xs text-zinc-500">${formatBytes(routeStreamBytes)} wire · ${text(runtime.active_connections || 0)} active</p>
+          </td>
         </tr>
           `;
         })()}
@@ -1360,51 +1518,66 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
       }
 
       const auditLog = document.getElementById("audit-log");
-      const auditEvents = stats.recent_audit_events || [];
-      document.getElementById("audit-count").textContent = `${stats.audit_events || 0} audit events`;
-      document.getElementById("audit-state").textContent = auditEvents.length
-        ? `Latest event ${new Date(auditEvents[auditEvents.length - 1].unix_timestamp_seconds * 1000).toLocaleTimeString()}`
-        : "Waiting for SMB activity";
+      const smbAuditEvents = (stats.recent_audit_events || []).map((event) => ({
+        source: "SMB",
+        timestamp: Number(event.unix_timestamp_seconds || 0),
+        severity: event.severity,
+        kind: event.kind,
+        action: event.action,
+        subject: event.file_path || text(event.kind).replaceAll("_", " "),
+        route: `${text(event.route_name)} · ${text(event.interface)} · ${text(event.direction)}`,
+        peer: event.peer_addr,
+        target: event.target_addr,
+        reason: `${text(event.reason)}${event.rule_name ? ` · ${text(event.rule_name)}` : ""}`
+      }));
+      const dnsAuditEvents = dnsEvents.map((event) => ({
+        source: "DNS",
+        timestamp: Number(event.unix_timestamp_seconds || 0),
+        severity: event.action === "block" ? "critical" : event.action === "monitor" ? "warning" : "info",
+        kind: "dns_query",
+        action: event.action,
+        subject: event.query_name,
+        route: `${text(event.protocol).toUpperCase()} · ${text(event.query_type)}${event.cache_hit ? " · cache hit" : ""}`,
+        peer: event.client_addr,
+        target: event.upstream_addr,
+        reason: `${text(event.reason)} · rcode ${text(event.response_code)} · ${text(event.latency_millis)} ms`
+      }));
+      const globalEvents = [...smbAuditEvents, ...dnsAuditEvents]
+        .sort((a, b) => b.timestamp - a.timestamp)
+        .slice(0, 120);
 
-      if (!auditEvents.length) {
-        auditLog.innerHTML = `<div class="px-6 py-6 text-sm text-zinc-400">No SMB activity recorded.</div>`;
+      document.getElementById("audit-count").textContent =
+        `${globalEvents.length} recent events · ${stats.audit_events || 0} SMB total · ${stats.dns_queries || 0} DNS total`;
+      document.getElementById("audit-state").textContent = globalEvents.length
+        ? `Latest event ${new Date(globalEvents[0].timestamp * 1000).toLocaleTimeString()}`
+        : "Waiting for SMB and DNS activity";
+
+      if (!globalEvents.length) {
+        auditLog.innerHTML = `<div class="px-6 py-6 text-sm text-zinc-400">No SMB or DNS activity recorded.</div>`;
       } else {
-        auditLog.innerHTML = auditEvents.slice().reverse().slice(0, 80).map((event) => {
+        auditLog.innerHTML = globalEvents.map((event) => {
           const severityClass = event.severity === "critical" ? "text-red-200" : event.severity === "warning" ? "text-amber-200" : "text-zinc-200";
-          const badgeClass = event.kind === "policy_blocked" ? "border-red-400/40 bg-red-500/10 text-red-100" : event.kind === "policy_detection" ? "border-amber-400/40 bg-amber-500/10 text-amber-100" : "border-zinc-700 bg-zinc-950 text-zinc-300";
+          const badgeClass = event.action === "block" ? "border-red-400/40 bg-red-500/10 text-red-100" : event.action === "monitor" ? "border-amber-400/40 bg-amber-500/10 text-amber-100" : "border-zinc-700 bg-zinc-950 text-zinc-300";
+          const sourceClass = event.source === "DNS" ? "border-sky-400/40 bg-sky-500/10 text-sky-100" : "border-emerald-400/40 bg-emerald-500/10 text-emerald-100";
           return `
             <div class="px-6 py-4">
               <div class="flex flex-col gap-2 lg:flex-row lg:items-center lg:justify-between">
                 <div class="min-w-0">
                   <div class="flex flex-wrap items-center gap-2">
+                    <span class="rounded-full border px-2.5 py-1 text-xs font-semibold uppercase ${sourceClass}">${event.source}</span>
                     <span class="rounded-full border px-2.5 py-1 text-xs font-semibold uppercase ${badgeClass}">${text(event.kind).replaceAll("_", " ")}</span>
                     <span class="text-sm font-semibold ${severityClass}">${text(event.action).toUpperCase()}</span>
-                    <span class="text-sm text-zinc-400">${text(event.peer_addr)} → ${text(event.target_addr)}</span>
+                    <span class="text-sm text-zinc-400">${text(event.peer)} → ${text(event.target)}</span>
                   </div>
-                  <p class="mt-2 truncate text-sm text-white">${text(event.file_path)}</p>
-                  <p class="mt-1 text-sm text-zinc-400">${text(event.reason)}${event.rule_name ? ` · ${text(event.rule_name)}` : ""}</p>
+                  <p class="mt-2 truncate text-sm text-white">${text(event.subject)}</p>
+                  <p class="mt-1 text-sm text-zinc-400">${text(event.reason)}</p>
+                  <p class="mt-1 text-xs text-zinc-500">${text(event.route)}</p>
                 </div>
-                <p class="text-xs text-zinc-500">${new Date(event.unix_timestamp_seconds * 1000).toLocaleString()}</p>
+                <p class="text-xs text-zinc-500">${new Date(event.timestamp * 1000).toLocaleString()}</p>
               </div>
             </div>
           `;
         }).join("");
-      }
-
-      const threats = document.getElementById("threats");
-      if (!stats.recent_threats.length) {
-        threats.innerHTML = `<div class="px-6 py-6 text-sm text-zinc-400">No policy detections recorded.</div>`;
-      } else {
-        threats.innerHTML = stats.recent_threats.slice().reverse().map((event) => `
-          <div class="px-6 py-4">
-            <div class="flex flex-col gap-1 md:flex-row md:items-center md:justify-between">
-              <p class="font-medium ${event.action === "block" ? "text-red-200" : "text-amber-200"}">${text(event.action).toUpperCase()} · ${text(event.reason)}</p>
-              <p class="text-xs text-zinc-500">${new Date(event.unix_timestamp_seconds * 1000).toLocaleString()}</p>
-            </div>
-            ${event.file_path ? `<p class="mt-2 text-sm font-medium text-white">${text(event.file_path)}</p>` : ""}
-            <p class="mt-2 text-sm text-zinc-400">${text(event.rule_name)} · ${text(event.route_name)} · ${text(event.interface)} · ${text(event.direction)} · ${text(event.peer_addr)} · entropy ${Number(event.entropy || 0).toFixed(3)}</p>
-          </div>
-        `).join("");
       }
     }
 
@@ -1596,10 +1769,14 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
     document.getElementById("save-policies").addEventListener("click", savePolicies);
     document.getElementById("run-policy-self-test").addEventListener("click", runPolicySelfTest);
     document.getElementById("load-diagnostics").addEventListener("click", loadDiagnostics);
+    document.querySelectorAll(".top-nav-button").forEach((button) => {
+      button.addEventListener("click", () => setActiveView(button.dataset.view));
+    });
     document.querySelectorAll(".policy-preset").forEach((button) => {
       button.addEventListener("click", () => applyPreset(button.dataset.preset));
     });
 
+    setActiveView(localStorage.getItem("axiomDashboardView") || "overview");
     refresh();
     loadPolicies();
     setInterval(refresh, 2000);
