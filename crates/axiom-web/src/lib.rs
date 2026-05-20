@@ -979,6 +979,34 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
     <section class="mt-8 rounded-lg border border-zinc-800 bg-zinc-900">
       <div class="flex flex-col gap-2 border-b border-zinc-800 px-6 py-5 md:flex-row md:items-end md:justify-between">
         <div>
+          <h2 class="text-xl font-semibold text-white">Live SMB Connections</h2>
+          <p id="live-connection-state" class="mt-1 text-sm text-zinc-400">Waiting for active SMB sessions</p>
+        </div>
+        <p id="live-connection-count" class="text-sm text-zinc-500">0 live connections</p>
+      </div>
+
+      <div class="overflow-x-auto">
+        <table class="min-w-full divide-y divide-zinc-800">
+          <thead class="bg-zinc-950/60">
+            <tr>
+              <th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-zinc-400">Client</th>
+              <th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-zinc-400">Target</th>
+              <th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-zinc-400">Route</th>
+              <th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-zinc-400">Current File</th>
+              <th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-zinc-400">Wire Traffic</th>
+              <th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-zinc-400">Forwarded</th>
+              <th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-zinc-400">SMB Writes</th>
+              <th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-zinc-400">Last Activity</th>
+            </tr>
+          </thead>
+          <tbody id="live-connections-body" class="divide-y divide-zinc-800"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="mt-8 rounded-lg border border-zinc-800 bg-zinc-900">
+      <div class="flex flex-col gap-2 border-b border-zinc-800 px-6 py-5 md:flex-row md:items-end md:justify-between">
+        <div>
           <h2 class="text-xl font-semibold text-white">File Transfer Ledger</h2>
           <p id="file-activity-state" class="mt-1 text-sm text-zinc-400">Waiting for per-file SMB activity</p>
         </div>
@@ -1098,6 +1126,43 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
       document.getElementById("management-info").textContent = `${data.management_interface} at ${data.management_bind_addr}`;
       document.getElementById("refresh-state").textContent = `PID ${data.process_id} · ${data.config_path} · updated ${new Date().toLocaleTimeString()}`;
       renderPolicyRuntime(stats.policy_runtime);
+
+      const liveConnections = stats.active_connection_details || [];
+      const liveConnectionsBody = document.getElementById("live-connections-body");
+      document.getElementById("live-connection-count").textContent = `${liveConnections.length} live connections`;
+      document.getElementById("live-connection-state").textContent = liveConnections.length
+        ? `Latest activity ${formatTime(liveConnections[0].last_activity_unix_timestamp_seconds)}`
+        : "Waiting for active SMB sessions";
+
+      if (!liveConnections.length) {
+        liveConnectionsBody.innerHTML = `<tr><td colspan="8" class="px-6 py-6 text-sm text-zinc-400">No active SMB connections right now.</td></tr>`;
+      } else {
+        liveConnectionsBody.innerHTML = liveConnections.map((connection) => {
+          const wireBytes = Number(connection.stream_bytes_client_to_server || 0) + Number(connection.stream_bytes_server_to_client || 0);
+          const forwarded = Number(connection.forwarded_bytes_client_to_server || 0) + Number(connection.forwarded_bytes_server_to_client || 0);
+          const blocked = Number(connection.blocked_events || 0) > 0;
+          const monitored = Number(connection.monitored_events || 0) > 0;
+          const actionClass = blocked ? "border-red-400/40 bg-red-500/10 text-red-100" : monitored ? "border-amber-400/40 bg-amber-500/10 text-amber-100" : "border-emerald-400/40 bg-emerald-500/10 text-emerald-100";
+          return `
+            <tr class="hover:bg-zinc-800/40">
+              <td class="whitespace-nowrap px-6 py-4 text-sm font-medium text-white">${text(connection.peer_addr)}</td>
+              <td class="whitespace-nowrap px-6 py-4 text-sm text-cyan-200">${text(connection.target_addr)}</td>
+              <td class="whitespace-nowrap px-6 py-4 text-sm text-zinc-300">${text(connection.route_name)} · ${text(connection.interface)}</td>
+              <td class="max-w-xs px-6 py-4 text-sm text-white">
+                <p class="truncate">${text(connection.last_file_path)}</p>
+                <p class="mt-1 line-clamp-1 text-xs text-zinc-500">${text(connection.last_reason)}</p>
+              </td>
+              <td class="whitespace-nowrap px-6 py-4 text-sm text-sky-200">${formatBytes(wireBytes)}</td>
+              <td class="whitespace-nowrap px-6 py-4 text-sm text-emerald-200">${formatBytes(forwarded)}</td>
+              <td class="whitespace-nowrap px-6 py-4 text-sm text-lime-200">${formatBytes(connection.smb_write_bytes || 0)} · ${text(connection.smb_write_requests || 0)} writes</td>
+              <td class="whitespace-nowrap px-6 py-4 text-sm text-zinc-300">
+                <span class="rounded-full border px-2.5 py-1 text-xs font-semibold uppercase ${actionClass}">${text(connection.last_action)}</span>
+                <p class="mt-2 text-xs text-zinc-500">${formatTime(connection.last_activity_unix_timestamp_seconds)}</p>
+              </td>
+            </tr>
+          `;
+        }).join("");
+      }
 
       const mappingBody = document.getElementById("mapping-body");
       const routeStats = new Map((stats.route_stats || []).map((route) => [route.route_name, route]));
@@ -1373,6 +1438,8 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
         config_path: payload.config_path,
         proxy_listeners: payload.proxy_listeners,
         route_stats: payload.status.route_stats,
+        active_connection_details: payload.status.active_connection_details,
+        file_activity: payload.status.file_activity,
         commands: payload.command_outputs
       };
 

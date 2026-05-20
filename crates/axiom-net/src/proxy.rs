@@ -197,7 +197,16 @@ async fn relay_smb_frame_direction(
             return Ok(());
         }
 
-        state.record_stream_bytes(&route.name, direction, bytes_read as u64);
+        let read_file_path_hint = telemetry.latest_write_file_path();
+        let read_context = InspectionContext {
+            route_name: &route.name,
+            interface: route.interface(),
+            direction,
+            peer_addr,
+            target_addr,
+            file_path_hint: read_file_path_hint.as_deref(),
+        };
+        state.record_connection_stream_bytes(&read_context, bytes_read as u64);
         let chunk = &buffer[..bytes_read];
         let frames = framer.push(chunk)?;
 
@@ -296,8 +305,7 @@ async fn inspect_and_forward_frame(
             writer.lock().await.write_all(&frame).await?;
             inspection_window.remember(&frame);
             state.record_allowed_chunk();
-            state.record_bytes(direction, frame.len() as u64);
-            state.record_route_bytes(&route.name, direction, frame.len() as u64);
+            state.record_forwarded_bytes(&context, frame.len() as u64);
         }
         InspectionResult::Monitor { event } => {
             let reason = event.reason.clone();
@@ -314,8 +322,7 @@ async fn inspect_and_forward_frame(
             writer.lock().await.write_all(&frame).await?;
             inspection_window.remember(&frame);
             state.record_allowed_chunk();
-            state.record_bytes(direction, frame.len() as u64);
-            state.record_route_bytes(&route.name, direction, frame.len() as u64);
+            state.record_forwarded_bytes(&context, frame.len() as u64);
         }
         InspectionResult::Block { event } => {
             let reason = event.reason.clone();
@@ -533,7 +540,7 @@ impl ConnectionTelemetry {
                 .expect("latest write file path mutex poisoned") = Some(file_path.clone());
             state.record_file_write_payload(context, &file_path, request.length as u64);
         } else {
-            state.record_smb_write_payload(context.route_name, request.length as u64);
+            state.record_smb_write_payload_for_connection(context, request.length as u64);
         }
     }
 }

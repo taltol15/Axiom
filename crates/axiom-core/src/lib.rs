@@ -28,6 +28,7 @@ pub struct AppState {
     policy_generation: AtomicU64,
     policy_updated_at_unix_timestamp_seconds: AtomicU64,
     route_stats: Mutex<HashMap<String, RouteRuntimeStats>>,
+    active_connections: Mutex<HashMap<String, ActiveConnectionStats>>,
     file_activity: Mutex<HashMap<String, FileActivityStats>>,
     recent_threats: Mutex<VecDeque<ThreatEvent>>,
     recent_audit_events: Mutex<VecDeque<AuditEvent>>,
@@ -42,6 +43,7 @@ impl AppState {
             policy_generation: AtomicU64::new(1),
             policy_updated_at_unix_timestamp_seconds: AtomicU64::new(unix_timestamp_seconds()),
             route_stats: Mutex::new(HashMap::new()),
+            active_connections: Mutex::new(HashMap::new()),
             file_activity: Mutex::new(HashMap::new()),
             recent_threats: Mutex::new(VecDeque::with_capacity(MAX_RETAINED_THREAT_EVENTS)),
             recent_audit_events: Mutex::new(VecDeque::with_capacity(MAX_RETAINED_AUDIT_EVENTS)),
@@ -93,6 +95,10 @@ impl AppState {
     }
 
     pub fn record_connection_opened(&self, context: &InspectionContext<'_>) {
+        self.upsert_active_connection(context, |connection| {
+            connection.last_action = "allow".to_string();
+            connection.last_reason = "SMB client connection opened".to_string();
+        });
         self.push_audit_event(AuditEvent::from_context(
             context,
             AuditEventKind::ConnectionOpened,
@@ -120,6 +126,7 @@ impl AppState {
     }
 
     pub fn record_connection_closed(&self, context: &InspectionContext<'_>) {
+        self.remove_active_connection(context);
         self.push_audit_event(AuditEvent::from_context(
             context,
             AuditEventKind::ConnectionClosed,
@@ -163,10 +170,46 @@ impl AppState {
         });
     }
 
+    pub fn record_connection_stream_bytes(&self, context: &InspectionContext<'_>, bytes: u64) {
+        self.record_stream_bytes(context.route_name, context.direction, bytes);
+        self.upsert_active_connection(context, |connection| {
+            match context.direction {
+                TrafficDirection::ClientToServer => {
+                    connection.stream_bytes_client_to_server += bytes;
+                }
+                TrafficDirection::ServerToClient => {
+                    connection.stream_bytes_server_to_client += bytes;
+                }
+            }
+            connection.last_action = "read".to_string();
+            connection.last_reason = "SMB socket bytes read by proxy".to_string();
+        });
+    }
+
     pub fn record_route_bytes(&self, route_name: &str, direction: TrafficDirection, bytes: u64) {
         self.with_route_stats(route_name, |route| match direction {
             TrafficDirection::ClientToServer => route.bytes_client_to_server += bytes,
             TrafficDirection::ServerToClient => route.bytes_server_to_client += bytes,
+        });
+    }
+
+    pub fn record_forwarded_bytes(&self, context: &InspectionContext<'_>, bytes: u64) {
+        self.record_bytes(context.direction, bytes);
+        self.record_route_bytes(context.route_name, context.direction, bytes);
+        self.upsert_active_connection(context, |connection| {
+            match context.direction {
+                TrafficDirection::ClientToServer => {
+                    connection.forwarded_bytes_client_to_server += bytes;
+                }
+                TrafficDirection::ServerToClient => {
+                    connection.forwarded_bytes_server_to_client += bytes;
+                }
+            }
+            connection.last_action = "forward".to_string();
+            connection.last_reason = "SMB frame forwarded after inspection".to_string();
+            if let Some(file_path) = context.file_path_hint {
+                connection.last_file_path = Some(file_path.to_string());
+            }
         });
     }
 
@@ -206,6 +249,12 @@ impl AppState {
             activity.last_rule_name = None;
             activity.last_bytes_in_chunk = Some(bytes_in_chunk);
         });
+        self.upsert_active_connection(context, |connection| {
+            connection.last_file_path = Some(file_path.clone());
+            connection.observed_file_events += 1;
+            connection.last_action = "observe".to_string();
+            connection.last_reason = "SMB file open/create observed".to_string();
+        });
         self.push_audit_event(AuditEvent::from_context(
             context,
             AuditEventKind::FileObserved,
@@ -231,13 +280,30 @@ impl AppState {
         });
     }
 
+    pub fn record_smb_write_payload_for_connection(
+        &self,
+        context: &InspectionContext<'_>,
+        bytes: u64,
+    ) {
+        self.record_smb_write_payload(context.route_name, bytes);
+        self.upsert_active_connection(context, |connection| {
+            connection.smb_write_requests += 1;
+            connection.smb_write_bytes += bytes;
+            connection.last_action = "write".to_string();
+            connection.last_reason = "SMB WRITE payload observed".to_string();
+            if let Some(file_path) = context.file_path_hint {
+                connection.last_file_path = Some(file_path.to_string());
+            }
+        });
+    }
+
     pub fn record_file_write_payload(
         &self,
         context: &InspectionContext<'_>,
         file_path: &str,
         bytes: u64,
     ) {
-        self.record_smb_write_payload(context.route_name, bytes);
+        self.record_smb_write_payload_for_connection(context, bytes);
         self.record_file_activity(context, file_path.to_string(), |activity| {
             activity.smb_write_requests += 1;
             activity.smb_write_bytes += bytes;
@@ -245,6 +311,9 @@ impl AppState {
             activity.last_reason = "SMB WRITE payload observed".to_string();
             activity.last_rule_name = None;
             activity.last_bytes_in_chunk = Some(bytes);
+        });
+        self.upsert_active_connection(context, |connection| {
+            connection.last_file_path = Some(file_path.to_string());
         });
     }
 
@@ -262,6 +331,13 @@ impl AppState {
             None,
             Some("SMB2 IOCTL copychunk".to_string()),
         ));
+        self.upsert_active_connection(context, |connection| {
+            connection.server_side_copy_requests += 1;
+            connection.last_action = "observe".to_string();
+            connection.last_reason =
+                "SMB server-side copy request observed; file bytes may not cross the proxy"
+                    .to_string();
+        });
     }
 
     pub fn record_monitored_threat(&self, event: ThreatEvent) {
@@ -275,6 +351,7 @@ impl AppState {
             route.monitored_events += 1;
         });
         self.record_file_activity_for_threat(&event);
+        self.record_active_connection_threat(&event);
         self.push_audit_event(AuditEvent::from_threat(
             &event,
             AuditEventKind::PolicyDetection,
@@ -292,6 +369,7 @@ impl AppState {
             route.blocked_events += 1;
         });
         self.record_file_activity_for_threat(&event);
+        self.record_active_connection_threat(&event);
         self.push_audit_event(AuditEvent::from_threat(
             &event,
             AuditEventKind::PolicyBlocked,
@@ -403,6 +481,7 @@ impl AppState {
             policy_runtime: self.policy_runtime_snapshot(),
             audit_log_path: AUDIT_LOG_PATH.to_string(),
             route_stats: self.route_snapshots(),
+            active_connection_details: self.active_connection_snapshots(),
             file_activity: self.file_activity_snapshots(),
             recent_threats,
             recent_audit_events,
@@ -533,6 +612,89 @@ impl AppState {
         });
     }
 
+    fn upsert_active_connection(
+        &self,
+        context: &InspectionContext<'_>,
+        update: impl FnOnce(&mut ActiveConnectionStats),
+    ) {
+        let key = active_connection_key(context.route_name, context.peer_addr, context.target_addr);
+        let now = unix_timestamp_seconds();
+        let mut active_connections = self
+            .active_connections
+            .lock()
+            .expect("active connections mutex poisoned");
+        let connection = active_connections
+            .entry(key.clone())
+            .and_modify(|connection| {
+                connection.route_name = context.route_name.to_string();
+                connection.interface = context.interface.to_string();
+                connection.peer_addr = context.peer_addr;
+                connection.target_addr = context.target_addr;
+                if let Some(file_path) = context.file_path_hint {
+                    connection.last_file_path = Some(file_path.to_string());
+                }
+            })
+            .or_insert_with(|| ActiveConnectionStats {
+                connection_key: key,
+                route_name: context.route_name.to_string(),
+                interface: context.interface.to_string(),
+                peer_addr: context.peer_addr,
+                target_addr: context.target_addr,
+                opened_unix_timestamp_seconds: now,
+                last_activity_unix_timestamp_seconds: now,
+                stream_bytes_client_to_server: 0,
+                stream_bytes_server_to_client: 0,
+                forwarded_bytes_client_to_server: 0,
+                forwarded_bytes_server_to_client: 0,
+                smb_write_requests: 0,
+                smb_write_bytes: 0,
+                observed_file_events: 0,
+                server_side_copy_requests: 0,
+                monitored_events: 0,
+                blocked_events: 0,
+                last_file_path: context.file_path_hint.map(ToString::to_string),
+                last_action: "allow".to_string(),
+                last_reason: "SMB client connection opened".to_string(),
+            });
+
+        update(connection);
+        connection.last_activity_unix_timestamp_seconds = now;
+    }
+
+    fn remove_active_connection(&self, context: &InspectionContext<'_>) {
+        self.active_connections
+            .lock()
+            .expect("active connections mutex poisoned")
+            .remove(&active_connection_key(
+                context.route_name,
+                context.peer_addr,
+                context.target_addr,
+            ));
+    }
+
+    fn record_active_connection_threat(&self, event: &ThreatEvent) {
+        let context = InspectionContext {
+            route_name: &event.route_name,
+            interface: &event.interface,
+            direction: event.direction,
+            peer_addr: event.peer_addr,
+            target_addr: event.target_addr,
+            file_path_hint: event.file_path.as_deref(),
+        };
+        self.upsert_active_connection(&context, |connection| {
+            match event.action {
+                PolicyMode::Block => connection.blocked_events += 1,
+                PolicyMode::Monitor => connection.monitored_events += 1,
+                PolicyMode::Disabled => {}
+            }
+            connection.last_action = policy_mode_label(event.action).to_string();
+            connection.last_reason = event.reason.clone();
+            if let Some(file_path) = &event.file_path {
+                connection.last_file_path = Some(file_path.clone());
+            }
+        });
+    }
+
     fn route_snapshots(&self) -> Vec<RouteStatsSnapshot> {
         let mut snapshots: Vec<_> = self
             .route_stats
@@ -543,6 +705,24 @@ impl AppState {
             .collect();
 
         snapshots.sort_by(|left, right| left.route_name.cmp(&right.route_name));
+        snapshots
+    }
+
+    fn active_connection_snapshots(&self) -> Vec<ActiveConnectionStats> {
+        let mut snapshots: Vec<_> = self
+            .active_connections
+            .lock()
+            .expect("active connections mutex poisoned")
+            .values()
+            .cloned()
+            .collect();
+
+        snapshots.sort_by(|left, right| {
+            right
+                .last_activity_unix_timestamp_seconds
+                .cmp(&left.last_activity_unix_timestamp_seconds)
+                .then_with(|| left.peer_addr.cmp(&right.peer_addr))
+        });
         snapshots
     }
 
@@ -619,9 +799,34 @@ pub struct StatusSnapshot {
     pub policy_runtime: PolicyRuntimeSnapshot,
     pub audit_log_path: String,
     pub route_stats: Vec<RouteStatsSnapshot>,
+    pub active_connection_details: Vec<ActiveConnectionStats>,
     pub file_activity: Vec<FileActivityStats>,
     pub recent_threats: Vec<ThreatEvent>,
     pub recent_audit_events: Vec<AuditEvent>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ActiveConnectionStats {
+    pub connection_key: String,
+    pub route_name: String,
+    pub interface: String,
+    pub peer_addr: SocketAddr,
+    pub target_addr: SocketAddr,
+    pub opened_unix_timestamp_seconds: u64,
+    pub last_activity_unix_timestamp_seconds: u64,
+    pub stream_bytes_client_to_server: u64,
+    pub stream_bytes_server_to_client: u64,
+    pub forwarded_bytes_client_to_server: u64,
+    pub forwarded_bytes_server_to_client: u64,
+    pub smb_write_requests: u64,
+    pub smb_write_bytes: u64,
+    pub observed_file_events: u64,
+    pub server_side_copy_requests: u64,
+    pub monitored_events: u64,
+    pub blocked_events: u64,
+    pub last_file_path: Option<String>,
+    pub last_action: String,
+    pub last_reason: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -965,38 +1170,15 @@ impl StreamPolicy {
         chunk: &[u8],
     ) -> Option<PolicyDetection> {
         if context.direction == TrafficDirection::ClientToServer {
+            if let Some(file_path) = context.file_path_hint
+                && let Some(detection) = self.archive_policy_detection_for_file_path(file_path)
+            {
+                return Some(detection);
+            }
+
             for file_path in extract_smb_file_paths(chunk) {
-                let lower_file_path = file_path.to_ascii_lowercase();
-                if lower_file_path.ends_with(".rar") && self.config.archive.rar.is_enabled() {
-                    return Some(PolicyDetection {
-                        action: self.config.archive.rar,
-                        rule_name: "RAR archive".to_string(),
-                        reason: format!(
-                            "RAR filename extension detected in SMB create/write flow: '{file_path}'"
-                        ),
-                    });
-                }
-
-                if (lower_file_path.ends_with(".7z") || lower_file_path.ends_with(".7zip"))
-                    && self.config.archive.seven_zip.is_enabled()
-                {
-                    return Some(PolicyDetection {
-                        action: self.config.archive.seven_zip,
-                        rule_name: "7z archive".to_string(),
-                        reason: format!(
-                            "7z filename extension detected in SMB create/write flow: '{file_path}'"
-                        ),
-                    });
-                }
-
-                if lower_file_path.ends_with(".zip") && self.config.archive.zip.is_enabled() {
-                    return Some(PolicyDetection {
-                        action: self.config.archive.zip,
-                        rule_name: "ZIP archive".to_string(),
-                        reason: format!(
-                            "ZIP filename extension detected in SMB create/write flow: '{file_path}'"
-                        ),
-                    });
+                if let Some(detection) = self.archive_policy_detection_for_file_path(&file_path) {
+                    return Some(detection);
                 }
             }
 
@@ -1073,6 +1255,43 @@ impl StreamPolicy {
                 action: self.config.archive.zip,
                 rule_name: "ZIP archive".to_string(),
                 reason: "ZIP archive transfer detected".to_string(),
+            });
+        }
+
+        None
+    }
+
+    fn archive_policy_detection_for_file_path(&self, file_path: &str) -> Option<PolicyDetection> {
+        let lower_file_path = file_path.to_ascii_lowercase();
+        if lower_file_path.ends_with(".rar") && self.config.archive.rar.is_enabled() {
+            return Some(PolicyDetection {
+                action: self.config.archive.rar,
+                rule_name: "RAR archive".to_string(),
+                reason: format!(
+                    "RAR filename extension detected in SMB create/write flow: '{file_path}'"
+                ),
+            });
+        }
+
+        if (lower_file_path.ends_with(".7z") || lower_file_path.ends_with(".7zip"))
+            && self.config.archive.seven_zip.is_enabled()
+        {
+            return Some(PolicyDetection {
+                action: self.config.archive.seven_zip,
+                rule_name: "7z archive".to_string(),
+                reason: format!(
+                    "7z filename extension detected in SMB create/write flow: '{file_path}'"
+                ),
+            });
+        }
+
+        if lower_file_path.ends_with(".zip") && self.config.archive.zip.is_enabled() {
+            return Some(PolicyDetection {
+                action: self.config.archive.zip,
+                rule_name: "ZIP archive".to_string(),
+                reason: format!(
+                    "ZIP filename extension detected in SMB create/write flow: '{file_path}'"
+                ),
             });
         }
 
@@ -1511,6 +1730,14 @@ fn file_activity_key(route_name: &str, peer_addr: SocketAddr, file_path: &str) -
     format!("{route_name}|{}|{file_path}", peer_addr.ip())
 }
 
+fn active_connection_key(
+    route_name: &str,
+    peer_addr: SocketAddr,
+    target_addr: SocketAddr,
+) -> String {
+    format!("{route_name}|{peer_addr}|{target_addr}")
+}
+
 fn policy_mode_label(mode: PolicyMode) -> &'static str {
     match mode {
         PolicyMode::Disabled => "disabled",
@@ -1772,6 +1999,20 @@ mod tests {
         let policy = StreamPolicy::default();
         let context = test_context();
         let chunk = smb2_create_request("Finance Backup.RaR");
+
+        let result = policy.inspect_chunk(&context, &chunk);
+
+        assert!(matches!(result, InspectionResult::Block { .. }));
+    }
+
+    #[test]
+    fn blocks_archive_filename_from_active_file_handle_context() {
+        let policy = StreamPolicy::default();
+        let context = InspectionContext {
+            file_path_hint: Some("Exports/zip_sample_file_250MB.zip"),
+            ..test_context()
+        };
+        let chunk = smb2_write_request(262_144);
 
         let result = policy.inspect_chunk(&context, &chunk);
 
