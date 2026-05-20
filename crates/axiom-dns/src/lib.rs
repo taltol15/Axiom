@@ -254,7 +254,9 @@ async fn handle_dns_query(
         return Ok(response);
     }
 
-    let response = state.forward_with_failover(protocol, &query).await;
+    let response = state
+        .forward_with_failover(protocol, client_addr, &query)
+        .await;
 
     match response {
         Ok((upstream, response)) => {
@@ -488,11 +490,23 @@ impl DnsGatewayState {
     async fn forward_with_failover(
         &self,
         protocol: DnsProtocol,
+        client_addr: SocketAddr,
         query: &[u8],
     ) -> anyhow::Result<(SocketAddr, Vec<u8>)> {
         let mut last_error = None;
+        let mut skipped_loop_upstreams = 0_usize;
 
         for upstream in self.ordered_upstreams() {
+            if upstream.ip() == client_addr.ip() || Some(upstream.ip()) == self.config.listen_ip {
+                skipped_loop_upstreams += 1;
+                warn!(
+                    %client_addr,
+                    %upstream,
+                    "skipping DNS upstream to prevent a resolver forwarding loop"
+                );
+                continue;
+            }
+
             let result = match protocol {
                 DnsProtocol::Udp => self.forward_udp(query, upstream).await,
                 DnsProtocol::Tcp => self.forward_tcp(query, upstream).await,
@@ -507,7 +521,15 @@ impl DnsGatewayState {
             }
         }
 
-        Err(last_error.unwrap_or_else(|| anyhow::anyhow!("no upstream DNS resolvers configured")))
+        Err(last_error.unwrap_or_else(|| {
+            if skipped_loop_upstreams > 0 {
+                anyhow::anyhow!(
+                    "DNS forwarding loop prevented: every usable upstream matched the client or Axiom listen address"
+                )
+            } else {
+                anyhow::anyhow!("no upstream DNS resolvers configured")
+            }
+        }))
     }
 
     async fn forward_tcp(&self, query: &[u8], upstream: SocketAddr) -> anyhow::Result<Vec<u8>> {
@@ -1055,6 +1077,8 @@ fn connect_is_in_progress(error: &io::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axiom_config::{DnsPolicyConfig, PolicyConfig};
+    use axiom_core::StreamPolicy;
 
     #[test]
     fn parses_plain_dns_question() {
@@ -1123,6 +1147,31 @@ mod tests {
 
         assert!(domains.contains(&"bad.example".to_string()));
         assert!(domains.contains(&"worse.example".to_string()));
+    }
+
+    #[tokio::test]
+    async fn prevents_forwarding_loop_to_client_upstream() {
+        let config = DnsConfig {
+            enabled: true,
+            interface: "lo".to_string(),
+            listen_ip: Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))),
+            upstreams: vec!["192.168.0.10:53".parse().unwrap()],
+            ..DnsConfig::default()
+        };
+        let runtime = Arc::new(RuntimeState::new(
+            StreamPolicy::from_config(PolicyConfig::default()),
+            DnsPolicyConfig::default(),
+        ));
+        let state = DnsGatewayState::new(config, runtime);
+        let query = dns_query("example.com", DNS_TYPE_A);
+        let client_addr: SocketAddr = "192.168.0.10:53333".parse().unwrap();
+
+        let error = state
+            .forward_with_failover(DnsProtocol::Udp, client_addr, &query)
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("DNS forwarding loop prevented"));
     }
 
     fn dns_query(name: &str, qtype: u16) -> Vec<u8> {

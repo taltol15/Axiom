@@ -406,6 +406,8 @@ async fn api_logout() -> Response {
 
 fn build_status_response(state: &WebState) -> StatusResponse {
     let config = state.config.lock().expect("web config mutex poisoned");
+    let stats = state.runtime.snapshot();
+    let deployment_warnings = build_deployment_warnings(&config, &stats);
     StatusResponse {
         process_id: std::process::id(),
         config_path: state.config_path.display().to_string(),
@@ -418,12 +420,47 @@ fn build_status_response(state: &WebState) -> StatusResponse {
             .map(ProxyListenerStatus::from)
             .collect(),
         dns: DnsStatus::from(&config.dns),
-        stats: state.runtime.snapshot(),
+        deployment_warnings,
+        stats,
     }
 }
 
 fn build_diagnostics_response(state: &WebState) -> DiagnosticsResponse {
     let config = state.config.lock().expect("web config mutex poisoned");
+    let status = state.runtime.snapshot();
+    let deployment_warnings = build_deployment_warnings(&config, &status);
+    let mut command_outputs = vec![
+        run_diagnostic_command("ss", &["-ltnp"]),
+        run_diagnostic_command("ss", &["-lunp"]),
+        run_diagnostic_command("ss", &["-tnp"]),
+        run_diagnostic_command("ip", &["-br", "addr"]),
+        run_diagnostic_command("ip", &["route"]),
+        run_diagnostic_command("ip", &["rule"]),
+        run_diagnostic_command("nft", &["list", "ruleset"]),
+        run_diagnostic_command("iptables-save", &[]),
+        run_diagnostic_command("sysctl", &["net.ipv4.ip_forward"]),
+        run_diagnostic_command("sysctl", &["net.ipv4.conf.all.forwarding"]),
+        run_diagnostic_command("sysctl", &["net.ipv4.conf.all.route_localnet"]),
+        run_diagnostic_command("ls", &["-l", "/var/log/axiom"]),
+        run_diagnostic_command("tail", &["-n", "80", "/var/log/axiom/audit.jsonl"]),
+    ];
+
+    for upstream in &config.dns.upstreams {
+        let upstream_ip = upstream.ip().to_string();
+        command_outputs.push(run_diagnostic_command(
+            "ip",
+            &["route", "get", upstream_ip.as_str()],
+        ));
+    }
+
+    for listener in &config.proxy_listeners {
+        let target_ip = listener.target_addr().ip().to_string();
+        command_outputs.push(run_diagnostic_command(
+            "ip",
+            &["route", "get", target_ip.as_str()],
+        ));
+    }
+
     DiagnosticsResponse {
         process_id: std::process::id(),
         executable_path: std::env::current_exe()
@@ -437,22 +474,9 @@ fn build_diagnostics_response(state: &WebState) -> DiagnosticsResponse {
             .map(ProxyListenerStatus::from)
             .collect(),
         dns: DnsStatus::from(&config.dns),
-        status: state.runtime.snapshot(),
-        command_outputs: vec![
-            run_diagnostic_command("ss", &["-ltnp"]),
-            run_diagnostic_command("ss", &["-lunp"]),
-            run_diagnostic_command("ss", &["-tnp"]),
-            run_diagnostic_command("ip", &["-br", "addr"]),
-            run_diagnostic_command("ip", &["route"]),
-            run_diagnostic_command("ip", &["rule"]),
-            run_diagnostic_command("nft", &["list", "ruleset"]),
-            run_diagnostic_command("iptables-save", &[]),
-            run_diagnostic_command("sysctl", &["net.ipv4.ip_forward"]),
-            run_diagnostic_command("sysctl", &["net.ipv4.conf.all.forwarding"]),
-            run_diagnostic_command("sysctl", &["net.ipv4.conf.all.route_localnet"]),
-            run_diagnostic_command("ls", &["-l", "/var/log/axiom"]),
-            run_diagnostic_command("tail", &["-n", "80", "/var/log/axiom/audit.jsonl"]),
-        ],
+        deployment_warnings,
+        status,
+        command_outputs,
         proc_self_status: fs::read_to_string("/proc/self/status").ok(),
     }
 }
@@ -587,6 +611,59 @@ fn run_diagnostic_command(command: &str, args: &[&str]) -> CommandOutput {
     }
 }
 
+fn build_deployment_warnings(config: &AxiomConfig, stats: &StatusSnapshot) -> DeploymentWarnings {
+    DeploymentWarnings {
+        smb: smb_deployment_warnings(config, stats),
+        dns: dns_deployment_warnings(&config.dns),
+    }
+}
+
+fn smb_deployment_warnings(config: &AxiomConfig, stats: &StatusSnapshot) -> Vec<String> {
+    if config.proxy_listeners.is_empty() {
+        return Vec::new();
+    }
+
+    let mut warnings = Vec::new();
+    for listener in &config.proxy_listeners {
+        let route_stats = stats
+            .route_stats
+            .iter()
+            .find(|route| route.route_name == listener.name);
+
+        match route_stats {
+            Some(route) if !route.listener_ready => warnings.push(format!(
+                "SMB route '{}' is configured but the listener is not ready.",
+                listener.name
+            )),
+            Some(route) if route.total_connections == 0 => warnings.push(format!(
+                "SMB route '{}' is listening on {}, but no client has reached the Axiom proxy yet.",
+                listener.name,
+                listener.listen_addr()
+            )),
+            Some(route)
+                if route.stream_bytes_client_to_server + route.stream_bytes_server_to_client
+                    < route.smb_write_bytes =>
+            {
+                warnings.push(format!(
+                    "SMB route '{}' has inconsistent counters; reload diagnostics and verify the proxy path.",
+                    listener.name
+                ));
+            }
+            None => warnings.push(format!(
+                "SMB route '{}' is configured but no runtime route telemetry exists yet.",
+                listener.name
+            )),
+            _ => {}
+        }
+    }
+
+    warnings.push(
+        "For SMB enforcement, endpoints must not have direct TCP/445 access to the target file server; only Axiom should reach the backend SMB server."
+            .to_string(),
+    );
+    warnings
+}
+
 #[derive(Debug, Serialize)]
 struct StatusResponse {
     process_id: u32,
@@ -596,6 +673,7 @@ struct StatusResponse {
     configured_proxy_listeners: usize,
     proxy_listeners: Vec<ProxyListenerStatus>,
     dns: DnsStatus,
+    deployment_warnings: DeploymentWarnings,
     stats: StatusSnapshot,
 }
 
@@ -607,9 +685,16 @@ struct DiagnosticsResponse {
     management_bind_addr: String,
     proxy_listeners: Vec<ProxyListenerStatus>,
     dns: DnsStatus,
+    deployment_warnings: DeploymentWarnings,
     status: StatusSnapshot,
     command_outputs: Vec<CommandOutput>,
     proc_self_status: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct DeploymentWarnings {
+    smb: Vec<String>,
+    dns: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -642,6 +727,7 @@ struct DnsStatus {
     monitored_domains: usize,
     local_records: usize,
     block_response: String,
+    deployment_warnings: Vec<String>,
 }
 
 impl From<&axiom_config::DnsConfig> for DnsStatus {
@@ -658,8 +744,41 @@ impl From<&axiom_config::DnsConfig> for DnsStatus {
             monitored_domains: config.policy.monitored_domains.len(),
             local_records: config.policy.local_records.len(),
             block_response: format!("{:?}", config.policy.block_response).to_ascii_lowercase(),
+            deployment_warnings: dns_deployment_warnings(config),
         }
     }
+}
+
+fn dns_deployment_warnings(config: &axiom_config::DnsConfig) -> Vec<String> {
+    if !config.enabled {
+        return Vec::new();
+    }
+
+    let mut warnings = Vec::new();
+    if config
+        .upstreams
+        .iter()
+        .any(|upstream| Some(upstream.ip()) == config.listen_ip)
+    {
+        warnings.push(
+            "A DNS upstream is equal to the Axiom DNS listen IP; this creates a self-loop."
+                .to_string(),
+        );
+    }
+
+    if config.upstream_interface() == config.interface {
+        warnings.push("DNS upstream egress uses the same NIC as the listener; verify that this NIC can route to the upstream resolvers.".to_string());
+    }
+
+    if !config.policy.threat_feed_urls.is_empty() {
+        warnings.push(
+            "DNS threat feeds are enabled and may block domains before local allowlisting exists."
+                .to_string(),
+        );
+    }
+
+    warnings.push("If the DC forwards DNS to Axiom, do not configure that same DC as an Axiom upstream resolver.".to_string());
+    warnings
 }
 
 impl From<&ProxyListenerConfig> for ProxyListenerStatus {
@@ -1000,6 +1119,15 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
             <p id="refresh-state">Waiting for telemetry</p>
           </div>
         </div>
+      </section>
+
+      <section id="deployment-warnings-section" class="mt-8 hidden rounded-lg border border-amber-400/30 bg-amber-400/10">
+        <div class="border-b border-amber-400/20 px-6 py-5">
+          <p class="text-sm font-semibold uppercase tracking-wider text-amber-500">Deployment Checks</p>
+          <h2 class="mt-2 text-xl font-semibold text-white">Network path warnings</h2>
+          <p class="mt-1 text-sm text-zinc-400">Axiom can enforce only traffic that actually reaches its DNS and SMB listeners.</p>
+        </div>
+        <div id="deployment-warnings" class="divide-y divide-amber-400/20"></div>
       </section>
 
       <section class="mt-8 rounded-lg border border-zinc-800 bg-zinc-900">
@@ -1439,6 +1567,25 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
       `).join("");
     }
 
+    function renderDeploymentWarnings(warnings) {
+      const section = document.getElementById("deployment-warnings-section");
+      const smbWarnings = (warnings?.smb || []).map((warning) => ({
+        title: "SMB path check",
+        detail: warning,
+        value: "verify",
+        tone: "text-amber-700"
+      }));
+      const dnsWarnings = (warnings?.dns || []).map((warning) => ({
+        title: "DNS resolver check",
+        detail: warning,
+        value: "verify",
+        tone: "text-amber-700"
+      }));
+      const rows = [...smbWarnings, ...dnsWarnings];
+      section.classList.toggle("hidden", rows.length === 0);
+      renderList("deployment-warnings", rows, "No deployment warnings.");
+    }
+
     function topCounts(items, keyFn, limit = 10) {
       const counts = new Map();
       items.forEach((item) => {
@@ -1522,7 +1669,12 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
                 detail: `${stats.dns_cache_hits || 0} cache hits · ${stats.dns_upstream_errors || 0} upstream errors`,
                 value: `${stats.dns_blocked_queries || 0} blocked`
               }
-            ]
+            ].concat((dns.deployment_warnings || []).map((warning) => ({
+              title: "Deployment warning",
+              detail: warning,
+              value: "check",
+              tone: "text-amber-700"
+            })))
           : [],
         "DNS policies are disabled."
       );
@@ -1559,6 +1711,7 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
       document.getElementById("management-info").textContent = `${data.management_interface} at ${data.management_bind_addr}`;
       document.getElementById("refresh-state").textContent = `PID ${data.process_id} · ${data.config_path} · updated ${new Date().toLocaleTimeString()}`;
       renderPolicyRuntime(stats.policy_runtime);
+      renderDeploymentWarnings(data.deployment_warnings || {});
 
       const dns = data.dns || {};
       const dnsEvents = stats.recent_dns_events || [];
