@@ -36,10 +36,17 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
+    if config.dns.enabled {
+        let dns_config = config.dns.clone();
+        let dns_runtime = Arc::clone(&runtime);
+        tasks.spawn(async move { axiom_dns::run_dns_gateway(dns_config, dns_runtime).await });
+    }
+
     info!(
         management_interface = config.management.interface,
         management_addr = %config.management.listen_addr(),
         proxy_listener_count = config.proxy_listeners.len(),
+        dns_enabled = config.dns.enabled,
         "Axiom daemon started"
     );
 
@@ -80,7 +87,7 @@ fn init_tracing() {
     tracing_subscriber::registry()
         .with(
             EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new("axiom=info,axiom_daemon=info")),
+                .unwrap_or_else(|_| EnvFilter::new("axiom=info,axiom_daemon=info,axiom_dns=info")),
         )
         .with(tracing_subscriber::fmt::layer())
         .init();

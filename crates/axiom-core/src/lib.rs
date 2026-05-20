@@ -15,6 +15,7 @@ use serde::Serialize;
 
 const MAX_RETAINED_THREAT_EVENTS: usize = 128;
 const MAX_RETAINED_AUDIT_EVENTS: usize = 512;
+const MAX_RETAINED_DNS_EVENTS: usize = 512;
 const MAX_TRACKED_FILE_ACTIVITIES: usize = 512;
 const ARCHIVE_MAX_PATTERN_LEN: usize = 8;
 const STREAM_INSPECTION_TAIL_LEN: usize = 4096;
@@ -32,6 +33,7 @@ pub struct AppState {
     file_activity: Mutex<HashMap<String, FileActivityStats>>,
     recent_threats: Mutex<VecDeque<ThreatEvent>>,
     recent_audit_events: Mutex<VecDeque<AuditEvent>>,
+    recent_dns_events: Mutex<VecDeque<DnsQueryEvent>>,
 }
 
 impl AppState {
@@ -47,6 +49,7 @@ impl AppState {
             file_activity: Mutex::new(HashMap::new()),
             recent_threats: Mutex::new(VecDeque::with_capacity(MAX_RETAINED_THREAT_EVENTS)),
             recent_audit_events: Mutex::new(VecDeque::with_capacity(MAX_RETAINED_AUDIT_EVENTS)),
+            recent_dns_events: Mutex::new(VecDeque::with_capacity(MAX_RETAINED_DNS_EVENTS)),
         }
     }
 
@@ -378,6 +381,57 @@ impl AppState {
         self.push_recent_event(event);
     }
 
+    pub fn record_dns_query(&self, event: DnsQueryEvent) {
+        self.counters.dns_queries.fetch_add(1, Ordering::Relaxed);
+
+        match event.protocol {
+            DnsProtocol::Udp => {
+                self.counters
+                    .dns_udp_queries
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            DnsProtocol::Tcp => {
+                self.counters
+                    .dns_tcp_queries
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        match event.action {
+            DnsAction::Allow => {}
+            DnsAction::Monitor => {
+                self.counters
+                    .dns_monitored_queries
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            DnsAction::Block => {
+                self.counters
+                    .dns_blocked_queries
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        if event.cache_hit {
+            self.counters.dns_cache_hits.fetch_add(1, Ordering::Relaxed);
+        }
+
+        let mut events = self
+            .recent_dns_events
+            .lock()
+            .expect("recent dns event mutex poisoned");
+
+        if events.len() == MAX_RETAINED_DNS_EVENTS {
+            events.pop_front();
+        }
+        events.push_back(event);
+    }
+
+    pub fn record_dns_upstream_error(&self) {
+        self.counters
+            .dns_upstream_errors
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn inspect_chunk(&self, context: &InspectionContext<'_>, chunk: &[u8]) -> InspectionResult {
         self.policy
             .read()
@@ -444,6 +498,13 @@ impl AppState {
             .iter()
             .cloned()
             .collect();
+        let recent_dns_events = self
+            .recent_dns_events
+            .lock()
+            .expect("recent dns event mutex poisoned")
+            .iter()
+            .cloned()
+            .collect();
 
         StatusSnapshot {
             uptime_seconds: self
@@ -476,6 +537,13 @@ impl AppState {
                 .counters
                 .server_side_copy_requests
                 .load(Ordering::Relaxed),
+            dns_queries: self.counters.dns_queries.load(Ordering::Relaxed),
+            dns_udp_queries: self.counters.dns_udp_queries.load(Ordering::Relaxed),
+            dns_tcp_queries: self.counters.dns_tcp_queries.load(Ordering::Relaxed),
+            dns_blocked_queries: self.counters.dns_blocked_queries.load(Ordering::Relaxed),
+            dns_monitored_queries: self.counters.dns_monitored_queries.load(Ordering::Relaxed),
+            dns_cache_hits: self.counters.dns_cache_hits.load(Ordering::Relaxed),
+            dns_upstream_errors: self.counters.dns_upstream_errors.load(Ordering::Relaxed),
             monitored_threats: self.counters.monitored_threats.load(Ordering::Relaxed),
             blocked_threats: self.counters.blocked_threats.load(Ordering::Relaxed),
             policy_runtime: self.policy_runtime_snapshot(),
@@ -485,6 +553,7 @@ impl AppState {
             file_activity: self.file_activity_snapshots(),
             recent_threats,
             recent_audit_events,
+            recent_dns_events,
         }
     }
 
@@ -771,6 +840,13 @@ struct TrafficCounters {
     smb_write_requests: AtomicU64,
     smb_write_bytes: AtomicU64,
     server_side_copy_requests: AtomicU64,
+    dns_queries: AtomicU64,
+    dns_udp_queries: AtomicU64,
+    dns_tcp_queries: AtomicU64,
+    dns_blocked_queries: AtomicU64,
+    dns_monitored_queries: AtomicU64,
+    dns_cache_hits: AtomicU64,
+    dns_upstream_errors: AtomicU64,
     monitored_threats: AtomicU64,
     blocked_threats: AtomicU64,
 }
@@ -794,6 +870,13 @@ pub struct StatusSnapshot {
     pub smb_write_requests: u64,
     pub smb_write_bytes: u64,
     pub server_side_copy_requests: u64,
+    pub dns_queries: u64,
+    pub dns_udp_queries: u64,
+    pub dns_tcp_queries: u64,
+    pub dns_blocked_queries: u64,
+    pub dns_monitored_queries: u64,
+    pub dns_cache_hits: u64,
+    pub dns_upstream_errors: u64,
     pub monitored_threats: u64,
     pub blocked_threats: u64,
     pub policy_runtime: PolicyRuntimeSnapshot,
@@ -803,6 +886,66 @@ pub struct StatusSnapshot {
     pub file_activity: Vec<FileActivityStats>,
     pub recent_threats: Vec<ThreatEvent>,
     pub recent_audit_events: Vec<AuditEvent>,
+    pub recent_dns_events: Vec<DnsQueryEvent>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DnsQueryEvent {
+    pub unix_timestamp_seconds: u64,
+    pub protocol: DnsProtocol,
+    pub client_addr: SocketAddr,
+    pub query_name: String,
+    pub query_type: String,
+    pub action: DnsAction,
+    pub reason: String,
+    pub upstream_addr: Option<SocketAddr>,
+    pub response_code: Option<u8>,
+    pub latency_millis: u64,
+    pub cache_hit: bool,
+}
+
+impl DnsQueryEvent {
+    pub fn now(
+        protocol: DnsProtocol,
+        client_addr: SocketAddr,
+        query_name: String,
+        query_type: String,
+        action: DnsAction,
+        reason: String,
+        upstream_addr: Option<SocketAddr>,
+        response_code: Option<u8>,
+        latency_millis: u64,
+        cache_hit: bool,
+    ) -> Self {
+        Self {
+            unix_timestamp_seconds: unix_timestamp_seconds(),
+            protocol,
+            client_addr,
+            query_name,
+            query_type,
+            action,
+            reason,
+            upstream_addr,
+            response_code,
+            latency_millis,
+            cache_hit,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DnsProtocol {
+    Udp,
+    Tcp,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DnsAction {
+    Allow,
+    Monitor,
+    Block,
 }
 
 #[derive(Debug, Clone, Serialize)]

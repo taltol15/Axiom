@@ -1,7 +1,7 @@
 use std::{
     collections::HashSet,
     fs,
-    net::{IpAddr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     path::Path,
 };
 
@@ -11,6 +11,8 @@ use thiserror::Error;
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AxiomConfig {
     pub management: ManagementNicConfig,
+    #[serde(default)]
+    pub dns: DnsConfig,
     #[serde(default)]
     pub policy: PolicyConfig,
     #[serde(default)]
@@ -34,9 +36,11 @@ impl AxiomConfig {
         self.management.validate()?;
         self.policy.validate()?;
 
-        if self.proxy_listeners.is_empty() {
+        self.dns.validate()?;
+
+        if self.proxy_listeners.is_empty() && !self.dns.enabled {
             return Err(ConfigError::Invalid(
-                "at least one proxy listener must be configured".to_string(),
+                "at least one SMB proxy listener or DNS gateway must be configured".to_string(),
             ));
         }
 
@@ -69,6 +73,183 @@ impl AxiomConfig {
 
         Ok(())
     }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct DnsConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub interface: String,
+    pub listen_ip: Option<IpAddr>,
+    #[serde(default = "default_dns_port")]
+    pub udp_port: u16,
+    #[serde(default = "default_dns_port")]
+    pub tcp_port: u16,
+    #[serde(default)]
+    pub upstream_interface: Option<String>,
+    #[serde(default)]
+    pub upstreams: Vec<SocketAddr>,
+    #[serde(default = "default_dns_cache_ttl_seconds")]
+    pub cache_ttl_seconds: u64,
+    #[serde(default = "default_dns_cache_max_entries")]
+    pub cache_max_entries: usize,
+    #[serde(default = "default_dns_query_timeout_millis")]
+    pub query_timeout_millis: u64,
+    #[serde(default = "default_dns_threat_feed_refresh_seconds")]
+    pub threat_feed_refresh_seconds: u64,
+    #[serde(default)]
+    pub policy: DnsPolicyConfig,
+}
+
+impl Default for DnsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            interface: String::new(),
+            listen_ip: None,
+            udp_port: default_dns_port(),
+            tcp_port: default_dns_port(),
+            upstream_interface: None,
+            upstreams: Vec::new(),
+            cache_ttl_seconds: default_dns_cache_ttl_seconds(),
+            cache_max_entries: default_dns_cache_max_entries(),
+            query_timeout_millis: default_dns_query_timeout_millis(),
+            threat_feed_refresh_seconds: default_dns_threat_feed_refresh_seconds(),
+            policy: DnsPolicyConfig::default(),
+        }
+    }
+}
+
+impl DnsConfig {
+    pub fn udp_listen_addr(&self) -> SocketAddr {
+        SocketAddr::new(
+            self.listen_ip
+                .unwrap_or(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0))),
+            self.udp_port,
+        )
+    }
+
+    pub fn tcp_listen_addr(&self) -> SocketAddr {
+        SocketAddr::new(
+            self.listen_ip
+                .unwrap_or(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0))),
+            self.tcp_port,
+        )
+    }
+
+    pub fn upstream_interface(&self) -> &str {
+        self.upstream_interface
+            .as_deref()
+            .unwrap_or(&self.interface)
+    }
+
+    fn validate(&self) -> Result<(), ConfigError> {
+        if !self.enabled {
+            return Ok(());
+        }
+
+        validate_interface_name(&self.interface, "dns interface")?;
+
+        if let Some(interface) = &self.upstream_interface {
+            validate_interface_name(interface, "dns upstream interface")?;
+        }
+
+        if self.udp_port == 0 || self.tcp_port == 0 {
+            return Err(ConfigError::Invalid(
+                "dns udp_port and tcp_port must be greater than zero".to_string(),
+            ));
+        }
+
+        if self.upstreams.is_empty() {
+            return Err(ConfigError::Invalid(
+                "dns.upstreams must contain at least one upstream DNS server".to_string(),
+            ));
+        }
+
+        if self.cache_ttl_seconds == 0 {
+            return Err(ConfigError::Invalid(
+                "dns.cache_ttl_seconds must be greater than zero".to_string(),
+            ));
+        }
+
+        if self.cache_max_entries == 0 {
+            return Err(ConfigError::Invalid(
+                "dns.cache_max_entries must be greater than zero".to_string(),
+            ));
+        }
+
+        if self.query_timeout_millis == 0 {
+            return Err(ConfigError::Invalid(
+                "dns.query_timeout_millis must be greater than zero".to_string(),
+            ));
+        }
+
+        self.policy.validate()
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct DnsPolicyConfig {
+    #[serde(default = "default_block_mode")]
+    pub blocked_domain_action: PolicyMode,
+    #[serde(default = "default_monitor_mode")]
+    pub monitored_domain_action: PolicyMode,
+    #[serde(default)]
+    pub blocked_domains: Vec<String>,
+    #[serde(default)]
+    pub monitored_domains: Vec<String>,
+    #[serde(default)]
+    pub threat_feed_urls: Vec<String>,
+    #[serde(default)]
+    pub block_response: DnsBlockResponse,
+    #[serde(default = "default_dns_sinkhole_ipv4")]
+    pub sinkhole_ipv4: Ipv4Addr,
+}
+
+impl Default for DnsPolicyConfig {
+    fn default() -> Self {
+        Self {
+            blocked_domain_action: PolicyMode::Block,
+            monitored_domain_action: PolicyMode::Monitor,
+            blocked_domains: Vec::new(),
+            monitored_domains: Vec::new(),
+            threat_feed_urls: Vec::new(),
+            block_response: DnsBlockResponse::Nxdomain,
+            sinkhole_ipv4: default_dns_sinkhole_ipv4(),
+        }
+    }
+}
+
+impl DnsPolicyConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        for domain in self
+            .blocked_domains
+            .iter()
+            .chain(self.monitored_domains.iter())
+        {
+            validate_dns_domain(domain)?;
+        }
+
+        for url in &self.threat_feed_urls {
+            if !(url.starts_with("https://") || url.starts_with("http://")) {
+                return Err(ConfigError::Invalid(format!(
+                    "dns.policy.threat_feed_urls entry '{url}' must start with http:// or https://"
+                )));
+            }
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DnsBlockResponse {
+    #[default]
+    Nxdomain,
+    Sinkhole,
+    Refused,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -376,8 +557,42 @@ fn validate_interface_name(interface: &str, label: &str) -> Result<(), ConfigErr
     Ok(())
 }
 
+fn validate_dns_domain(domain: &str) -> Result<(), ConfigError> {
+    let normalized = domain.trim().trim_end_matches('.');
+    if normalized.is_empty() || normalized.len() > 253 {
+        return Err(ConfigError::Invalid(format!(
+            "dns domain '{domain}' must be between 1 and 253 characters"
+        )));
+    }
+
+    for label in normalized.split('.') {
+        if label.is_empty() || label.len() > 63 {
+            return Err(ConfigError::Invalid(format!(
+                "dns domain '{domain}' contains an invalid label"
+            )));
+        }
+
+        if label.starts_with('-')
+            || label.ends_with('-')
+            || !label
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+        {
+            return Err(ConfigError::Invalid(format!(
+                "dns domain '{domain}' contains unsupported characters"
+            )));
+        }
+    }
+
+    Ok(())
+}
+
 fn default_smb_port() -> u16 {
     445
+}
+
+fn default_dns_port() -> u16 {
+    53
 }
 
 fn default_management_port() -> u16 {
@@ -402,6 +617,26 @@ fn default_entropy_threshold() -> f64 {
 
 fn default_entropy_minimum_chunk_size() -> usize {
     8 * 1024
+}
+
+fn default_dns_cache_ttl_seconds() -> u64 {
+    300
+}
+
+fn default_dns_cache_max_entries() -> usize {
+    100_000
+}
+
+fn default_dns_query_timeout_millis() -> u64 {
+    1_500
+}
+
+fn default_dns_threat_feed_refresh_seconds() -> u64 {
+    3600
+}
+
+fn default_dns_sinkhole_ipv4() -> Ipv4Addr {
+    Ipv4Addr::new(0, 0, 0, 0)
 }
 
 fn default_signatures() -> Vec<SignaturePolicyConfig> {

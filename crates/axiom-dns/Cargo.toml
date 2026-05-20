@@ -1,5 +1,5 @@
 [package]
-name = "axiom-daemon"
+name = "axiom-dns"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
@@ -10,9 +10,8 @@ rust-version.workspace = true
 anyhow.workspace = true
 axiom-config = { path = "../axiom-config" }
 axiom-core = { path = "../axiom-core" }
-axiom-dns = { path = "../axiom-dns" }
-axiom-net = { path = "../axiom-net" }
-axiom-web = { path = "../axiom-web" }
+libc.workspace = true
+reqwest.workspace = true
+socket2.workspace = true
 tokio.workspace = true
 tracing.workspace = true
-tracing-subscriber.workspace = true

@@ -343,6 +343,7 @@ fn build_status_response(state: &WebState) -> StatusResponse {
             .iter()
             .map(ProxyListenerStatus::from)
             .collect(),
+        dns: DnsStatus::from(&config.dns),
         stats: state.runtime.snapshot(),
     }
 }
@@ -361,9 +362,11 @@ fn build_diagnostics_response(state: &WebState) -> DiagnosticsResponse {
             .iter()
             .map(ProxyListenerStatus::from)
             .collect(),
+        dns: DnsStatus::from(&config.dns),
         status: state.runtime.snapshot(),
         command_outputs: vec![
             run_diagnostic_command("ss", &["-ltnp"]),
+            run_diagnostic_command("ss", &["-lunp"]),
             run_diagnostic_command("ss", &["-tnp"]),
             run_diagnostic_command("ip", &["-br", "addr"]),
             run_diagnostic_command("ip", &["route"]),
@@ -518,6 +521,7 @@ struct StatusResponse {
     management_bind_addr: String,
     configured_proxy_listeners: usize,
     proxy_listeners: Vec<ProxyListenerStatus>,
+    dns: DnsStatus,
     stats: StatusSnapshot,
 }
 
@@ -528,6 +532,7 @@ struct DiagnosticsResponse {
     config_path: String,
     management_bind_addr: String,
     proxy_listeners: Vec<ProxyListenerStatus>,
+    dns: DnsStatus,
     status: StatusSnapshot,
     command_outputs: Vec<CommandOutput>,
     proc_self_status: Option<String>,
@@ -548,6 +553,37 @@ struct ProxyListenerStatus {
     client_vlan: Option<u16>,
     listen_addr: String,
     target_file_server_addr: String,
+}
+
+#[derive(Debug, Serialize)]
+struct DnsStatus {
+    enabled: bool,
+    interface: String,
+    listen_udp_addr: String,
+    listen_tcp_addr: String,
+    upstream_interface: String,
+    upstreams: Vec<String>,
+    threat_feed_urls: Vec<String>,
+    blocked_domains: usize,
+    monitored_domains: usize,
+    block_response: String,
+}
+
+impl From<&axiom_config::DnsConfig> for DnsStatus {
+    fn from(config: &axiom_config::DnsConfig) -> Self {
+        Self {
+            enabled: config.enabled,
+            interface: config.interface.clone(),
+            listen_udp_addr: config.udp_listen_addr().to_string(),
+            listen_tcp_addr: config.tcp_listen_addr().to_string(),
+            upstream_interface: config.upstream_interface().to_string(),
+            upstreams: config.upstreams.iter().map(ToString::to_string).collect(),
+            threat_feed_urls: config.policy.threat_feed_urls.clone(),
+            blocked_domains: config.policy.blocked_domains.len(),
+            monitored_domains: config.policy.monitored_domains.len(),
+            block_response: format!("{:?}", config.policy.block_response).to_ascii_lowercase(),
+        }
+    }
 }
 
 impl From<&ProxyListenerConfig> for ProxyListenerStatus {
@@ -814,7 +850,7 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
     <div class="mx-auto flex max-w-7xl items-center justify-between px-6 py-5">
       <div>
         <p class="text-sm font-medium uppercase tracking-[0.28em] text-emerald-300">Axiom</p>
-        <h1 class="mt-1 text-2xl font-semibold text-white">SMB Protection Dashboard</h1>
+        <h1 class="mt-1 text-2xl font-semibold text-white">SMB + DNS Security Dashboard</h1>
       </div>
       <button id="logout" class="rounded-md border border-zinc-700 px-4 py-2 text-sm text-zinc-200 transition hover:border-red-400 hover:text-red-200">Log out</button>
     </div>
@@ -858,6 +894,66 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
         <p class="text-sm text-zinc-400">Server-side Copies</p>
         <p id="server-side-copies" class="mt-4 text-4xl font-semibold text-orange-200">0</p>
       </article>
+      <article class="rounded-lg border border-zinc-800 bg-zinc-900 p-6">
+        <p class="text-sm text-zinc-400">DNS Queries</p>
+        <p id="dns-queries" class="mt-4 text-4xl font-semibold text-sky-200">0</p>
+      </article>
+      <article class="rounded-lg border border-zinc-800 bg-zinc-900 p-6">
+        <p class="text-sm text-zinc-400">DNS Blocked</p>
+        <p id="dns-blocked" class="mt-4 text-4xl font-semibold text-red-300">0</p>
+      </article>
+      <article class="rounded-lg border border-zinc-800 bg-zinc-900 p-6">
+        <p class="text-sm text-zinc-400">DNS Cache Hits</p>
+        <p id="dns-cache-hits" class="mt-4 text-4xl font-semibold text-emerald-200">0</p>
+      </article>
+      <article class="rounded-lg border border-zinc-800 bg-zinc-900 p-6">
+        <p class="text-sm text-zinc-400">DNS Upstream Errors</p>
+        <p id="dns-upstream-errors" class="mt-4 text-4xl font-semibold text-orange-200">0</p>
+      </article>
+    </section>
+
+    <section class="mt-8 rounded-lg border border-zinc-800 bg-zinc-900">
+      <div class="flex flex-col gap-2 border-b border-zinc-800 px-6 py-5 md:flex-row md:items-end md:justify-between">
+        <div>
+          <h2 class="text-xl font-semibold text-white">DNS Security Gateway</h2>
+          <p id="dns-state" class="mt-1 text-sm text-zinc-400">Waiting for DNS telemetry</p>
+        </div>
+        <p id="dns-config" class="text-sm text-zinc-500"></p>
+      </div>
+      <div class="grid gap-4 border-b border-zinc-800 px-6 py-5 md:grid-cols-4">
+        <div>
+          <p class="text-xs font-semibold uppercase tracking-wider text-zinc-500">Listener</p>
+          <p id="dns-listener" class="mt-2 text-sm font-medium text-white">—</p>
+        </div>
+        <div>
+          <p class="text-xs font-semibold uppercase tracking-wider text-zinc-500">Upstreams / DC DNS</p>
+          <p id="dns-upstreams" class="mt-2 text-sm font-medium text-cyan-200">—</p>
+        </div>
+        <div>
+          <p class="text-xs font-semibold uppercase tracking-wider text-zinc-500">Threat Feeds</p>
+          <p id="dns-feeds" class="mt-2 text-sm font-medium text-emerald-200">—</p>
+        </div>
+        <div>
+          <p class="text-xs font-semibold uppercase tracking-wider text-zinc-500">Policy</p>
+          <p id="dns-policy" class="mt-2 text-sm font-medium text-white">—</p>
+        </div>
+      </div>
+      <div class="overflow-x-auto">
+        <table class="min-w-full divide-y divide-zinc-800">
+          <thead class="bg-zinc-950/60">
+            <tr>
+              <th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-zinc-400">Client</th>
+              <th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-zinc-400">Domain</th>
+              <th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-zinc-400">Type</th>
+              <th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-zinc-400">Action</th>
+              <th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-zinc-400">Upstream</th>
+              <th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-zinc-400">Latency</th>
+              <th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-zinc-400">Time</th>
+            </tr>
+          </thead>
+          <tbody id="dns-events-body" class="divide-y divide-zinc-800"></tbody>
+        </table>
+      </div>
     </section>
 
     <section class="mt-6 rounded-lg border border-emerald-500/20 bg-emerald-500/5 px-6 py-5">
@@ -1123,9 +1219,52 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
       document.getElementById("inspected-chunks").textContent = stats.inspected_chunks;
       document.getElementById("observed-files").textContent = stats.observed_file_events || 0;
       document.getElementById("server-side-copies").textContent = stats.server_side_copy_requests || 0;
+      document.getElementById("dns-queries").textContent = stats.dns_queries || 0;
+      document.getElementById("dns-blocked").textContent = stats.dns_blocked_queries || 0;
+      document.getElementById("dns-cache-hits").textContent = stats.dns_cache_hits || 0;
+      document.getElementById("dns-upstream-errors").textContent = stats.dns_upstream_errors || 0;
       document.getElementById("management-info").textContent = `${data.management_interface} at ${data.management_bind_addr}`;
       document.getElementById("refresh-state").textContent = `PID ${data.process_id} · ${data.config_path} · updated ${new Date().toLocaleTimeString()}`;
       renderPolicyRuntime(stats.policy_runtime);
+
+      const dns = data.dns || {};
+      const dnsEvents = stats.recent_dns_events || [];
+      document.getElementById("dns-state").textContent = dns.enabled
+        ? `${stats.dns_queries || 0} queries · ${stats.dns_blocked_queries || 0} blocked · ${stats.dns_monitored_queries || 0} monitored`
+        : "DNS Security Gateway is disabled";
+      document.getElementById("dns-config").textContent = dns.enabled ? `${dns.interface} · ${dns.listen_udp_addr}` : "not configured";
+      document.getElementById("dns-listener").textContent = dns.enabled ? `UDP ${dns.listen_udp_addr} · TCP ${dns.listen_tcp_addr}` : "disabled";
+      document.getElementById("dns-upstreams").textContent = dns.enabled ? (dns.upstreams || []).join(", ") : "—";
+      document.getElementById("dns-feeds").textContent = dns.enabled
+        ? `${(dns.threat_feed_urls || []).length} feeds · ${dns.blocked_domains || 0} static blocks`
+        : "—";
+      document.getElementById("dns-policy").textContent = dns.enabled ? `block response: ${dns.block_response}` : "—";
+
+      const dnsEventsBody = document.getElementById("dns-events-body");
+      if (!dnsEvents.length) {
+        dnsEventsBody.innerHTML = `<tr><td colspan="7" class="px-6 py-6 text-sm text-zinc-400">No DNS queries recorded yet.</td></tr>`;
+      } else {
+        dnsEventsBody.innerHTML = dnsEvents.slice().reverse().slice(0, 80).map((event) => {
+          const actionClass = event.action === "block" ? "border-red-400/40 bg-red-500/10 text-red-100" : event.action === "monitor" ? "border-amber-400/40 bg-amber-500/10 text-amber-100" : "border-emerald-400/40 bg-emerald-500/10 text-emerald-100";
+          return `
+            <tr class="hover:bg-zinc-800/40">
+              <td class="whitespace-nowrap px-6 py-4 text-sm font-medium text-white">${text(event.client_addr)} · ${text(event.protocol).toUpperCase()}</td>
+              <td class="max-w-xs px-6 py-4 text-sm text-white">
+                <p class="truncate">${text(event.query_name)}</p>
+                <p class="mt-1 line-clamp-1 text-xs text-zinc-500">${text(event.reason)}</p>
+              </td>
+              <td class="whitespace-nowrap px-6 py-4 text-sm text-zinc-300">${text(event.query_type)}</td>
+              <td class="whitespace-nowrap px-6 py-4 text-sm">
+                <span class="rounded-full border px-2.5 py-1 text-xs font-semibold uppercase ${actionClass}">${text(event.action)}</span>
+                ${event.cache_hit ? `<p class="mt-2 text-xs text-emerald-500">cache hit</p>` : ""}
+              </td>
+              <td class="whitespace-nowrap px-6 py-4 text-sm text-cyan-200">${text(event.upstream_addr)}</td>
+              <td class="whitespace-nowrap px-6 py-4 text-sm text-zinc-300">${text(event.latency_millis)} ms · rcode ${text(event.response_code)}</td>
+              <td class="whitespace-nowrap px-6 py-4 text-xs text-zinc-500">${formatTime(event.unix_timestamp_seconds)}</td>
+            </tr>
+          `;
+        }).join("");
+      }
 
       const liveConnections = stats.active_connection_details || [];
       const liveConnectionsBody = document.getElementById("live-connections-body");
@@ -1437,9 +1576,11 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
         executable_path: payload.executable_path,
         config_path: payload.config_path,
         proxy_listeners: payload.proxy_listeners,
+        dns: payload.dns,
         route_stats: payload.status.route_stats,
         active_connection_details: payload.status.active_connection_details,
         file_activity: payload.status.file_activity,
+        recent_dns_events: payload.status.recent_dns_events,
         commands: payload.command_outputs
       };
 

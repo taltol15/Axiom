@@ -12,7 +12,9 @@ SERVICE_USER="axiom"
 SERVICE_GROUP="axiom"
 MANAGEMENT_DEFAULT_PORT="8443"
 SMB_DEFAULT_PORT="445"
+DNS_DEFAULT_PORT="53"
 LISTEN_DEFAULT_IP="0.0.0.0"
+DNS_DEFAULT_THREAT_FEED_URL="https://urlhaus.abuse.ch/downloads/hostfile/"
 MIN_RUST_VERSION="1.88.0"
 
 trap 'echo "Axiom installation failed. Review the error above and rerun install.sh." >&2' ERR
@@ -232,6 +234,18 @@ select_proxy_interfaces() {
   done
 }
 
+select_dns_interface() {
+  while true; do
+    print_interfaces
+    read -r -p "Select the interface for the DNS Security Gateway [number]: " selection
+    if [[ "${selection}" =~ ^[0-9]+$ ]] && ((selection >= 1 && selection <= ${#INTERFACES[@]})); then
+      DNS_INTERFACE="${INTERFACES[$((selection - 1))]}"
+      return
+    fi
+    echo "Invalid interface selection."
+  done
+}
+
 is_ipv4() {
   local value="$1"
   local octets
@@ -291,6 +305,41 @@ prompt_port() {
   done
 }
 
+prompt_yes_no() {
+  local prompt="$1"
+  local default_value="$2"
+  local value
+  local suffix
+
+  if [[ "${default_value}" == "yes" ]]; then
+    suffix="Y/n"
+  else
+    suffix="y/N"
+  fi
+
+  while true; do
+    printf "%s [%s]: " "${prompt}" "${suffix}" >&2
+    read -r value
+    value="${value,,}"
+
+    if [[ -z "${value}" ]]; then
+      value="${default_value}"
+    fi
+
+    case "${value}" in
+      y|yes)
+        return 0
+        ;;
+      n|no)
+        return 1
+        ;;
+      *)
+        echo "Please answer yes or no." >&2
+        ;;
+    esac
+  done
+}
+
 prompt_optional_vlan() {
   local prompt="$1"
   local value
@@ -308,6 +357,56 @@ prompt_optional_vlan() {
       return
     fi
     echo "Invalid VLAN ID." >&2
+  done
+}
+
+prompt_dns_upstreams() {
+  local prompt="$1"
+  local raw_value
+  local upstream
+
+  while true; do
+    printf "%s [comma-separated IPv4 or IPv4:port]: " "${prompt}" >&2
+    read -r raw_value
+    raw_value="${raw_value// /}"
+
+    if [[ -z "${raw_value}" ]]; then
+      echo "At least one upstream DNS server is required when DNS is enabled." >&2
+      continue
+    fi
+
+    IFS=',' read -r -a DNS_UPSTREAMS <<< "${raw_value}"
+    local valid="true"
+    local normalized=()
+
+    for upstream in "${DNS_UPSTREAMS[@]}"; do
+      local ip="${upstream}"
+      local port="${DNS_DEFAULT_PORT}"
+
+      if [[ "${upstream}" == *:* ]]; then
+        ip="${upstream%:*}"
+        port="${upstream##*:}"
+      fi
+
+      if ! is_ipv4 "${ip}"; then
+        echo "Invalid upstream DNS IPv4: ${ip}" >&2
+        valid="false"
+        break
+      fi
+
+      if [[ ! "${port}" =~ ^[0-9]+$ ]] || ((port < 1 || port > 65535)); then
+        echo "Invalid upstream DNS port: ${port}" >&2
+        valid="false"
+        break
+      fi
+
+      normalized+=("${ip}:${port}")
+    done
+
+    if [[ "${valid}" == "true" ]] && ((${#normalized[@]} > 0)); then
+      DNS_UPSTREAMS=("${normalized[@]}")
+      return
+    fi
   done
 }
 
@@ -431,6 +530,37 @@ collect_configuration() {
     PROXY_TARGET_PORTS+=("${target_port}")
   done
 
+  DNS_ENABLED="false"
+  DNS_INTERFACE=""
+  DNS_BIND_IP="${LISTEN_DEFAULT_IP}"
+  DNS_UDP_PORT="${DNS_DEFAULT_PORT}"
+  DNS_TCP_PORT="${DNS_DEFAULT_PORT}"
+  DNS_UPSTREAM_INTERFACE=""
+  DNS_UPSTREAMS=()
+  DNS_THREAT_FEED_URLS=()
+
+  echo
+  if prompt_yes_no "Enable Axiom DNS Security Gateway in front of your DC DNS" "yes"; then
+    DNS_ENABLED="true"
+    select_dns_interface
+
+    local discovered_dns_ip
+    discovered_dns_ip="$(get_interface_ipv4 "${DNS_INTERFACE}")"
+    if [[ -z "${discovered_dns_ip}" ]]; then
+      discovered_dns_ip="${LISTEN_DEFAULT_IP}"
+    fi
+
+    DNS_BIND_IP="$(prompt_ipv4 "DNS listen IPv4 for ${DNS_INTERFACE}" "${discovered_dns_ip}")"
+    DNS_UDP_PORT="$(prompt_port "DNS UDP port" "${DNS_DEFAULT_PORT}")"
+    DNS_TCP_PORT="$(prompt_port "DNS TCP port" "${DNS_DEFAULT_PORT}")"
+    DNS_UPSTREAM_INTERFACE="${DNS_INTERFACE}"
+    prompt_dns_upstreams "Upstream DC/internal DNS servers"
+
+    if prompt_yes_no "Enable the built-in URLhaus DNS threat feed" "yes"; then
+      DNS_THREAT_FEED_URLS=("${DNS_DEFAULT_THREAT_FEED_URL}")
+    fi
+  fi
+
   prompt_admin_credentials
   ADMIN_PASSWORD_HASH="$(sha256_password_hash "${ADMIN_PASSWORD}")"
   unset ADMIN_PASSWORD
@@ -465,6 +595,44 @@ write_config() {
     echo "username = \"$(toml_escape "${ADMIN_USERNAME}")\""
     echo "password_hash = \"$(toml_escape "${ADMIN_PASSWORD_HASH}")\""
     echo
+    echo "[dns]"
+    echo "enabled = ${DNS_ENABLED}"
+    if [[ "${DNS_ENABLED}" == "true" ]]; then
+      echo "interface = \"$(toml_escape "${DNS_INTERFACE}")\""
+      echo "listen_ip = \"$(toml_escape "${DNS_BIND_IP}")\""
+      echo "udp_port = ${DNS_UDP_PORT}"
+      echo "tcp_port = ${DNS_TCP_PORT}"
+      echo "upstream_interface = \"$(toml_escape "${DNS_UPSTREAM_INTERFACE}")\""
+      printf "upstreams = ["
+      for index in "${!DNS_UPSTREAMS[@]}"; do
+        if ((index > 0)); then
+          printf ", "
+        fi
+        printf "\"%s\"" "$(toml_escape "${DNS_UPSTREAMS[${index}]}")"
+      done
+      printf "]\n"
+      echo "cache_ttl_seconds = 300"
+      echo "cache_max_entries = 100000"
+      echo "query_timeout_millis = 1500"
+      echo "threat_feed_refresh_seconds = 3600"
+      echo
+      echo "[dns.policy]"
+      echo "blocked_domain_action = \"block\""
+      echo "monitored_domain_action = \"monitor\""
+      echo "blocked_domains = []"
+      echo "monitored_domains = []"
+      printf "threat_feed_urls = ["
+      for index in "${!DNS_THREAT_FEED_URLS[@]}"; do
+        if ((index > 0)); then
+          printf ", "
+        fi
+        printf "\"%s\"" "$(toml_escape "${DNS_THREAT_FEED_URLS[${index}]}")"
+      done
+      printf "]\n"
+      echo "block_response = \"nxdomain\""
+      echo "sinkhole_ipv4 = \"0.0.0.0\""
+      echo
+    fi
     echo "[policy.smb]"
     echo "encrypted_payload = \"monitor\""
     echo
@@ -595,7 +763,7 @@ write_systemd_service() {
 
   cat > "${temp_service}" <<EOF
 [Unit]
-Description=Axiom SMB Reverse Proxy
+Description=Axiom SMB and DNS Security Gateway
 Documentation=file:${PROJECT_ROOT}/README.md
 Wants=network-online.target
 After=network-online.target
@@ -607,7 +775,7 @@ Group=${SERVICE_GROUP}
 ExecStart=${BINARY_PATH} ${CONFIG_PATH}
 Restart=on-failure
 RestartSec=2s
-Environment=RUST_LOG=axiom=info,axiom_daemon=info
+Environment=RUST_LOG=axiom=info,axiom_daemon=info,axiom_dns=info
 AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_RAW
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_RAW
 NoNewPrivileges=true
@@ -640,6 +808,9 @@ print_summary() {
   echo "Binary: ${BINARY_PATH}"
   echo "Service: axiom.service"
   echo "Management UI: http://${MANAGEMENT_BIND_IP}:${MANAGEMENT_PORT}/"
+  if [[ "${DNS_ENABLED}" == "true" ]]; then
+    echo "DNS Gateway: ${DNS_BIND_IP}:${DNS_UDP_PORT}/udp and ${DNS_BIND_IP}:${DNS_TCP_PORT}/tcp -> ${DNS_UPSTREAMS[*]}"
+  fi
   echo
   ${SUDO} systemctl --no-pager --lines=12 status axiom.service || true
 }
