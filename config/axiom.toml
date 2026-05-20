@@ -1,3 +1,10 @@
+[node]
+role = "standalone_lab"
+node_id = "axiom-lab-01"
+display_name = "Axiom Standalone Lab"
+enrollment_token = "replace-with-random-token-for-lab-child-nodes"
+heartbeat_interval_seconds = 5
+
 [management]
 interface = "ens160"
 bind_ip = "10.10.0.10"

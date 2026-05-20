@@ -10,6 +10,8 @@ use thiserror::Error;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AxiomConfig {
+    #[serde(default)]
+    pub node: NodeConfig,
     pub management: ManagementNicConfig,
     #[serde(default)]
     pub dns: DnsConfig,
@@ -33,15 +35,38 @@ impl AxiomConfig {
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
+        self.node.validate()?;
         self.management.validate()?;
         self.policy.validate()?;
 
         self.dns.validate()?;
 
-        if self.proxy_listeners.is_empty() && !self.dns.enabled {
-            return Err(ConfigError::Invalid(
-                "at least one SMB proxy listener or DNS gateway must be configured".to_string(),
-            ));
+        match self.node.role {
+            NodeRole::Management => {}
+            NodeRole::Dns => {
+                if !self.dns.enabled {
+                    return Err(ConfigError::Invalid(
+                        "dns role requires dns.enabled = true".to_string(),
+                    ));
+                }
+                self.node.validate_agent_registration()?;
+            }
+            NodeRole::SmbProxy => {
+                if self.proxy_listeners.is_empty() {
+                    return Err(ConfigError::Invalid(
+                        "smb_proxy role requires at least one proxy listener".to_string(),
+                    ));
+                }
+                self.node.validate_agent_registration()?;
+            }
+            NodeRole::StandaloneLab => {
+                if self.proxy_listeners.is_empty() && !self.dns.enabled {
+                    return Err(ConfigError::Invalid(
+                        "standalone_lab role requires at least one SMB proxy listener or DNS gateway"
+                            .to_string(),
+                    ));
+                }
+            }
         }
 
         let mut listener_names = HashSet::new();
@@ -72,6 +97,132 @@ impl AxiomConfig {
         }
 
         Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct NodeConfig {
+    #[serde(default)]
+    pub role: NodeRole,
+    #[serde(default = "default_node_id")]
+    pub node_id: String,
+    #[serde(default = "default_node_display_name")]
+    pub display_name: String,
+    #[serde(default)]
+    pub management_url: Option<String>,
+    #[serde(default)]
+    pub enrollment_token: Option<String>,
+    #[serde(default = "default_heartbeat_interval_seconds")]
+    pub heartbeat_interval_seconds: u64,
+}
+
+impl Default for NodeConfig {
+    fn default() -> Self {
+        Self {
+            role: NodeRole::StandaloneLab,
+            node_id: default_node_id(),
+            display_name: default_node_display_name(),
+            management_url: None,
+            enrollment_token: None,
+            heartbeat_interval_seconds: default_heartbeat_interval_seconds(),
+        }
+    }
+}
+
+impl NodeConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        if self.node_id.trim().is_empty() {
+            return Err(ConfigError::Invalid(
+                "node.node_id must not be empty".to_string(),
+            ));
+        }
+
+        if self.display_name.trim().is_empty() {
+            return Err(ConfigError::Invalid(
+                "node.display_name must not be empty".to_string(),
+            ));
+        }
+
+        if self.heartbeat_interval_seconds == 0 {
+            return Err(ConfigError::Invalid(
+                "node.heartbeat_interval_seconds must be greater than zero".to_string(),
+            ));
+        }
+
+        if let Some(url) = &self.management_url
+            && !(url.starts_with("http://") || url.starts_with("https://"))
+        {
+            return Err(ConfigError::Invalid(
+                "node.management_url must start with http:// or https://".to_string(),
+            ));
+        }
+
+        Ok(())
+    }
+
+    fn validate_agent_registration(&self) -> Result<(), ConfigError> {
+        if self
+            .management_url
+            .as_deref()
+            .unwrap_or_default()
+            .is_empty()
+        {
+            return Err(ConfigError::Invalid(format!(
+                "{} role requires node.management_url",
+                self.role.as_str()
+            )));
+        }
+
+        if self
+            .enrollment_token
+            .as_deref()
+            .unwrap_or_default()
+            .is_empty()
+        {
+            return Err(ConfigError::Invalid(format!(
+                "{} role requires node.enrollment_token",
+                self.role.as_str()
+            )));
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum NodeRole {
+    Management,
+    Dns,
+    SmbProxy,
+    #[default]
+    StandaloneLab,
+}
+
+impl NodeRole {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Management => "management",
+            Self::Dns => "dns",
+            Self::SmbProxy => "smb_proxy",
+            Self::StandaloneLab => "standalone_lab",
+        }
+    }
+
+    pub fn runs_management(self) -> bool {
+        matches!(self, Self::Management | Self::StandaloneLab)
+    }
+
+    pub fn runs_dns(self) -> bool {
+        matches!(self, Self::Dns | Self::StandaloneLab)
+    }
+
+    pub fn runs_smb_proxy(self) -> bool {
+        matches!(self, Self::SmbProxy | Self::StandaloneLab)
+    }
+
+    pub fn runs_agent(self) -> bool {
+        matches!(self, Self::Dns | Self::SmbProxy)
     }
 }
 
@@ -696,6 +847,18 @@ fn default_dns_sinkhole_ipv4() -> Ipv4Addr {
 
 fn default_dns_local_record_ttl_seconds() -> u32 {
     300
+}
+
+fn default_node_id() -> String {
+    "axiom-local".to_string()
+}
+
+fn default_node_display_name() -> String {
+    "Axiom Local Node".to_string()
+}
+
+fn default_heartbeat_interval_seconds() -> u64 {
+    5
 }
 
 fn default_signatures() -> Vec<SignaturePolicyConfig> {

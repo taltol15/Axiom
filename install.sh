@@ -16,6 +16,8 @@ DNS_DEFAULT_PORT="53"
 LISTEN_DEFAULT_IP="0.0.0.0"
 DNS_DEFAULT_THREAT_FEED_URL="https://urlhaus.abuse.ch/downloads/hostfile/"
 MIN_RUST_VERSION="1.88.0"
+LOCAL_AGENT_MANAGEMENT_INTERFACE="lo"
+LOCAL_AGENT_MANAGEMENT_IP="127.0.0.1"
 
 trap 'echo "Axiom installation failed. Review the error above and rerun install.sh." >&2' ERR
 
@@ -272,6 +274,35 @@ select_proxy_interfaces_tui() {
   done
 
   ((${#SELECTED_PROXY_INTERFACES[@]} > 0))
+}
+
+select_node_role() {
+  if use_tui; then
+    NODE_ROLE="$(whiptail --title "Axiom installer" --menu "Select this server role" 18 86 8 \
+      "management" "Central Web UI, policy control plane, node registry" \
+      "dns" "DNS Security data-plane node managed by a central server" \
+      "smb_proxy" "SMB Reverse Proxy data-plane node managed by a central server" \
+      "standalone_lab" "Single-server lab mode: management + optional DNS + SMB" \
+      3>&1 1>&2 2>&3)" || exit 1
+    return
+  fi
+
+  echo
+  echo "Axiom server role:"
+  echo "  1) management      Central Web UI and policy control plane"
+  echo "  2) dns             DNS Security data-plane node"
+  echo "  3) smb_proxy       SMB Reverse Proxy data-plane node"
+  echo "  4) standalone_lab  Single-server lab mode"
+  while true; do
+    read -r -p "Select role [1-4]: " role_selection
+    case "${role_selection}" in
+      1) NODE_ROLE="management"; return ;;
+      2) NODE_ROLE="dns"; return ;;
+      3) NODE_ROLE="smb_proxy"; return ;;
+      4) NODE_ROLE="standalone_lab"; return ;;
+      *) echo "Invalid role selection." ;;
+    esac
+  done
 }
 
 select_management_interface() {
@@ -667,44 +698,58 @@ prompt_admin_credentials() {
   done
 }
 
-sha256_password_hash() {
-  local password="$1"
-  local salt
-  local digest
-
-  salt="$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
-  digest="$(printf "%s:%s" "${salt}" "${password}" | sha256sum | awk '{ print $1 }')"
-  printf "sha256\$%s\$%s" "${salt}" "${digest}"
-}
-
-toml_escape() {
-  local value="$1"
-  value="${value//\\/\\\\}"
-  value="${value//\"/\\\"}"
-  printf "%s" "${value}"
-}
-
-safe_route_name() {
-  local interface_name="$1"
-  local vlan="$2"
-  local name
-
-  name="$(printf "%s" "${interface_name}" | tr -c 'A-Za-z0-9_-' '-')"
-  if [[ -n "${vlan}" ]]; then
-    printf "proxy-%s-vlan%s" "${name}" "${vlan}"
-  else
-    printf "proxy-%s" "${name}"
-  fi
-}
-
-collect_configuration() {
+configure_management_ui() {
   select_management_interface
 
   local discovered_management_ip
   discovered_management_ip="$(get_interface_ipv4 "${MANAGEMENT_INTERFACE}")"
   MANAGEMENT_BIND_IP="$(prompt_ipv4 "Management UI bind IPv4 for ${MANAGEMENT_INTERFACE}" "${discovered_management_ip}")"
   MANAGEMENT_PORT="$(prompt_port "Management UI TCP port" "${MANAGEMENT_DEFAULT_PORT}")"
+  prompt_admin_credentials
+  ADMIN_PASSWORD_HASH="$(sha256_password_hash "${ADMIN_PASSWORD}")"
+  unset ADMIN_PASSWORD
+}
 
+configure_agent_management_stub() {
+  MANAGEMENT_INTERFACE="${LOCAL_AGENT_MANAGEMENT_INTERFACE}"
+  MANAGEMENT_BIND_IP="${LOCAL_AGENT_MANAGEMENT_IP}"
+  MANAGEMENT_PORT="${MANAGEMENT_DEFAULT_PORT}"
+  ADMIN_USERNAME="local-agent-node"
+  ADMIN_PASSWORD_HASH="$(sha256_password_hash "$(random_secret)")"
+}
+
+configure_agent_registration() {
+  NODE_MANAGEMENT_URL="$(prompt_nonempty "Management server URL, for example http://10.0.0.5:8443")"
+  NODE_ENROLLMENT_TOKEN="$(prompt_nonempty "Enrollment token from the Axiom management server")"
+}
+
+configure_node_identity() {
+  local default_id
+  local default_name
+  default_id="$(hostname -s 2>/dev/null || printf "axiom-node")"
+  default_id="$(printf "%s-%s" "${NODE_ROLE}" "${default_id}" | tr -c 'A-Za-z0-9_-' '-')"
+  default_name="Axiom ${NODE_ROLE} node"
+
+  if use_tui; then
+    NODE_ID="$(ui_input "Axiom node ID" "${default_id}")" || exit 1
+    NODE_ID="${NODE_ID:-${default_id}}"
+  else
+    printf "Axiom node ID [%s]: " "${default_id}" >&2
+    read -r NODE_ID
+    NODE_ID="${NODE_ID:-${default_id}}"
+  fi
+
+  if use_tui; then
+    NODE_DISPLAY_NAME="$(ui_input "Axiom node display name" "${default_name}")" || exit 1
+    NODE_DISPLAY_NAME="${NODE_DISPLAY_NAME:-${default_name}}"
+  else
+    printf "Axiom node display name [%s]: " "${default_name}" >&2
+    read -r NODE_DISPLAY_NAME
+    NODE_DISPLAY_NAME="${NODE_DISPLAY_NAME:-${default_name}}"
+  fi
+}
+
+configure_proxy_listeners() {
   select_proxy_interfaces
 
   PROXY_NAMES=()
@@ -745,7 +790,76 @@ collect_configuration() {
     PROXY_TARGET_IPS+=("${target_ip}")
     PROXY_TARGET_PORTS+=("${target_port}")
   done
+}
 
+configure_dns_gateway() {
+  DNS_ENABLED="true"
+  select_dns_interface
+
+  local discovered_dns_ip
+  discovered_dns_ip="$(get_interface_ipv4 "${DNS_INTERFACE}")"
+  if [[ -z "${discovered_dns_ip}" ]]; then
+    discovered_dns_ip="${LISTEN_DEFAULT_IP}"
+  fi
+
+  DNS_BIND_IP="$(prompt_ipv4 "DNS listen IPv4 for ${DNS_INTERFACE}" "${discovered_dns_ip}")"
+  DNS_UDP_PORT="$(prompt_port "DNS UDP port" "${DNS_DEFAULT_PORT}")"
+  DNS_TCP_PORT="$(prompt_port "DNS TCP port" "${DNS_DEFAULT_PORT}")"
+  select_dns_upstream_interface
+  configure_dns_upstreams
+
+  if prompt_yes_no "Enable the built-in URLhaus DNS threat feed (can block domains immediately)" "no"; then
+    DNS_THREAT_FEED_URLS=("${DNS_DEFAULT_THREAT_FEED_URL}")
+  fi
+}
+
+sha256_password_hash() {
+  local password="$1"
+  local salt
+  local digest
+
+  salt="$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
+  digest="$(printf "%s:%s" "${salt}" "${password}" | sha256sum | awk '{ print $1 }')"
+  printf "sha256\$%s\$%s" "${salt}" "${digest}"
+}
+
+random_secret() {
+  od -An -N24 -tx1 /dev/urandom | tr -d ' \n'
+}
+
+toml_escape() {
+  local value="$1"
+  value="${value//\\/\\\\}"
+  value="${value//\"/\\\"}"
+  printf "%s" "${value}"
+}
+
+safe_route_name() {
+  local interface_name="$1"
+  local vlan="$2"
+  local name
+
+  name="$(printf "%s" "${interface_name}" | tr -c 'A-Za-z0-9_-' '-')"
+  if [[ -n "${vlan}" ]]; then
+    printf "proxy-%s-vlan%s" "${name}" "${vlan}"
+  else
+    printf "proxy-%s" "${name}"
+  fi
+}
+
+collect_configuration() {
+  select_node_role
+  NODE_MANAGEMENT_URL=""
+  NODE_ENROLLMENT_TOKEN=""
+  NODE_ID=""
+  NODE_DISPLAY_NAME=""
+  PROXY_NAMES=()
+  PROXY_INTERFACES=()
+  PROXY_VLANS=()
+  PROXY_LISTEN_IPS=()
+  PROXY_LISTEN_PORTS=()
+  PROXY_TARGET_IPS=()
+  PROXY_TARGET_PORTS=()
   DNS_ENABLED="false"
   DNS_INTERFACE=""
   DNS_BIND_IP="${LISTEN_DEFAULT_IP}"
@@ -755,31 +869,42 @@ collect_configuration() {
   DNS_UPSTREAMS=()
   DNS_THREAT_FEED_URLS=()
 
-  echo
-  if prompt_yes_no "Enable Axiom DNS Security Gateway" "yes"; then
-    DNS_ENABLED="true"
-    select_dns_interface
+  case "${NODE_ROLE}" in
+    management)
+      configure_management_ui
+      NODE_ID="$(hostname -s 2>/dev/null || printf "axiom-management")"
+      NODE_DISPLAY_NAME="Axiom Management Server"
+      NODE_ENROLLMENT_TOKEN="$(random_secret)"
+      ;;
+    dns)
+      configure_agent_management_stub
+      configure_agent_registration
+      configure_node_identity
+      configure_dns_gateway
+      ;;
+    smb_proxy)
+      configure_agent_management_stub
+      configure_agent_registration
+      configure_node_identity
+      configure_proxy_listeners
+      ;;
+    standalone_lab)
+      configure_management_ui
+      NODE_ID="$(hostname -s 2>/dev/null || printf "axiom-standalone")"
+      NODE_DISPLAY_NAME="Axiom Standalone Lab"
+      NODE_ENROLLMENT_TOKEN="$(random_secret)"
+      configure_proxy_listeners
 
-    local discovered_dns_ip
-    discovered_dns_ip="$(get_interface_ipv4 "${DNS_INTERFACE}")"
-    if [[ -z "${discovered_dns_ip}" ]]; then
-      discovered_dns_ip="${LISTEN_DEFAULT_IP}"
-    fi
-
-    DNS_BIND_IP="$(prompt_ipv4 "DNS listen IPv4 for ${DNS_INTERFACE}" "${discovered_dns_ip}")"
-    DNS_UDP_PORT="$(prompt_port "DNS UDP port" "${DNS_DEFAULT_PORT}")"
-    DNS_TCP_PORT="$(prompt_port "DNS TCP port" "${DNS_DEFAULT_PORT}")"
-    select_dns_upstream_interface
-    configure_dns_upstreams
-
-    if prompt_yes_no "Enable the built-in URLhaus DNS threat feed (can block domains immediately)" "no"; then
-      DNS_THREAT_FEED_URLS=("${DNS_DEFAULT_THREAT_FEED_URL}")
-    fi
-  fi
-
-  prompt_admin_credentials
-  ADMIN_PASSWORD_HASH="$(sha256_password_hash "${ADMIN_PASSWORD}")"
-  unset ADMIN_PASSWORD
+      echo
+      if prompt_yes_no "Enable Axiom DNS Security Gateway" "yes"; then
+        configure_dns_gateway
+      fi
+      ;;
+    *)
+      echo "Unsupported role: ${NODE_ROLE}" >&2
+      exit 1
+      ;;
+  esac
 }
 
 ensure_service_user() {
@@ -802,6 +927,18 @@ write_config() {
   temp_config="$(mktemp)"
 
   {
+    echo "[node]"
+    echo "role = \"$(toml_escape "${NODE_ROLE}")\""
+    echo "node_id = \"$(toml_escape "${NODE_ID}")\""
+    echo "display_name = \"$(toml_escape "${NODE_DISPLAY_NAME}")\""
+    if [[ -n "${NODE_MANAGEMENT_URL}" ]]; then
+      echo "management_url = \"$(toml_escape "${NODE_MANAGEMENT_URL}")\""
+    fi
+    if [[ -n "${NODE_ENROLLMENT_TOKEN}" ]]; then
+      echo "enrollment_token = \"$(toml_escape "${NODE_ENROLLMENT_TOKEN}")\""
+    fi
+    echo "heartbeat_interval_seconds = 5"
+    echo
     echo "[management]"
     echo "interface = \"$(toml_escape "${MANAGEMENT_INTERFACE}")\""
     echo "bind_ip = \"$(toml_escape "${MANAGEMENT_BIND_IP}")\""
@@ -1024,7 +1161,14 @@ print_summary() {
   echo "Config: ${CONFIG_PATH}"
   echo "Binary: ${BINARY_PATH}"
   echo "Service: axiom.service"
-  echo "Management UI: http://${MANAGEMENT_BIND_IP}:${MANAGEMENT_PORT}/"
+  echo "Role: ${NODE_ROLE}"
+  if [[ "${NODE_ROLE}" == "management" || "${NODE_ROLE}" == "standalone_lab" ]]; then
+    echo "Management UI: http://${MANAGEMENT_BIND_IP}:${MANAGEMENT_PORT}/"
+    echo "Enrollment token for DNS/SMB nodes: ${NODE_ENROLLMENT_TOKEN}"
+  else
+    echo "Management server: ${NODE_MANAGEMENT_URL}"
+    echo "Node ID: ${NODE_ID}"
+  fi
   if [[ "${DNS_ENABLED}" == "true" ]]; then
     echo "DNS Gateway: ${DNS_BIND_IP}:${DNS_UDP_PORT}/udp and ${DNS_BIND_IP}:${DNS_TCP_PORT}/tcp -> ${DNS_UPSTREAMS[*]}"
   fi
@@ -1043,7 +1187,9 @@ main() {
   ensure_service_user
   write_config
   build_and_install_binary
-  configure_reverse_proxy_network_mode
+  if ((${#PROXY_INTERFACES[@]} > 0)); then
+    configure_reverse_proxy_network_mode
+  fi
   write_systemd_service
   enable_and_start_service
   print_summary

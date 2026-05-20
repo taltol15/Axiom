@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     fs,
     path::{Path, PathBuf},
     process::Command,
@@ -8,7 +9,7 @@ use std::{
 
 use anyhow::Context;
 use axiom_config::{
-    AdminCredentials, AxiomConfig, DnsPolicyConfig, PolicyConfig, ProxyListenerConfig,
+    AdminCredentials, AxiomConfig, DnsPolicyConfig, NodeRole, PolicyConfig, ProxyListenerConfig,
 };
 use axiom_core::{
     DnsPolicyRuntimeSnapshot, InspectionContext, InspectionResult, PolicyRuntimeSnapshot,
@@ -33,6 +34,7 @@ struct WebState {
     runtime: Arc<RuntimeState>,
     config_path: PathBuf,
     config: Mutex<AxiomConfig>,
+    fleet_nodes: Mutex<HashMap<String, FleetNodeStatus>>,
 }
 
 pub async fn run_management_server(
@@ -56,6 +58,7 @@ pub async fn run_management_server(
         runtime,
         config_path,
         config: Mutex::new(config),
+        fleet_nodes: Mutex::new(HashMap::new()),
     });
 
     let app = Router::new()
@@ -64,6 +67,8 @@ pub async fn run_management_server(
         .route("/login", get(login_page))
         .route("/api/status", get(api_status))
         .route("/api/diagnostics", get(api_diagnostics))
+        .route("/api/nodes/report", post(api_node_report))
+        .route("/api/nodes/runtime-config", get(api_node_runtime_config))
         .route("/api/policies", get(api_policies).put(api_update_policies))
         .route(
             "/api/dns-policy",
@@ -126,6 +131,79 @@ async fn api_diagnostics(headers: HeaderMap, State(state): State<Arc<WebState>>)
     }
 
     Json(build_diagnostics_response(&state)).into_response()
+}
+
+async fn api_node_report(
+    headers: HeaderMap,
+    State(state): State<Arc<WebState>>,
+    Json(report): Json<NodeReport>,
+) -> Response {
+    if !is_node_authorized(&headers, &state) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(ErrorResponse {
+                message: "node enrollment token required",
+            }),
+        )
+            .into_response();
+    }
+
+    let node_id = report.node_id.trim().to_string();
+    if node_id.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                message: "node_id is required",
+            }),
+        )
+            .into_response();
+    }
+
+    let status = FleetNodeStatus {
+        node_id: node_id.clone(),
+        display_name: report.display_name,
+        role: report.role,
+        hostname: report.hostname,
+        version: report.version,
+        last_seen_unix_timestamp_seconds: unix_timestamp_seconds(),
+        management_url: report.management_url,
+        proxy_listeners: report.proxy_listeners,
+        dns: report.dns,
+        stats: report.stats,
+    };
+
+    state
+        .fleet_nodes
+        .lock()
+        .expect("fleet nodes mutex poisoned")
+        .insert(node_id, status);
+
+    Json(NodeAckResponse {
+        accepted: true,
+        message: "node report accepted",
+    })
+    .into_response()
+}
+
+async fn api_node_runtime_config(
+    headers: HeaderMap,
+    State(state): State<Arc<WebState>>,
+) -> Response {
+    if !is_node_authorized(&headers, &state) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(ErrorResponse {
+                message: "node enrollment token required",
+            }),
+        )
+            .into_response();
+    }
+
+    Json(NodeRuntimeConfigResponse {
+        policy_runtime: state.runtime.policy_runtime_snapshot(),
+        dns_policy_runtime: state.runtime.dns_policy_runtime_snapshot(),
+    })
+    .into_response()
 }
 
 async fn api_policies(headers: HeaderMap, State(state): State<Arc<WebState>>) -> Response {
@@ -411,6 +489,7 @@ fn build_status_response(state: &WebState) -> StatusResponse {
     StatusResponse {
         process_id: std::process::id(),
         config_path: state.config_path.display().to_string(),
+        node: NodeInfo::from_config(&config),
         management_interface: config.management.interface.clone(),
         management_bind_addr: config.management.listen_addr().to_string(),
         configured_proxy_listeners: config.proxy_listeners.len(),
@@ -421,6 +500,7 @@ fn build_status_response(state: &WebState) -> StatusResponse {
             .collect(),
         dns: DnsStatus::from(&config.dns),
         deployment_warnings,
+        fleet_nodes: fleet_node_snapshots(state),
         stats,
     }
 }
@@ -467,6 +547,7 @@ fn build_diagnostics_response(state: &WebState) -> DiagnosticsResponse {
             .map(|path| path.display().to_string())
             .unwrap_or_else(|error| format!("unavailable: {error}")),
         config_path: state.config_path.display().to_string(),
+        node: NodeInfo::from_config(&config),
         management_bind_addr: config.management.listen_addr().to_string(),
         proxy_listeners: config
             .proxy_listeners
@@ -475,6 +556,7 @@ fn build_diagnostics_response(state: &WebState) -> DiagnosticsResponse {
             .collect(),
         dns: DnsStatus::from(&config.dns),
         deployment_warnings,
+        fleet_nodes: fleet_node_snapshots(state),
         status,
         command_outputs,
         proc_self_status: fs::read_to_string("/proc/self/status").ok(),
@@ -501,6 +583,29 @@ fn is_authorized(headers: &HeaderMap, state: &WebState) -> bool {
         && constant_time_eq(token.as_bytes(), expected_token.as_bytes())
     {
         return true;
+    }
+
+    false
+}
+
+fn is_node_authorized(headers: &HeaderMap, state: &WebState) -> bool {
+    let expected_token = {
+        let config = state.config.lock().expect("web config mutex poisoned");
+        config.node.enrollment_token.clone()
+    };
+    let Some(expected_token) = expected_token else {
+        return false;
+    };
+
+    if expected_token.is_empty() {
+        return false;
+    }
+
+    if let Some(header_value) = headers.get(header::AUTHORIZATION)
+        && let Ok(value) = header_value.to_str()
+        && let Some(token) = value.strip_prefix("Bearer ")
+    {
+        return constant_time_eq(token.as_bytes(), expected_token.as_bytes());
     }
 
     false
@@ -618,6 +723,24 @@ fn build_deployment_warnings(config: &AxiomConfig, stats: &StatusSnapshot) -> De
     }
 }
 
+fn fleet_node_snapshots(state: &WebState) -> Vec<FleetNodeStatus> {
+    let mut nodes: Vec<_> = state
+        .fleet_nodes
+        .lock()
+        .expect("fleet nodes mutex poisoned")
+        .values()
+        .cloned()
+        .collect();
+
+    nodes.sort_by(|left, right| {
+        right
+            .last_seen_unix_timestamp_seconds
+            .cmp(&left.last_seen_unix_timestamp_seconds)
+            .then_with(|| left.node_id.cmp(&right.node_id))
+    });
+    nodes
+}
+
 fn smb_deployment_warnings(config: &AxiomConfig, stats: &StatusSnapshot) -> Vec<String> {
     if config.proxy_listeners.is_empty() {
         return Vec::new();
@@ -668,12 +791,14 @@ fn smb_deployment_warnings(config: &AxiomConfig, stats: &StatusSnapshot) -> Vec<
 struct StatusResponse {
     process_id: u32,
     config_path: String,
+    node: NodeInfo,
     management_interface: String,
     management_bind_addr: String,
     configured_proxy_listeners: usize,
     proxy_listeners: Vec<ProxyListenerStatus>,
     dns: DnsStatus,
     deployment_warnings: DeploymentWarnings,
+    fleet_nodes: Vec<FleetNodeStatus>,
     stats: StatusSnapshot,
 }
 
@@ -682,13 +807,75 @@ struct DiagnosticsResponse {
     process_id: u32,
     executable_path: String,
     config_path: String,
+    node: NodeInfo,
     management_bind_addr: String,
     proxy_listeners: Vec<ProxyListenerStatus>,
     dns: DnsStatus,
     deployment_warnings: DeploymentWarnings,
+    fleet_nodes: Vec<FleetNodeStatus>,
     status: StatusSnapshot,
     command_outputs: Vec<CommandOutput>,
     proc_self_status: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct NodeInfo {
+    node_id: String,
+    display_name: String,
+    role: NodeRole,
+    management_url: Option<String>,
+    heartbeat_interval_seconds: u64,
+}
+
+impl NodeInfo {
+    fn from_config(config: &AxiomConfig) -> Self {
+        Self {
+            node_id: config.node.node_id.clone(),
+            display_name: config.node.display_name.clone(),
+            role: config.node.role,
+            management_url: config.node.management_url.clone(),
+            heartbeat_interval_seconds: config.node.heartbeat_interval_seconds,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct FleetNodeStatus {
+    node_id: String,
+    display_name: String,
+    role: NodeRole,
+    hostname: String,
+    version: String,
+    last_seen_unix_timestamp_seconds: u64,
+    management_url: Option<String>,
+    proxy_listeners: Vec<ProxyListenerStatus>,
+    dns: DnsStatus,
+    stats: serde_json::Value,
+}
+
+#[derive(Debug, Deserialize)]
+struct NodeReport {
+    node_id: String,
+    display_name: String,
+    role: NodeRole,
+    hostname: String,
+    version: String,
+    management_url: Option<String>,
+    proxy_listeners: Vec<ProxyListenerStatus>,
+    dns: DnsStatus,
+    stats: serde_json::Value,
+}
+
+#[derive(Debug, Serialize)]
+struct NodeAckResponse {
+    accepted: bool,
+    message: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+struct NodeRuntimeConfigResponse {
+    policy_runtime: PolicyRuntimeSnapshot,
+    dns_policy_runtime: DnsPolicyRuntimeSnapshot,
 }
 
 #[derive(Debug, Serialize)]
@@ -705,7 +892,7 @@ struct CommandOutput {
     stderr: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct ProxyListenerStatus {
     name: String,
     source_interface: String,
@@ -714,7 +901,7 @@ struct ProxyListenerStatus {
     target_file_server_addr: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct DnsStatus {
     enabled: bool,
     interface: String,
@@ -1074,6 +1261,7 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
     <div class="border-t border-zinc-800 bg-zinc-900/70">
       <nav class="mx-auto flex max-w-7xl flex-wrap gap-2 px-6 py-3" aria-label="Dashboard sections">
         <button data-view="overview" class="top-nav-button active rounded-md border border-zinc-700 px-4 py-2 text-sm font-medium text-zinc-200 transition hover:border-emerald-300 hover:text-emerald-100">Overview</button>
+        <button data-view="nodes" class="top-nav-button rounded-md border border-zinc-700 px-4 py-2 text-sm font-medium text-zinc-200 transition hover:border-emerald-300 hover:text-emerald-100">Nodes</button>
         <button data-view="smb" class="top-nav-button rounded-md border border-zinc-700 px-4 py-2 text-sm font-medium text-zinc-200 transition hover:border-emerald-300 hover:text-emerald-100">SMB Protection</button>
         <button data-view="dns" class="top-nav-button rounded-md border border-zinc-700 px-4 py-2 text-sm font-medium text-zinc-200 transition hover:border-emerald-300 hover:text-emerald-100">DNS Security</button>
         <button data-view="audit" class="top-nav-button rounded-md border border-zinc-700 px-4 py-2 text-sm font-medium text-zinc-200 transition hover:border-emerald-300 hover:text-emerald-100">Global Audit Log</button>
@@ -1171,6 +1359,33 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
               </div>
             </div>
           </div>
+        </div>
+      </section>
+    </section>
+
+    <section id="view-nodes" class="dashboard-view">
+      <section class="rounded-lg border border-zinc-800 bg-zinc-900">
+        <div class="flex flex-col gap-2 border-b border-zinc-800 px-6 py-5 md:flex-row md:items-end md:justify-between">
+          <div>
+            <h2 class="text-xl font-semibold text-white">Axiom Nodes</h2>
+            <p id="fleet-state" class="mt-1 text-sm text-zinc-400">Waiting for remote nodes</p>
+          </div>
+          <p id="fleet-count" class="text-sm text-zinc-500">0 registered nodes</p>
+        </div>
+        <div class="overflow-x-auto">
+          <table class="min-w-full divide-y divide-zinc-800">
+            <thead class="bg-zinc-950/60">
+              <tr>
+                <th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-zinc-400">Node</th>
+                <th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-zinc-400">Role</th>
+                <th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-zinc-400">Health</th>
+                <th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-zinc-400">Traffic</th>
+                <th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-zinc-400">Security</th>
+                <th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-zinc-400">Services</th>
+              </tr>
+            </thead>
+            <tbody id="fleet-nodes-body" class="divide-y divide-zinc-800"></tbody>
+          </table>
         </div>
       </section>
     </section>
@@ -1531,7 +1746,7 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
     }
 
     function setActiveView(name) {
-      const knownViews = new Set(["overview", "smb", "dns", "audit", "settings"]);
+      const knownViews = new Set(["overview", "nodes", "smb", "dns", "audit", "settings"]);
       if (!knownViews.has(name)) name = "overview";
       document.querySelectorAll(".dashboard-view").forEach((section) => {
         section.classList.toggle("active", section.id === `view-${name}`);
@@ -1584,6 +1799,98 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
       const rows = [...smbWarnings, ...dnsWarnings];
       section.classList.toggle("hidden", rows.length === 0);
       renderList("deployment-warnings", rows, "No deployment warnings.");
+    }
+
+    function numberStat(stats, key) {
+      return Number((stats || {})[key] || 0);
+    }
+
+    function aggregateStats(localStats, fleetNodes) {
+      const stats = { ...(localStats || {}) };
+      const numericKeys = [
+        "total_connections", "active_connections", "inspected_chunks", "inspected_bytes",
+        "allowed_chunks", "monitored_chunks", "blocked_chunks", "observed_file_events",
+        "audit_events", "stream_bytes_client_to_server", "stream_bytes_server_to_client",
+        "bytes_client_to_server", "bytes_server_to_client", "smb_write_requests",
+        "smb_write_bytes", "server_side_copy_requests", "dns_queries", "dns_udp_queries",
+        "dns_tcp_queries", "dns_blocked_queries", "dns_monitored_queries", "dns_cache_hits",
+        "dns_upstream_errors", "monitored_threats", "blocked_threats"
+      ];
+
+      fleetNodes.forEach((node) => {
+        const remote = node.stats || {};
+        numericKeys.forEach((key) => {
+          stats[key] = numberStat(stats, key) + numberStat(remote, key);
+        });
+        ["route_stats", "active_connection_details", "file_activity", "recent_threats", "recent_audit_events", "recent_dns_events"].forEach((key) => {
+          stats[key] = [...(stats[key] || []), ...(remote[key] || [])];
+        });
+      });
+
+      ["recent_threats", "recent_audit_events", "recent_dns_events", "active_connection_details", "file_activity"].forEach((key) => {
+        stats[key] = (stats[key] || [])
+          .slice()
+          .sort((left, right) => Number(right.last_activity_unix_timestamp_seconds || right.unix_timestamp_seconds || 0) - Number(left.last_activity_unix_timestamp_seconds || left.unix_timestamp_seconds || 0))
+          .slice(0, 160);
+      });
+
+      stats.route_stats = stats.route_stats || [];
+      return stats;
+    }
+
+    function effectiveDnsStatus(localDns, fleetNodes) {
+      if (localDns?.enabled) return localDns;
+      const dnsNode = fleetNodes.find((node) => node.dns?.enabled);
+      return dnsNode?.dns || localDns || {};
+    }
+
+    function renderFleetNodes(localNode, fleetNodes) {
+      const body = document.getElementById("fleet-nodes-body");
+      document.getElementById("fleet-count").textContent = `${fleetNodes.length} reporting nodes`;
+      document.getElementById("fleet-state").textContent =
+        fleetNodes.length ? `Management role: ${text(localNode?.role)} · latest heartbeat ${formatTime(fleetNodes[0].last_seen_unix_timestamp_seconds)}` : `Management role: ${text(localNode?.role)} · waiting for DNS/SMB nodes`;
+
+      if (!fleetNodes.length) {
+        body.innerHTML = `<tr><td colspan="6" class="px-6 py-6 text-sm text-zinc-400">No remote DNS or SMB nodes have enrolled yet.</td></tr>`;
+        return;
+      }
+
+      const nowSeconds = Date.now() / 1000;
+      body.innerHTML = fleetNodes.map((node) => {
+        const stats = node.stats || {};
+        const age = Math.max(0, Math.round(nowSeconds - Number(node.last_seen_unix_timestamp_seconds || 0)));
+        const healthy = age <= 20;
+        const wireBytes = Number(stats.stream_bytes_client_to_server || 0) + Number(stats.stream_bytes_server_to_client || 0);
+        const dnsQueries = Number(stats.dns_queries || 0);
+        const trafficTitle = node.role === "dns" ? `${dnsQueries} DNS queries` : formatBytes(wireBytes);
+        const services = [
+          (node.proxy_listeners || []).length ? `${(node.proxy_listeners || []).length} SMB routes` : null,
+          node.dns?.enabled ? `DNS ${text(node.dns.listen_udp_addr)}` : null
+        ].filter(Boolean).join(" · ");
+
+        return `
+          <tr class="hover:bg-zinc-800/40">
+            <td class="px-6 py-4 text-sm font-medium text-white">
+              <p>${text(node.display_name)}</p>
+              <p class="mt-1 text-xs text-zinc-500">${text(node.node_id)} · ${text(node.hostname)}</p>
+            </td>
+            <td class="whitespace-nowrap px-6 py-4 text-sm text-zinc-300">${text(node.role)}</td>
+            <td class="whitespace-nowrap px-6 py-4 text-sm">
+              <span class="rounded-full border px-2.5 py-1 text-xs font-semibold uppercase ${healthy ? "border-emerald-400/40 bg-emerald-500/10 text-emerald-100" : "border-amber-400/40 bg-amber-500/10 text-amber-100"}">${healthy ? "online" : "stale"}</span>
+              <p class="mt-2 text-xs text-zinc-500">${age}s ago · v${text(node.version)}</p>
+            </td>
+            <td class="whitespace-nowrap px-6 py-4 text-sm text-sky-200">
+              <p>${trafficTitle}</p>
+              <p class="mt-1 text-xs text-zinc-500">${formatBytes(wireBytes)} wire · ${text(stats.active_connections || 0)} SMB active · ${dnsQueries} DNS queries</p>
+            </td>
+            <td class="whitespace-nowrap px-6 py-4 text-sm text-red-200">
+              <p>${text(stats.blocked_threats || 0)} SMB blocks</p>
+              <p class="mt-1 text-xs text-zinc-500">${text(stats.dns_blocked_queries || 0)} DNS blocks</p>
+            </td>
+            <td class="px-6 py-4 text-sm text-zinc-300">${text(services)}</td>
+          </tr>
+        `;
+      }).join("");
     }
 
     function topCounts(items, keyFn, limit = 10) {
@@ -1692,7 +1999,9 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
       }
 
       const data = await response.json();
-      const stats = data.stats;
+      const fleetNodes = data.fleet_nodes || [];
+      const stats = aggregateStats(data.stats, fleetNodes);
+      renderFleetNodes(data.node || {}, fleetNodes);
       const forwardedBytes = Number(stats.bytes_client_to_server || 0) + Number(stats.bytes_server_to_client || 0);
       const streamBytes = Number(stats.stream_bytes_client_to_server || 0) + Number(stats.stream_bytes_server_to_client || 0);
 
@@ -1713,7 +2022,7 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
       renderPolicyRuntime(stats.policy_runtime);
       renderDeploymentWarnings(data.deployment_warnings || {});
 
-      const dns = data.dns || {};
+      const dns = effectiveDnsStatus(data.dns || {}, fleetNodes);
       const dnsEvents = stats.recent_dns_events || [];
       document.getElementById("dns-state").textContent = dns.enabled
         ? `${stats.dns_queries || 0} queries · ${stats.dns_blocked_queries || 0} blocked · ${stats.dns_monitored_queries || 0} monitored`
@@ -1789,7 +2098,11 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
 
       const mappingBody = document.getElementById("mapping-body");
       const routeStats = new Map((stats.route_stats || []).map((route) => [route.route_name, route]));
-      mappingBody.innerHTML = data.proxy_listeners.map((route) => `
+      const proxyListeners = fleetNodes.flatMap((node) =>
+        (node.proxy_listeners || []).map((route) => ({ ...route, node_label: node.display_name || node.node_id }))
+      );
+      const visibleProxyListeners = proxyListeners.length ? proxyListeners : (data.proxy_listeners || []);
+      mappingBody.innerHTML = visibleProxyListeners.map((route) => `
         ${(() => {
           const runtime = routeStats.get(route.name) || {};
           const routeBytes = Number(runtime.bytes_client_to_server || 0) + Number(runtime.bytes_server_to_client || 0);
@@ -1798,7 +2111,7 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
         <tr class="hover:bg-zinc-800/40">
           <td class="px-4 py-4 text-sm font-medium text-white">
             <p>${text(route.name)}</p>
-            <p class="mt-1 text-xs text-zinc-500">${text(route.listen_addr)}</p>
+            <p class="mt-1 text-xs text-zinc-500">${text(route.listen_addr)}${route.node_label ? ` · ${text(route.node_label)}` : ""}</p>
           </td>
           <td class="px-4 py-4 text-sm text-emerald-200">
             <p>${text(route.source_interface)}</p>
@@ -2150,6 +2463,9 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
         process_id: payload.process_id,
         executable_path: payload.executable_path,
         config_path: payload.config_path,
+        node: payload.node,
+        fleet_nodes: payload.fleet_nodes,
+        deployment_warnings: payload.deployment_warnings,
         proxy_listeners: payload.proxy_listeners,
         dns: payload.dns,
         route_stats: payload.status.route_stats,

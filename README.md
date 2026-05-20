@@ -4,6 +4,30 @@ Axiom is an enterprise SMB reverse proxy and DNS security gateway MVP for Linux
 deployments with a dedicated management NIC, isolated SMB proxy NICs, and an
 optional DNS NIC that can sit in front of internal DC DNS resolvers.
 
+## Deployment Roles
+
+The recommended production-style lab uses at least three Axiom servers:
+
+```text
+Axiom Management Server  - Web UI, policy control plane, node registry
+Axiom DNS Node           - DNS Security data plane
+Axiom SMB Proxy Node     - SMB reverse proxy data plane
+```
+
+During installation, choose one of these roles:
+
+```text
+management      Central dashboard and policy server
+dns             DNS node enrolled to the management server
+smb_proxy       SMB proxy node enrolled to the management server
+standalone_lab  Single-machine lab mode
+```
+
+The management server prints an enrollment token at the end of installation.
+Use that token when installing DNS and SMB nodes. Data-plane nodes connect
+outbound to the management server, pull policies, and post heartbeat/statistics,
+so the admin only needs to sign in to the management server dashboard.
+
 ## Run
 
 ```bash
