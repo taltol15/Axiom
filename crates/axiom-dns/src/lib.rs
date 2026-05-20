@@ -14,7 +14,7 @@ use std::{
 };
 
 use anyhow::Context;
-use axiom_config::{DnsBlockResponse, DnsConfig, PolicyMode};
+use axiom_config::{DnsBlockResponse, DnsConfig, DnsLocalRecordConfig, DnsRecordType, PolicyMode};
 use axiom_core::{DnsAction, DnsProtocol, DnsQueryEvent, RuntimeState};
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use tokio::{
@@ -173,7 +173,7 @@ async fn handle_dns_query(
                 client_addr,
                 "<invalid>".to_string(),
                 "INVALID".to_string(),
-                DnsAction::Block,
+                DnsAction::Error,
                 format!("malformed DNS query: {error}"),
                 None,
                 Some(DNS_RCODE_FORMERR),
@@ -184,9 +184,12 @@ async fn handle_dns_query(
         }
     };
 
-    let decision = state.policy_decision(&question.normalized_name).await;
+    let policy = state.runtime.dns_policy_config();
+    let decision = state
+        .policy_decision(&policy, &question.normalized_name)
+        .await;
     if decision.action == DnsAction::Block {
-        let response = build_policy_block_response(&query, &question, &state.config);
+        let response = build_policy_block_response(&query, &question, &policy);
         state.runtime.record_dns_query(DnsQueryEvent::now(
             protocol,
             client_addr,
@@ -194,6 +197,30 @@ async fn handle_dns_query(
             dns_type_label(question.qtype),
             DnsAction::Block,
             decision.reason,
+            None,
+            Some(response_code(&response)),
+            started.elapsed().as_millis() as u64,
+            false,
+        ));
+        return Ok(response);
+    }
+
+    if let Some(response) = build_local_record_response(&query, &question, &policy) {
+        state.runtime.record_dns_query(DnsQueryEvent::now(
+            protocol,
+            client_addr,
+            question.name,
+            dns_type_label(question.qtype),
+            if decision.action == DnsAction::Monitor {
+                DnsAction::Monitor
+            } else {
+                DnsAction::Allow
+            },
+            if decision.action == DnsAction::Monitor {
+                decision.reason
+            } else {
+                "answered from Axiom local DNS records".to_string()
+            },
             None,
             Some(response_code(&response)),
             started.elapsed().as_millis() as u64,
@@ -227,14 +254,10 @@ async fn handle_dns_query(
         return Ok(response);
     }
 
-    let upstream = state.next_upstream();
-    let response = match protocol {
-        DnsProtocol::Udp => state.forward_udp(&query, upstream).await,
-        DnsProtocol::Tcp => state.forward_tcp(&query, upstream).await,
-    };
+    let response = state.forward_with_failover(protocol, &query).await;
 
     match response {
-        Ok(response) => {
+        Ok((upstream, response)) => {
             state.store_cache(cache_key, response.clone());
             state.runtime.record_dns_query(DnsQueryEvent::now(
                 protocol,
@@ -263,9 +286,9 @@ async fn handle_dns_query(
                 client_addr,
                 question.name,
                 dns_type_label(question.qtype),
-                DnsAction::Block,
+                DnsAction::Error,
                 format!("upstream DNS query failed: {error}"),
-                Some(upstream),
+                None,
                 Some(DNS_RCODE_REFUSED),
                 started.elapsed().as_millis() as u64,
                 false,
@@ -291,32 +314,17 @@ struct DnsGatewayState {
     runtime: Arc<RuntimeState>,
     cache: Mutex<HashMap<DnsCacheKey, DnsCacheEntry>>,
     blocked_domains: RwLock<HashSet<String>>,
-    monitored_domains: RwLock<HashSet<String>>,
     upstream_cursor: AtomicUsize,
     http_client: reqwest::Client,
 }
 
 impl DnsGatewayState {
     fn new(config: DnsConfig, runtime: Arc<RuntimeState>) -> Self {
-        let blocked_domains = config
-            .policy
-            .blocked_domains
-            .iter()
-            .filter_map(|domain| normalize_domain(domain))
-            .collect();
-        let monitored_domains = config
-            .policy
-            .monitored_domains
-            .iter()
-            .filter_map(|domain| normalize_domain(domain))
-            .collect();
-
         Self {
             config,
             runtime,
             cache: Mutex::new(HashMap::new()),
-            blocked_domains: RwLock::new(blocked_domains),
-            monitored_domains: RwLock::new(monitored_domains),
+            blocked_domains: RwLock::new(HashSet::new()),
             upstream_cursor: AtomicUsize::new(0),
             http_client: reqwest::Client::builder()
                 .timeout(Duration::from_secs(20))
@@ -327,19 +335,15 @@ impl DnsGatewayState {
     }
 
     async fn refresh_threat_feeds(&self) {
-        if self.config.policy.threat_feed_urls.is_empty() {
+        let policy = self.runtime.dns_policy_config();
+        if policy.threat_feed_urls.is_empty() {
+            *self.blocked_domains.write().await = HashSet::new();
             return;
         }
 
-        let mut refreshed = self
-            .config
-            .policy
-            .blocked_domains
-            .iter()
-            .filter_map(|domain| normalize_domain(domain))
-            .collect::<HashSet<_>>();
+        let mut refreshed = HashSet::new();
 
-        for url in &self.config.policy.threat_feed_urls {
+        for url in &policy.threat_feed_urls {
             match self.http_client.get(url).send().await {
                 Ok(response) => match response.text().await {
                     Ok(body) => {
@@ -364,24 +368,46 @@ impl DnsGatewayState {
         *self.blocked_domains.write().await = refreshed;
     }
 
-    async fn policy_decision(&self, normalized_name: &str) -> DnsPolicyDecision {
-        let blocked_domains = self.blocked_domains.read().await;
-        if domain_matches(&blocked_domains, normalized_name)
-            && self.config.policy.blocked_domain_action.is_enabled()
+    async fn policy_decision(
+        &self,
+        policy: &axiom_config::DnsPolicyConfig,
+        normalized_name: &str,
+    ) -> DnsPolicyDecision {
+        let static_blocked_domains = policy
+            .blocked_domains
+            .iter()
+            .filter_map(|domain| normalize_domain(domain))
+            .collect::<HashSet<_>>();
+        if domain_matches(&static_blocked_domains, normalized_name)
+            && policy.blocked_domain_action.is_enabled()
         {
             return DnsPolicyDecision {
-                action: policy_mode_to_dns_action(self.config.policy.blocked_domain_action),
+                action: policy_mode_to_dns_action(policy.blocked_domain_action),
                 reason: format!("domain matched DNS block policy: {normalized_name}"),
             };
         }
-        drop(blocked_domains);
 
-        let monitored_domains = self.monitored_domains.read().await;
-        if domain_matches(&monitored_domains, normalized_name)
-            && self.config.policy.monitored_domain_action.is_enabled()
+        let feed_blocked_domains = self.blocked_domains.read().await;
+        if domain_matches(&feed_blocked_domains, normalized_name)
+            && policy.blocked_domain_action.is_enabled()
         {
             return DnsPolicyDecision {
-                action: policy_mode_to_dns_action(self.config.policy.monitored_domain_action),
+                action: policy_mode_to_dns_action(policy.blocked_domain_action),
+                reason: format!("domain matched DNS threat feed: {normalized_name}"),
+            };
+        }
+        drop(feed_blocked_domains);
+
+        let static_monitored_domains = policy
+            .monitored_domains
+            .iter()
+            .filter_map(|domain| normalize_domain(domain))
+            .collect::<HashSet<_>>();
+        if domain_matches(&static_monitored_domains, normalized_name)
+            && policy.monitored_domain_action.is_enabled()
+        {
+            return DnsPolicyDecision {
+                action: policy_mode_to_dns_action(policy.monitored_domain_action),
                 reason: format!("domain matched DNS monitor policy: {normalized_name}"),
             };
         }
@@ -392,9 +418,12 @@ impl DnsGatewayState {
         }
     }
 
-    fn next_upstream(&self) -> SocketAddr {
-        let index = self.upstream_cursor.fetch_add(1, Ordering::Relaxed);
-        self.config.upstreams[index % self.config.upstreams.len()]
+    fn ordered_upstreams(&self) -> Vec<SocketAddr> {
+        let upstream_count = self.config.upstreams.len();
+        let start = self.upstream_cursor.fetch_add(1, Ordering::Relaxed) % upstream_count;
+        (0..upstream_count)
+            .map(|offset| self.config.upstreams[(start + offset) % upstream_count])
+            .collect()
     }
 
     fn cached_response(&self, key: &DnsCacheKey, request_id: [u8; 2]) -> Option<Vec<u8>> {
@@ -454,6 +483,31 @@ impl DnsGatewayState {
         .context("DNS UDP upstream query timed out")??;
         buffer.truncate(bytes_read);
         Ok(buffer)
+    }
+
+    async fn forward_with_failover(
+        &self,
+        protocol: DnsProtocol,
+        query: &[u8],
+    ) -> anyhow::Result<(SocketAddr, Vec<u8>)> {
+        let mut last_error = None;
+
+        for upstream in self.ordered_upstreams() {
+            let result = match protocol {
+                DnsProtocol::Udp => self.forward_udp(query, upstream).await,
+                DnsProtocol::Tcp => self.forward_tcp(query, upstream).await,
+            };
+
+            match result {
+                Ok(response) => return Ok((upstream, response)),
+                Err(error) => {
+                    warn!(%upstream, ?error, "DNS upstream attempt failed; trying next resolver");
+                    last_error = Some(error);
+                }
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| anyhow::anyhow!("no upstream DNS resolvers configured")))
     }
 
     async fn forward_tcp(&self, query: &[u8], upstream: SocketAddr) -> anyhow::Result<Vec<u8>> {
@@ -614,23 +668,42 @@ fn parse_dns_name(packet: &[u8], start: usize) -> anyhow::Result<(String, usize)
 fn build_policy_block_response(
     request: &[u8],
     question: &DnsQuestion,
-    config: &DnsConfig,
+    policy: &axiom_config::DnsPolicyConfig,
 ) -> Vec<u8> {
-    match config.policy.block_response {
+    match policy.block_response {
         DnsBlockResponse::Nxdomain => build_error_response(request, DNS_RCODE_NXDOMAIN)
             .unwrap_or_else(|| minimal_error_response(request, DNS_RCODE_NXDOMAIN)),
         DnsBlockResponse::Refused => build_error_response(request, DNS_RCODE_REFUSED)
             .unwrap_or_else(|| minimal_error_response(request, DNS_RCODE_REFUSED)),
-        DnsBlockResponse::Sinkhole => build_sinkhole_response(
-            request,
-            question,
-            config.policy.sinkhole_ipv4,
-            config.cache_ttl_seconds,
-        )
-        .unwrap_or_else(|| {
-            build_error_response(request, DNS_RCODE_NXDOMAIN)
-                .unwrap_or_else(|| minimal_error_response(request, DNS_RCODE_NXDOMAIN))
-        }),
+        DnsBlockResponse::Sinkhole => {
+            build_a_record_response(request, question, policy.sinkhole_ipv4, 60).unwrap_or_else(
+                || {
+                    build_error_response(request, DNS_RCODE_NXDOMAIN)
+                        .unwrap_or_else(|| minimal_error_response(request, DNS_RCODE_NXDOMAIN))
+                },
+            )
+        }
+    }
+}
+
+fn build_local_record_response(
+    request: &[u8],
+    question: &DnsQuestion,
+    policy: &axiom_config::DnsPolicyConfig,
+) -> Option<Vec<u8>> {
+    let record = policy.local_records.iter().find(|record| {
+        normalize_domain(&record.name).as_deref() == Some(question.normalized_name.as_str())
+            && local_record_matches_question(record, question.qtype)
+    })?;
+
+    match (record.record_type, record.value) {
+        (DnsRecordType::A, IpAddr::V4(address)) => {
+            build_a_record_response(request, question, address, u64::from(record.ttl_seconds))
+        }
+        (DnsRecordType::Aaaa, IpAddr::V6(address)) => {
+            build_aaaa_record_response(request, question, address, u64::from(record.ttl_seconds))
+        }
+        _ => None,
     }
 }
 
@@ -656,10 +729,10 @@ fn minimal_error_response(request: &[u8], rcode: u8) -> Vec<u8> {
     response
 }
 
-fn build_sinkhole_response(
+fn build_a_record_response(
     request: &[u8],
     question: &DnsQuestion,
-    sinkhole_ipv4: Ipv4Addr,
+    address: Ipv4Addr,
     ttl: u64,
 ) -> Option<Vec<u8>> {
     if question.qclass != DNS_CLASS_IN
@@ -681,8 +754,47 @@ fn build_sinkhole_response(
     response.extend_from_slice(&DNS_CLASS_IN.to_be_bytes());
     response.extend_from_slice(&(ttl.min(u64::from(u32::MAX)) as u32).to_be_bytes());
     response.extend_from_slice(&4_u16.to_be_bytes());
-    response.extend_from_slice(&sinkhole_ipv4.octets());
+    response.extend_from_slice(&address.octets());
     Some(response)
+}
+
+fn build_aaaa_record_response(
+    request: &[u8],
+    question: &DnsQuestion,
+    address: std::net::Ipv6Addr,
+    ttl: u64,
+) -> Option<Vec<u8>> {
+    if question.qclass != DNS_CLASS_IN
+        || !(question.qtype == DNS_TYPE_AAAA || question.qtype == DNS_TYPE_ANY)
+    {
+        return None;
+    }
+
+    let mut response = Vec::with_capacity(question.question_end + 28);
+    response.extend_from_slice(request.get(0..2)?);
+    response.extend_from_slice(&response_flags(request, DNS_RCODE_NOERROR).to_be_bytes());
+    response.extend_from_slice(&1_u16.to_be_bytes());
+    response.extend_from_slice(&1_u16.to_be_bytes());
+    response.extend_from_slice(&0_u16.to_be_bytes());
+    response.extend_from_slice(&0_u16.to_be_bytes());
+    response.extend_from_slice(request.get(DNS_HEADER_LEN..question.question_end)?);
+    response.extend_from_slice(&[0xC0, 0x0C]);
+    response.extend_from_slice(&DNS_TYPE_AAAA.to_be_bytes());
+    response.extend_from_slice(&DNS_CLASS_IN.to_be_bytes());
+    response.extend_from_slice(&(ttl.min(u64::from(u32::MAX)) as u32).to_be_bytes());
+    response.extend_from_slice(&16_u16.to_be_bytes());
+    response.extend_from_slice(&address.octets());
+    Some(response)
+}
+
+fn local_record_matches_question(record: &DnsLocalRecordConfig, qtype: u16) -> bool {
+    matches!(
+        (record.record_type, qtype),
+        (DnsRecordType::A, DNS_TYPE_A)
+            | (DnsRecordType::A, DNS_TYPE_ANY)
+            | (DnsRecordType::Aaaa, DNS_TYPE_AAAA)
+            | (DnsRecordType::Aaaa, DNS_TYPE_ANY)
+    )
 }
 
 fn response_flags(request: &[u8], rcode: u8) -> u16 {
@@ -974,11 +1086,24 @@ mod tests {
         let question = parse_dns_question(&packet).unwrap();
 
         let response =
-            build_sinkhole_response(&packet, &question, Ipv4Addr::new(10, 10, 10, 10), 60).unwrap();
+            build_a_record_response(&packet, &question, Ipv4Addr::new(10, 10, 10, 10), 60).unwrap();
 
         assert_eq!(response_code(&response), DNS_RCODE_NOERROR);
         assert_eq!(read_u16(&response, 6), Some(1));
         assert_eq!(&response[response.len() - 4..], &[10, 10, 10, 10]);
+    }
+
+    #[test]
+    fn builds_local_dns_aaaa_response() {
+        let packet = dns_query("host.internal", DNS_TYPE_AAAA);
+        let question = parse_dns_question(&packet).unwrap();
+        let address = "2001:db8::10".parse().unwrap();
+
+        let response = build_aaaa_record_response(&packet, &question, address, 300).unwrap();
+
+        assert_eq!(response_code(&response), DNS_RCODE_NOERROR);
+        assert_eq!(read_u16(&response, 6), Some(1));
+        assert_eq!(&response[response.len() - 16..], &address.octets());
     }
 
     #[test]

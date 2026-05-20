@@ -10,7 +10,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use axiom_config::{PolicyConfig, PolicyMode};
+use axiom_config::{DnsPolicyConfig, PolicyConfig, PolicyMode};
 use serde::Serialize;
 
 const MAX_RETAINED_THREAT_EVENTS: usize = 128;
@@ -26,8 +26,11 @@ pub struct AppState {
     started_at: SystemTime,
     counters: TrafficCounters,
     policy: RwLock<StreamPolicy>,
+    dns_policy: RwLock<DnsPolicyConfig>,
     policy_generation: AtomicU64,
+    dns_policy_generation: AtomicU64,
     policy_updated_at_unix_timestamp_seconds: AtomicU64,
+    dns_policy_updated_at_unix_timestamp_seconds: AtomicU64,
     route_stats: Mutex<HashMap<String, RouteRuntimeStats>>,
     active_connections: Mutex<HashMap<String, ActiveConnectionStats>>,
     file_activity: Mutex<HashMap<String, FileActivityStats>>,
@@ -37,13 +40,16 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn new(policy: StreamPolicy) -> Self {
+    pub fn new(policy: StreamPolicy, dns_policy: DnsPolicyConfig) -> Self {
         Self {
             started_at: SystemTime::now(),
             counters: TrafficCounters::default(),
             policy: RwLock::new(policy),
+            dns_policy: RwLock::new(dns_policy),
             policy_generation: AtomicU64::new(1),
+            dns_policy_generation: AtomicU64::new(1),
             policy_updated_at_unix_timestamp_seconds: AtomicU64::new(unix_timestamp_seconds()),
+            dns_policy_updated_at_unix_timestamp_seconds: AtomicU64::new(unix_timestamp_seconds()),
             route_stats: Mutex::new(HashMap::new()),
             active_connections: Mutex::new(HashMap::new()),
             file_activity: Mutex::new(HashMap::new()),
@@ -343,6 +349,19 @@ impl AppState {
         });
     }
 
+    pub fn record_smb_multichannel_blocked(&self, context: &InspectionContext<'_>, bytes: u64) {
+        let event = ThreatEvent::now(
+            context,
+            PolicyMode::Block,
+            "SMB multichannel bypass protection".to_string(),
+            "SMB multichannel interface discovery was blocked so clients stay on the Axiom proxy path"
+                .to_string(),
+            bytes as usize,
+            0.0,
+        );
+        self.record_blocked_threat(event);
+    }
+
     pub fn record_monitored_threat(&self, event: ThreatEvent) {
         self.counters
             .monitored_chunks
@@ -409,6 +428,7 @@ impl AppState {
                     .dns_blocked_queries
                     .fetch_add(1, Ordering::Relaxed);
             }
+            DnsAction::Error => {}
         }
 
         if event.cache_hit {
@@ -458,6 +478,36 @@ impl AppState {
             .store(updated_at, Ordering::Relaxed);
         self.policy_generation.fetch_add(1, Ordering::Relaxed);
         self.policy_runtime_snapshot()
+    }
+
+    pub fn dns_policy_config(&self) -> DnsPolicyConfig {
+        self.dns_policy
+            .read()
+            .expect("dns policy lock poisoned")
+            .clone()
+    }
+
+    pub fn update_dns_policy(&self, policy: DnsPolicyConfig) -> DnsPolicyRuntimeSnapshot {
+        {
+            let mut guard = self.dns_policy.write().expect("dns policy lock poisoned");
+            *guard = policy;
+        }
+
+        let updated_at = unix_timestamp_seconds();
+        self.dns_policy_updated_at_unix_timestamp_seconds
+            .store(updated_at, Ordering::Relaxed);
+        self.dns_policy_generation.fetch_add(1, Ordering::Relaxed);
+        self.dns_policy_runtime_snapshot()
+    }
+
+    pub fn dns_policy_runtime_snapshot(&self) -> DnsPolicyRuntimeSnapshot {
+        DnsPolicyRuntimeSnapshot {
+            generation: self.dns_policy_generation.load(Ordering::Relaxed),
+            last_updated_unix_timestamp_seconds: self
+                .dns_policy_updated_at_unix_timestamp_seconds
+                .load(Ordering::Relaxed),
+            active_policy: self.dns_policy_config(),
+        }
     }
 
     pub fn max_pattern_len(&self) -> usize {
@@ -547,6 +597,7 @@ impl AppState {
             monitored_threats: self.counters.monitored_threats.load(Ordering::Relaxed),
             blocked_threats: self.counters.blocked_threats.load(Ordering::Relaxed),
             policy_runtime: self.policy_runtime_snapshot(),
+            dns_policy_runtime: self.dns_policy_runtime_snapshot(),
             audit_log_path: AUDIT_LOG_PATH.to_string(),
             route_stats: self.route_snapshots(),
             active_connection_details: self.active_connection_snapshots(),
@@ -816,7 +867,7 @@ impl AppState {
 
 impl Default for AppState {
     fn default() -> Self {
-        Self::new(StreamPolicy::default())
+        Self::new(StreamPolicy::default(), DnsPolicyConfig::default())
     }
 }
 
@@ -880,6 +931,7 @@ pub struct StatusSnapshot {
     pub monitored_threats: u64,
     pub blocked_threats: u64,
     pub policy_runtime: PolicyRuntimeSnapshot,
+    pub dns_policy_runtime: DnsPolicyRuntimeSnapshot,
     pub audit_log_path: String,
     pub route_stats: Vec<RouteStatsSnapshot>,
     pub active_connection_details: Vec<ActiveConnectionStats>,
@@ -946,6 +998,14 @@ pub enum DnsAction {
     Allow,
     Monitor,
     Block,
+    Error,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DnsPolicyRuntimeSnapshot {
+    pub generation: u64,
+    pub last_updated_unix_timestamp_seconds: u64,
+    pub active_policy: DnsPolicyConfig,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1774,6 +1834,38 @@ pub fn contains_smb2_server_side_copy_request(chunk: &[u8]) -> bool {
     false
 }
 
+pub fn contains_smb2_network_interface_info_request(chunk: &[u8]) -> bool {
+    contains_smb2_ioctl_control_code(chunk, 0x0014_01FC)
+}
+
+fn contains_smb2_ioctl_control_code(chunk: &[u8], expected_control_code: u32) -> bool {
+    for header_offset in smb2_header_offsets(chunk) {
+        let Some(command) = read_u16_le(chunk, header_offset + 12) else {
+            continue;
+        };
+        if command != 11 {
+            continue;
+        }
+
+        let body_offset = header_offset + 64;
+        let Some(structure_size) = read_u16_le(chunk, body_offset) else {
+            continue;
+        };
+        if structure_size != 57 {
+            continue;
+        }
+
+        let Some(control_code) = read_u32_le(chunk, body_offset + 4) else {
+            continue;
+        };
+        if control_code == expected_control_code {
+            return true;
+        }
+    }
+
+    false
+}
+
 fn smb2_header_offsets(chunk: &[u8]) -> Vec<usize> {
     let Some(first_offset) = first_smb2_header_offset(chunk) else {
         return Vec::new();
@@ -2215,6 +2307,13 @@ mod tests {
         let chunk = smb2_ioctl_request(0x0014_40F2);
 
         assert!(contains_smb2_server_side_copy_request(&chunk));
+    }
+
+    #[test]
+    fn detects_smb2_multichannel_interface_request() {
+        let chunk = smb2_ioctl_request(0x0014_01FC);
+
+        assert!(contains_smb2_network_interface_info_request(&chunk));
     }
 
     #[test]

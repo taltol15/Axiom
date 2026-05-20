@@ -352,6 +352,24 @@ select_dns_interface() {
   done
 }
 
+select_dns_upstream_interface() {
+  if use_tui; then
+    if DNS_UPSTREAM_INTERFACE="$(select_interface_tui "Select the interface Axiom should use to reach upstream DNS resolvers")"; then
+      return
+    fi
+  fi
+
+  while true; do
+    print_interfaces
+    read -r -p "Select the upstream DNS egress interface [number]: " selection
+    if [[ "${selection}" =~ ^[0-9]+$ ]] && ((selection >= 1 && selection <= ${#INTERFACES[@]})); then
+      DNS_UPSTREAM_INTERFACE="${INTERFACES[$((selection - 1))]}"
+      return
+    fi
+    echo "Invalid interface selection."
+  done
+}
+
 is_ipv4() {
   local value="$1"
   local octets
@@ -751,10 +769,10 @@ collect_configuration() {
     DNS_BIND_IP="$(prompt_ipv4 "DNS listen IPv4 for ${DNS_INTERFACE}" "${discovered_dns_ip}")"
     DNS_UDP_PORT="$(prompt_port "DNS UDP port" "${DNS_DEFAULT_PORT}")"
     DNS_TCP_PORT="$(prompt_port "DNS TCP port" "${DNS_DEFAULT_PORT}")"
-    DNS_UPSTREAM_INTERFACE="${DNS_INTERFACE}"
+    select_dns_upstream_interface
     configure_dns_upstreams
 
-    if prompt_yes_no "Enable the built-in URLhaus DNS threat feed" "yes"; then
+    if prompt_yes_no "Enable the built-in URLhaus DNS threat feed (can block domains immediately)" "no"; then
       DNS_THREAT_FEED_URLS=("${DNS_DEFAULT_THREAT_FEED_URL}")
     fi
   fi
@@ -811,7 +829,7 @@ write_config() {
       printf "]\n"
       echo "cache_ttl_seconds = 300"
       echo "cache_max_entries = 100000"
-      echo "query_timeout_millis = 1500"
+      echo "query_timeout_millis = 1000"
       echo "threat_feed_refresh_seconds = 3600"
       echo
       echo "[dns.policy]"
@@ -829,6 +847,7 @@ write_config() {
       printf "]\n"
       echo "block_response = \"nxdomain\""
       echo "sinkhole_ipv4 = \"0.0.0.0\""
+      echo "local_records = []"
       echo
     fi
     echo "[policy.smb]"

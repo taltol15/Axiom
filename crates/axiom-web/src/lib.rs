@@ -7,10 +7,12 @@ use std::{
 };
 
 use anyhow::Context;
-use axiom_config::{AdminCredentials, AxiomConfig, PolicyConfig, ProxyListenerConfig};
+use axiom_config::{
+    AdminCredentials, AxiomConfig, DnsPolicyConfig, PolicyConfig, ProxyListenerConfig,
+};
 use axiom_core::{
-    InspectionContext, InspectionResult, PolicyRuntimeSnapshot, RuntimeState, StatusSnapshot,
-    TrafficDirection,
+    DnsPolicyRuntimeSnapshot, InspectionContext, InspectionResult, PolicyRuntimeSnapshot,
+    RuntimeState, StatusSnapshot, TrafficDirection,
 };
 use axiom_net::bind_tcp_listener_to_interface;
 use axum::{
@@ -63,6 +65,10 @@ pub async fn run_management_server(
         .route("/api/status", get(api_status))
         .route("/api/diagnostics", get(api_diagnostics))
         .route("/api/policies", get(api_policies).put(api_update_policies))
+        .route(
+            "/api/dns-policy",
+            get(api_dns_policy).put(api_update_dns_policy),
+        )
         .route("/api/policies/self-test", post(api_policy_self_test))
         .route("/api/login", post(api_login))
         .route("/api/logout", post(api_logout))
@@ -186,6 +192,74 @@ async fn api_update_policies(
         process_id: std::process::id(),
         config_path: state.config_path.display().to_string(),
         policy_runtime: runtime_policy,
+    })
+    .into_response()
+}
+
+async fn api_dns_policy(headers: HeaderMap, State(state): State<Arc<WebState>>) -> Response {
+    if !is_authorized(&headers, &state) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(ErrorResponse {
+                message: "authentication required",
+            }),
+        )
+            .into_response();
+    }
+
+    Json(state.runtime.dns_policy_config()).into_response()
+}
+
+async fn api_update_dns_policy(
+    headers: HeaderMap,
+    State(state): State<Arc<WebState>>,
+    Json(policy): Json<DnsPolicyConfig>,
+) -> Response {
+    if !is_authorized(&headers, &state) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(ErrorResponse {
+                message: "authentication required",
+            }),
+        )
+            .into_response();
+    }
+
+    if let Err(error) = policy.validate() {
+        warn!(?error, "invalid DNS policy update rejected");
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                message: "invalid DNS policy configuration",
+            }),
+        )
+            .into_response();
+    }
+
+    let persisted = {
+        let mut config = state.config.lock().expect("web config mutex poisoned");
+        config.dns.policy = policy.clone();
+        persist_config(&state.config_path, &config)
+    };
+
+    if let Err(error) = persisted {
+        warn!(?error, "failed persisting DNS policy update");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                message: "failed saving DNS policy configuration",
+            }),
+        )
+            .into_response();
+    }
+
+    let dns_policy_runtime = state.runtime.update_dns_policy(policy);
+
+    Json(DnsPolicyUpdateResponse {
+        message: "DNS policy updated and applied to the running resolver",
+        process_id: std::process::id(),
+        config_path: state.config_path.display().to_string(),
+        dns_policy_runtime,
     })
     .into_response()
 }
@@ -566,6 +640,7 @@ struct DnsStatus {
     threat_feed_urls: Vec<String>,
     blocked_domains: usize,
     monitored_domains: usize,
+    local_records: usize,
     block_response: String,
 }
 
@@ -581,6 +656,7 @@ impl From<&axiom_config::DnsConfig> for DnsStatus {
             threat_feed_urls: config.policy.threat_feed_urls.clone(),
             blocked_domains: config.policy.blocked_domains.len(),
             monitored_domains: config.policy.monitored_domains.len(),
+            local_records: config.policy.local_records.len(),
             block_response: format!("{:?}", config.policy.block_response).to_ascii_lowercase(),
         }
     }
@@ -625,6 +701,14 @@ struct PolicyUpdateResponse {
     process_id: u32,
     config_path: String,
     policy_runtime: PolicyRuntimeSnapshot,
+}
+
+#[derive(Debug, Serialize)]
+struct DnsPolicyUpdateResponse {
+    message: &'static str,
+    process_id: u32,
+    config_path: String,
+    dns_policy_runtime: DnsPolicyRuntimeSnapshot,
 }
 
 #[derive(Debug, Serialize)]
@@ -861,20 +945,21 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
 </head>
 <body class="min-h-screen bg-zinc-950 text-zinc-100">
   <header class="border-b border-zinc-800 bg-zinc-950/95">
-    <div class="mx-auto flex max-w-7xl flex-col gap-5 px-6 py-5 lg:flex-row lg:items-center lg:justify-between">
+    <div class="mx-auto flex max-w-7xl items-center justify-between gap-6 px-6 py-5">
       <div>
         <p class="text-sm font-medium uppercase tracking-[0.28em] text-emerald-300">Axiom</p>
         <h1 class="mt-1 text-2xl font-semibold text-white">Axiom Dashboard</h1>
       </div>
-      <div class="flex flex-col gap-3 lg:items-end">
-        <nav class="flex flex-wrap gap-2" aria-label="Dashboard sections">
-          <button data-view="overview" class="top-nav-button active rounded-md border border-zinc-700 px-3 py-2 text-sm font-medium text-zinc-200 transition hover:border-emerald-300 hover:text-emerald-100">Overview</button>
-          <button data-view="smb" class="top-nav-button rounded-md border border-zinc-700 px-3 py-2 text-sm font-medium text-zinc-200 transition hover:border-emerald-300 hover:text-emerald-100">SMB Protection</button>
-          <button data-view="dns" class="top-nav-button rounded-md border border-zinc-700 px-3 py-2 text-sm font-medium text-zinc-200 transition hover:border-emerald-300 hover:text-emerald-100">DNS Security</button>
-          <button data-view="audit" class="top-nav-button rounded-md border border-zinc-700 px-3 py-2 text-sm font-medium text-zinc-200 transition hover:border-emerald-300 hover:text-emerald-100">Global Audit Log</button>
-        </nav>
-        <button id="logout" class="self-start rounded-md border border-zinc-700 px-4 py-2 text-sm text-zinc-200 transition hover:border-red-400 hover:text-red-200 lg:self-end">Log out</button>
-      </div>
+      <button id="logout" class="rounded-md border border-zinc-700 px-4 py-2 text-sm text-zinc-200 transition hover:border-red-400 hover:text-red-200">Log out</button>
+    </div>
+    <div class="border-t border-zinc-800 bg-zinc-900/70">
+      <nav class="mx-auto flex max-w-7xl flex-wrap gap-2 px-6 py-3" aria-label="Dashboard sections">
+        <button data-view="overview" class="top-nav-button active rounded-md border border-zinc-700 px-4 py-2 text-sm font-medium text-zinc-200 transition hover:border-emerald-300 hover:text-emerald-100">Overview</button>
+        <button data-view="smb" class="top-nav-button rounded-md border border-zinc-700 px-4 py-2 text-sm font-medium text-zinc-200 transition hover:border-emerald-300 hover:text-emerald-100">SMB Protection</button>
+        <button data-view="dns" class="top-nav-button rounded-md border border-zinc-700 px-4 py-2 text-sm font-medium text-zinc-200 transition hover:border-emerald-300 hover:text-emerald-100">DNS Security</button>
+        <button data-view="audit" class="top-nav-button rounded-md border border-zinc-700 px-4 py-2 text-sm font-medium text-zinc-200 transition hover:border-emerald-300 hover:text-emerald-100">Global Audit Log</button>
+        <button data-view="settings" class="top-nav-button rounded-md border border-zinc-700 px-4 py-2 text-sm font-medium text-zinc-200 transition hover:border-emerald-300 hover:text-emerald-100">Settings</button>
+      </nav>
     </div>
   </header>
 
@@ -1160,6 +1245,51 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
         <div id="dns-policy-summary" class="divide-y divide-zinc-800"></div>
       </section>
     </section>
+
+    <section class="mt-8 rounded-lg border border-zinc-800 bg-zinc-900">
+      <div class="flex flex-col gap-4 border-b border-zinc-800 px-6 py-5 md:flex-row md:items-center md:justify-between">
+        <div>
+          <h2 class="text-xl font-semibold text-white">DNS Policies and Local Records</h2>
+          <p id="dns-policy-state" class="mt-1 text-sm text-zinc-400">Loading DNS policy</p>
+        </div>
+        <button id="save-dns-policy" class="rounded-md bg-emerald-400 px-4 py-2 text-sm font-semibold text-zinc-950 transition hover:bg-emerald-300">Save and apply</button>
+      </div>
+      <div class="grid gap-6 p-6 lg:grid-cols-3">
+        <label class="block">
+          <span class="text-sm text-zinc-300">Blocked Domain Action</span>
+          <select id="dns-blocked-action" class="mt-2 w-full rounded-md border border-zinc-700 bg-zinc-950 px-3 py-2 text-white"></select>
+        </label>
+        <label class="block">
+          <span class="text-sm text-zinc-300">Monitored Domain Action</span>
+          <select id="dns-monitored-action" class="mt-2 w-full rounded-md border border-zinc-700 bg-zinc-950 px-3 py-2 text-white"></select>
+        </label>
+        <label class="block">
+          <span class="text-sm text-zinc-300">Block Response</span>
+          <select id="dns-block-response" class="mt-2 w-full rounded-md border border-zinc-700 bg-zinc-950 px-3 py-2 text-white">
+            <option value="nxdomain">nxdomain</option>
+            <option value="refused">refused</option>
+            <option value="sinkhole">sinkhole</option>
+          </select>
+        </label>
+        <label class="block">
+          <span class="text-sm text-zinc-300">Blocked Domains</span>
+          <textarea id="dns-blocked-domains" rows="6" spellcheck="false" class="mt-2 w-full rounded-md border border-zinc-700 bg-zinc-950 px-4 py-3 font-mono text-sm text-white"></textarea>
+        </label>
+        <label class="block">
+          <span class="text-sm text-zinc-300">Monitored Domains</span>
+          <textarea id="dns-monitored-domains" rows="6" spellcheck="false" class="mt-2 w-full rounded-md border border-zinc-700 bg-zinc-950 px-4 py-3 font-mono text-sm text-white"></textarea>
+        </label>
+        <label class="block">
+          <span class="text-sm text-zinc-300">Threat Feed URLs</span>
+          <textarea id="dns-threat-feeds" rows="6" spellcheck="false" class="mt-2 w-full rounded-md border border-zinc-700 bg-zinc-950 px-4 py-3 font-mono text-sm text-white"></textarea>
+        </label>
+        <label class="block lg:col-span-3">
+          <span class="text-sm text-zinc-300">Local DNS Records</span>
+          <textarea id="dns-local-records" rows="5" spellcheck="false" class="mt-2 w-full rounded-md border border-zinc-700 bg-zinc-950 px-4 py-3 font-mono text-sm text-white"></textarea>
+          <span class="mt-2 block text-xs text-zinc-500">Format: name|type|value|ttl. Example: intranet.local|a|10.0.0.5|300</span>
+        </label>
+      </div>
+    </section>
     </section>
 
     <section id="view-audit" class="dashboard-view">
@@ -1186,7 +1316,54 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
       <pre id="diagnostics-output" class="max-h-96 overflow-auto whitespace-pre-wrap px-6 py-5 text-xs leading-5 text-zinc-300"></pre>
     </section>
     </section>
+
+    <section id="view-settings" class="dashboard-view">
+      <section class="rounded-lg border border-zinc-800 bg-zinc-900">
+        <div class="border-b border-zinc-800 px-6 py-5">
+          <h2 class="text-xl font-semibold text-white">Management Settings</h2>
+          <p id="settings-state" class="mt-1 text-sm text-zinc-400">Local console preferences and identity settings</p>
+        </div>
+        <div class="grid gap-6 p-6 lg:grid-cols-2">
+          <label class="block">
+            <span class="text-sm text-zinc-300">Display Name</span>
+            <input id="settings-display-name" type="text" class="mt-2 w-full rounded-md border border-zinc-700 bg-zinc-950 px-3 py-2 text-white">
+          </label>
+          <label class="block">
+            <span class="text-sm text-zinc-300">Theme</span>
+            <select id="settings-theme" class="mt-2 w-full rounded-md border border-zinc-700 bg-zinc-950 px-3 py-2 text-white">
+              <option value="system">system</option>
+              <option value="light">light</option>
+              <option value="dark">dark</option>
+            </select>
+          </label>
+          <div class="rounded-md border border-zinc-800 bg-zinc-950/50 p-4">
+            <p class="text-sm font-semibold text-white">Two-factor Authentication</p>
+            <p class="mt-2 text-sm text-zinc-500">TOTP enrollment will be enforced here before production rollout.</p>
+            <button disabled class="mt-4 rounded-md border border-zinc-700 px-3 py-2 text-sm text-zinc-500">2FA coming next</button>
+          </div>
+          <div class="rounded-md border border-zinc-800 bg-zinc-950/50 p-4">
+            <p class="text-sm font-semibold text-white">Directory Integration</p>
+            <p class="mt-2 text-sm text-zinc-500">Active Directory authentication and workstation enrichment will connect here.</p>
+            <button disabled class="mt-4 rounded-md border border-zinc-700 px-3 py-2 text-sm text-zinc-500">AD connector planned</button>
+          </div>
+        </div>
+        <div class="border-t border-zinc-800 px-6 py-5">
+          <button id="save-settings" class="rounded-md bg-emerald-400 px-4 py-2 text-sm font-semibold text-zinc-950 transition hover:bg-emerald-300">Save settings</button>
+        </div>
+      </section>
+    </section>
   </main>
+
+  <footer class="border-t border-zinc-800 bg-zinc-950 px-6 py-6 text-sm text-zinc-500">
+    <div class="mx-auto flex max-w-7xl flex-col gap-2 md:flex-row md:items-center md:justify-between">
+      <p>© 2026 Axiom Security. Lab build for authorized defensive testing only.</p>
+      <div class="flex flex-wrap gap-4">
+        <a class="hover:text-emerald-300" href="#">Documentation</a>
+        <a class="hover:text-emerald-300" href="#">Support</a>
+        <a class="hover:text-emerald-300" href="#">Privacy</a>
+      </div>
+    </div>
+  </footer>
 
   <script>
     const token = localStorage.getItem("axiomToken") || "";
@@ -1226,7 +1403,7 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
     }
 
     function setActiveView(name) {
-      const knownViews = new Set(["overview", "smb", "dns", "audit"]);
+      const knownViews = new Set(["overview", "smb", "dns", "audit", "settings"]);
       if (!knownViews.has(name)) name = "overview";
       document.querySelectorAll(".dashboard-view").forEach((section) => {
         section.classList.toggle("active", section.id === `view-${name}`);
@@ -1240,6 +1417,7 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
     function actionBadgeClass(action) {
       if (action === "block") return "border-red-400/40 bg-red-500/10 text-red-100";
       if (action === "monitor") return "border-amber-400/40 bg-amber-500/10 text-amber-100";
+      if (action === "error") return "border-orange-400/40 bg-orange-500/10 text-orange-100";
       return "border-emerald-400/40 bg-emerald-500/10 text-emerald-100";
     }
 
@@ -1336,7 +1514,7 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
               },
               {
                 title: "Threat feeds",
-                detail: `${dns.blocked_domains || 0} static blocks · ${dns.monitored_domains || 0} monitored domains`,
+                detail: `${dns.blocked_domains || 0} static blocks · ${dns.monitored_domains || 0} monitored domains · ${dns.local_records || 0} local records`,
                 value: (dns.threat_feed_urls || []).length
               },
               {
@@ -1366,9 +1544,9 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
       const forwardedBytes = Number(stats.bytes_client_to_server || 0) + Number(stats.bytes_server_to_client || 0);
       const streamBytes = Number(stats.stream_bytes_client_to_server || 0) + Number(stats.stream_bytes_server_to_client || 0);
 
-      document.getElementById("overview-smb-traffic").textContent = formatBytes(forwardedBytes);
+      document.getElementById("overview-smb-traffic").textContent = formatBytes(streamBytes);
       document.getElementById("overview-smb-detail").textContent =
-        `${formatBytes(streamBytes)} wire · ${formatBytes(stats.smb_write_bytes || 0)} uploaded · ${stats.active_connections || 0} active`;
+        `${formatBytes(forwardedBytes)} forwarded · ${formatBytes(stats.smb_write_bytes || 0)} uploaded · ${stats.active_connections || 0} active`;
       document.getElementById("overview-dns-queries").textContent = stats.dns_queries || 0;
       document.getElementById("overview-dns-detail").textContent =
         `${stats.dns_cache_hits || 0} cache hits · ${stats.dns_upstream_errors || 0} upstream errors`;
@@ -1533,7 +1711,7 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
       const dnsAuditEvents = dnsEvents.map((event) => ({
         source: "DNS",
         timestamp: Number(event.unix_timestamp_seconds || 0),
-        severity: event.action === "block" ? "critical" : event.action === "monitor" ? "warning" : "info",
+        severity: event.action === "block" ? "critical" : event.action === "monitor" || event.action === "error" ? "warning" : "info",
         kind: "dns_query",
         action: event.action,
         subject: event.query_name,
@@ -1608,6 +1786,77 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
         .map((signature) => `${signature.name}|${signature.mode}|${signature.pattern}`)
         .join("\n");
       document.getElementById("policy-state").textContent = "Policies loaded";
+    }
+
+    function linesToArray(id) {
+      return document.getElementById(id).value
+        .split("\n")
+        .map((line) => line.trim())
+        .filter(Boolean);
+    }
+
+    async function loadDnsPolicy() {
+      const response = await fetch("/api/dns-policy", { headers: authHeaders() });
+      if (response.status === 401) {
+        localStorage.removeItem("axiomToken");
+        window.location.href = "/login";
+        return;
+      }
+
+      const policy = await response.json();
+      fillModeSelect("dns-blocked-action", policy.blocked_domain_action);
+      fillModeSelect("dns-monitored-action", policy.monitored_domain_action);
+      document.getElementById("dns-block-response").value = policy.block_response || "nxdomain";
+      document.getElementById("dns-blocked-domains").value = (policy.blocked_domains || []).join("\n");
+      document.getElementById("dns-monitored-domains").value = (policy.monitored_domains || []).join("\n");
+      document.getElementById("dns-threat-feeds").value = (policy.threat_feed_urls || []).join("\n");
+      document.getElementById("dns-local-records").value = (policy.local_records || [])
+        .map((record) => `${record.name}|${record.type}|${record.value}|${record.ttl_seconds || 300}`)
+        .join("\n");
+      document.getElementById("dns-policy-state").textContent = "DNS policy loaded";
+    }
+
+    function readDnsPolicyPayload() {
+      const localRecords = linesToArray("dns-local-records").map((line) => {
+        const [name, recordType, value, ttl] = line.split("|").map((part) => (part || "").trim());
+        return {
+          name,
+          type: (recordType || "a").toLowerCase(),
+          value,
+          ttl_seconds: Number(ttl || 300)
+        };
+      }).filter((record) => record.name && record.value);
+
+      return {
+        blocked_domain_action: document.getElementById("dns-blocked-action").value,
+        monitored_domain_action: document.getElementById("dns-monitored-action").value,
+        blocked_domains: linesToArray("dns-blocked-domains"),
+        monitored_domains: linesToArray("dns-monitored-domains"),
+        threat_feed_urls: linesToArray("dns-threat-feeds"),
+        block_response: document.getElementById("dns-block-response").value,
+        sinkhole_ipv4: "0.0.0.0",
+        local_records: localRecords
+      };
+    }
+
+    async function saveDnsPolicy() {
+      document.getElementById("dns-policy-state").textContent = "Saving DNS policy";
+      const response = await fetch("/api/dns-policy", {
+        method: "PUT",
+        headers: authHeaders({ "Content-Type": "application/json" }),
+        body: JSON.stringify(readDnsPolicyPayload())
+      });
+
+      const payload = await response.json().catch(() => ({ message: "DNS policy save failed" }));
+      if (!response.ok) {
+        document.getElementById("dns-policy-state").textContent = payload.message || "DNS policy save failed";
+        return;
+      }
+
+      await loadDnsPolicy();
+      document.getElementById("dns-policy-state").textContent =
+        `Saved and active on PID ${payload.process_id} · generation ${payload.dns_policy_runtime.generation}`;
+      await refresh();
     }
 
     function readPolicyPayload() {
@@ -1761,14 +2010,29 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
       document.getElementById("diagnostics-state").textContent = "Diagnostics loaded";
     }
 
+    function loadLocalSettings() {
+      document.getElementById("settings-display-name").value =
+        localStorage.getItem("axiomDisplayName") || "Axiom Administrator";
+      document.getElementById("settings-theme").value =
+        localStorage.getItem("axiomTheme") || "system";
+    }
+
+    function saveLocalSettings() {
+      localStorage.setItem("axiomDisplayName", document.getElementById("settings-display-name").value.trim() || "Axiom Administrator");
+      localStorage.setItem("axiomTheme", document.getElementById("settings-theme").value);
+      document.getElementById("settings-state").textContent = `Settings saved locally · ${new Date().toLocaleTimeString()}`;
+    }
+
     document.getElementById("logout").addEventListener("click", async () => {
       await fetch("/api/logout", { method: "POST" });
       localStorage.removeItem("axiomToken");
       window.location.href = "/login";
     });
     document.getElementById("save-policies").addEventListener("click", savePolicies);
+    document.getElementById("save-dns-policy").addEventListener("click", saveDnsPolicy);
     document.getElementById("run-policy-self-test").addEventListener("click", runPolicySelfTest);
     document.getElementById("load-diagnostics").addEventListener("click", loadDiagnostics);
+    document.getElementById("save-settings").addEventListener("click", saveLocalSettings);
     document.querySelectorAll(".top-nav-button").forEach((button) => {
       button.addEventListener("click", () => setActiveView(button.dataset.view));
     });
@@ -1777,8 +2041,10 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
     });
 
     setActiveView(localStorage.getItem("axiomDashboardView") || "overview");
+    loadLocalSettings();
     refresh();
     loadPolicies();
+    loadDnsPolicy();
     setInterval(refresh, 2000);
   </script>
 </body>

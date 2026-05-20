@@ -25,9 +25,12 @@ blocked_domain_action = "block"
 monitored_domain_action = "monitor"
 blocked_domains = ["malware.test"]
 monitored_domains = ["suspicious.test"]
-threat_feed_urls = ["https://urlhaus.abuse.ch/downloads/hostfile/"]
+threat_feed_urls = []
 block_response = "nxdomain"
 sinkhole_ipv4 = "0.0.0.0"
+local_records = [
+  { name = "intranet.local", type = "a", value = "10.10.0.50", ttl_seconds = 300 },
+]
 
 [policy.smb]
 encrypted_payload = "monitor"

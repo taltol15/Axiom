@@ -25,12 +25,15 @@ directory, discovers NICs interactively, writes `/etc/axiom/axiom.toml`, builds
 the release binary, applies Linux capabilities, and starts `axiom.service`.
 
 During installation, the DNS Security Gateway can be enabled on a dedicated NIC.
-Axiom listens on UDP/TCP 53, checks domains against local policy and configured
-threat feeds, caches safe responses, and forwards allowed queries to the
-configured internal DC/upstream DNS servers.
+Axiom listens on UDP/TCP 53, checks domains against local policy and optional
+threat feeds, serves local DNS records, caches safe responses, and forwards
+allowed queries to the configured internal DC/upstream DNS servers. Threat feeds
+are opt-in during installation so a new lab does not start blocking domains
+before an explicit DNS policy is configured.
 
 Organizations without internal DNS can select public recursive upstreams during
-installation, including Cloudflare, Google, Quad9, or custom resolver IPs.
+installation, including Cloudflare, Google, Quad9, or custom resolver IPs. The
+installer also asks which NIC should be used for upstream resolver egress.
 When `whiptail` is available, the installer uses a terminal GUI/TUI; set
 `AXIOM_INSTALLER_CLI=1` to force the plain CLI wizard.
 
@@ -41,8 +44,13 @@ entropy detection, and custom byte signatures. Each rule can be set to
 `disabled`, `monitor`, or `block`. Policy changes are applied immediately and
 persisted back to `/etc/axiom/axiom.toml`.
 
-The same dashboard also shows DNS query volume, DNS blocks, cache hits, upstream
-errors, and recent DNS activity by client/domain/action.
+The same dashboard also includes DNS policy controls, local DNS records, DNS
+query volume, DNS blocks, cache hits, upstream errors, and recent DNS activity by
+client/domain/action.
+
+Axiom blocks SMB multichannel interface-discovery IOCTLs by default. This keeps
+Windows clients on the proxy path instead of learning backend file-server NICs
+and moving large file transfers around Axiom.
 
 The default MVP management login is:
 

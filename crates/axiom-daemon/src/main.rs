@@ -18,9 +18,10 @@ async fn main() -> anyhow::Result<()> {
         .with_context(|| format!("failed loading Axiom config from '{config_path}'"))?;
 
     let config_path = PathBuf::from(config_path);
-    let runtime = Arc::new(RuntimeState::new(StreamPolicy::from_config(
-        config.policy.clone(),
-    )));
+    let runtime = Arc::new(RuntimeState::new(
+        StreamPolicy::from_config(config.policy.clone()),
+        config.dns.policy.clone(),
+    ));
     let mut tasks = JoinSet::new();
 
     let web_config = config.clone();

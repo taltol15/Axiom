@@ -205,6 +205,8 @@ pub struct DnsPolicyConfig {
     pub block_response: DnsBlockResponse,
     #[serde(default = "default_dns_sinkhole_ipv4")]
     pub sinkhole_ipv4: Ipv4Addr,
+    #[serde(default)]
+    pub local_records: Vec<DnsLocalRecordConfig>,
 }
 
 impl Default for DnsPolicyConfig {
@@ -217,12 +219,13 @@ impl Default for DnsPolicyConfig {
             threat_feed_urls: Vec::new(),
             block_response: DnsBlockResponse::Nxdomain,
             sinkhole_ipv4: default_dns_sinkhole_ipv4(),
+            local_records: Vec::new(),
         }
     }
 }
 
 impl DnsPolicyConfig {
-    fn validate(&self) -> Result<(), ConfigError> {
+    pub fn validate(&self) -> Result<(), ConfigError> {
         for domain in self
             .blocked_domains
             .iter()
@@ -239,8 +242,60 @@ impl DnsPolicyConfig {
             }
         }
 
+        for record in &self.local_records {
+            record.validate()?;
+        }
+
         Ok(())
     }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct DnsLocalRecordConfig {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub record_type: DnsRecordType,
+    pub value: IpAddr,
+    #[serde(default = "default_dns_local_record_ttl_seconds")]
+    pub ttl_seconds: u32,
+}
+
+impl DnsLocalRecordConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        validate_dns_domain(&self.name)?;
+
+        match (self.record_type, self.value) {
+            (DnsRecordType::A, IpAddr::V4(_)) | (DnsRecordType::Aaaa, IpAddr::V6(_)) => {}
+            (DnsRecordType::A, _) => {
+                return Err(ConfigError::Invalid(format!(
+                    "dns.policy.local_records '{}' type A must use an IPv4 value",
+                    self.name
+                )));
+            }
+            (DnsRecordType::Aaaa, _) => {
+                return Err(ConfigError::Invalid(format!(
+                    "dns.policy.local_records '{}' type AAAA must use an IPv6 value",
+                    self.name
+                )));
+            }
+        }
+
+        if self.ttl_seconds == 0 {
+            return Err(ConfigError::Invalid(format!(
+                "dns.policy.local_records '{}' ttl_seconds must be greater than zero",
+                self.name
+            )));
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum DnsRecordType {
+    A,
+    Aaaa,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, Default, PartialEq, Eq)]
@@ -637,6 +692,10 @@ fn default_dns_threat_feed_refresh_seconds() -> u64 {
 
 fn default_dns_sinkhole_ipv4() -> Ipv4Addr {
     Ipv4Addr::new(0, 0, 0, 0)
+}
+
+fn default_dns_local_record_ttl_seconds() -> u32 {
+    300
 }
 
 fn default_signatures() -> Vec<SignaturePolicyConfig> {

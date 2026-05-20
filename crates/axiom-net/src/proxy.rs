@@ -9,8 +9,9 @@ use anyhow::Context;
 use axiom_config::ProxyListenerConfig;
 use axiom_core::{
     InspectionContext, InspectionResult, RuntimeState, Smb2CreateRequest, Smb2CreateResponse,
-    Smb2WriteRequest, ThreatEvent, TrafficDirection, contains_smb2_server_side_copy_request,
-    extract_smb2_create_requests, extract_smb2_create_responses, extract_smb2_write_requests,
+    Smb2WriteRequest, ThreatEvent, TrafficDirection, contains_smb2_network_interface_info_request,
+    contains_smb2_server_side_copy_request, extract_smb2_create_requests,
+    extract_smb2_create_responses, extract_smb2_write_requests,
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -283,6 +284,24 @@ async fn inspect_and_forward_frame(
         }
         for write_request in write_requests {
             telemetry.observe_write_request(state, &context, write_request);
+        }
+        if contains_smb2_network_interface_info_request(&frame) {
+            state.record_smb_multichannel_blocked(&context, frame.len() as u64);
+            warn!(
+                route = route.name,
+                interface = route.interface(),
+                peer = %peer_addr,
+                target = %target_addr,
+                "blocked SMB multichannel interface discovery to keep traffic on Axiom"
+            );
+
+            if let Some(response_writer) = block_response_writer
+                && let Some(response) = build_smb2_error_response(&frame, STATUS_ACCESS_DENIED)
+            {
+                response_writer.lock().await.write_all(&response).await?;
+            }
+
+            return Ok(());
         }
         if contains_smb2_server_side_copy_request(&frame) {
             state.record_server_side_copy_requested(&context);
