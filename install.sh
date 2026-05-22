@@ -8,6 +8,8 @@ BINARY_NAME="axiom-daemon"
 BINARY_SOURCE="${PROJECT_ROOT}/target/release/${BINARY_NAME}"
 BINARY_PATH="/usr/local/bin/${BINARY_NAME}"
 SERVICE_PATH="/etc/systemd/system/axiom.service"
+RESTART_HELPER_PATH="/usr/local/sbin/axiom-restart-service"
+SUDOERS_PATH="/etc/sudoers.d/axiom-management"
 SERVICE_USER="axiom"
 SERVICE_GROUP="axiom"
 MANAGEMENT_DEFAULT_PORT="8443"
@@ -69,6 +71,7 @@ install_missing_dependencies() {
     ["curl"]="curl"
     ["tar"]="tar"
     ["gzip"]="gzip"
+    ["sudo"]="sudo"
   )
 
   for command_name in "${!command_packages[@]}"; do
@@ -95,9 +98,10 @@ install_missing_dependencies() {
     cmake \
     openssl \
     pkg-config \
+    sudo \
     whiptail
 
-  for command_name in ip cmake systemctl setcap sha256sum sysctl curl tar gzip cc ld.bfd openssl; do
+  for command_name in ip cmake systemctl setcap sha256sum sysctl curl tar gzip cc ld.bfd openssl sudo visudo; do
     if ! command -v "${command_name}" >/dev/null 2>&1; then
       echo "Required command '${command_name}' is still unavailable after dependency installation." >&2
       exit 1
@@ -1100,8 +1104,10 @@ write_config() {
     echo
     echo "[management.tls]"
     echo "enabled = ${MANAGEMENT_TLS_ENABLED}"
-    if [[ "${MANAGEMENT_TLS_ENABLED}" == "true" ]]; then
+    if [[ -n "${MANAGEMENT_TLS_CERT_PATH}" ]]; then
       echo "cert_path = \"$(toml_escape "${MANAGEMENT_TLS_CERT_PATH}")\""
+    fi
+    if [[ -n "${MANAGEMENT_TLS_KEY_PATH}" ]]; then
       echo "key_path = \"$(toml_escape "${MANAGEMENT_TLS_KEY_PATH}")\""
     fi
     echo
@@ -1217,7 +1223,11 @@ write_config() {
 }
 
 prepare_tls_certificate() {
-  if [[ "${MANAGEMENT_TLS_ENABLED}" != "true" ]]; then
+  if [[ "${NODE_ROLE}" != "management" && "${NODE_ROLE}" != "standalone_lab" ]]; then
+    return
+  fi
+
+  if [[ -z "${MANAGEMENT_TLS_CERT_PATH}" || -z "${MANAGEMENT_TLS_KEY_PATH}" ]]; then
     return
   fi
 
@@ -1249,6 +1259,50 @@ prepare_tls_certificate() {
   ${SUDO} chown root:"${SERVICE_GROUP}" "${MANAGEMENT_TLS_CERT_PATH}" "${MANAGEMENT_TLS_KEY_PATH}"
   ${SUDO} chmod 0644 "${MANAGEMENT_TLS_CERT_PATH}"
   ${SUDO} chmod 0640 "${MANAGEMENT_TLS_KEY_PATH}"
+}
+
+write_service_restart_helper() {
+  if [[ "${NODE_ROLE}" != "management" && "${NODE_ROLE}" != "standalone_lab" ]]; then
+    return
+  fi
+
+  local systemctl_path
+  local systemd_run_path
+  local temp_helper
+  local temp_sudoers
+  systemctl_path="$(command -v systemctl)"
+  systemd_run_path="$(command -v systemd-run || true)"
+  temp_helper="$(mktemp)"
+  temp_sudoers="$(mktemp)"
+
+  cat > "${temp_helper}" <<EOF
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+SYSTEMCTL_PATH="${systemctl_path}"
+SYSTEMD_RUN_PATH="${systemd_run_path}"
+
+if [[ -n "\${SYSTEMD_RUN_PATH}" && -x "\${SYSTEMD_RUN_PATH}" ]]; then
+  exec "\${SYSTEMD_RUN_PATH}" \
+    --unit axiom-restart \
+    --on-active=1 \
+    --description "Restart Axiom service from Management UI" \
+    "\${SYSTEMCTL_PATH}" restart axiom.service
+fi
+
+exec "\${SYSTEMCTL_PATH}" restart axiom.service
+EOF
+
+  cat > "${temp_sudoers}" <<EOF
+Defaults:${SERVICE_USER} !requiretty
+${SERVICE_USER} ALL=(root) NOPASSWD: ${RESTART_HELPER_PATH}
+EOF
+
+  ${SUDO} visudo -cf "${temp_sudoers}" >/dev/null
+  ${SUDO} install -d -m 0755 "$(dirname "${RESTART_HELPER_PATH}")"
+  ${SUDO} install -m 0750 -o root -g "${SERVICE_GROUP}" "${temp_helper}" "${RESTART_HELPER_PATH}"
+  ${SUDO} install -m 0440 -o root -g root "${temp_sudoers}" "${SUDOERS_PATH}"
+  rm -f "${temp_helper}" "${temp_sudoers}"
 }
 
 build_and_install_binary() {
@@ -1322,7 +1376,13 @@ EOF
 
 write_systemd_service() {
   local temp_service
+  local no_new_privileges_line
   temp_service="$(mktemp)"
+  no_new_privileges_line="NoNewPrivileges=true"
+
+  if [[ "${NODE_ROLE}" == "management" || "${NODE_ROLE}" == "standalone_lab" ]]; then
+    no_new_privileges_line=""
+  fi
 
   cat > "${temp_service}" <<EOF
 [Unit]
@@ -1341,7 +1401,7 @@ RestartSec=2s
 Environment=RUST_LOG=axiom=info,axiom_daemon=info,axiom_dns=info
 AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_RAW
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_RAW
-NoNewPrivileges=true
+${no_new_privileges_line}
 PrivateTmp=true
 ProtectHome=true
 ProtectSystem=strict
@@ -1377,6 +1437,7 @@ print_summary() {
       echo "TLS certificate: ${MANAGEMENT_TLS_CERT_PATH}"
     else
       echo "Management UI: http://${MANAGEMENT_BIND_IP}:${MANAGEMENT_PORT}/"
+      echo "HTTPS can be enabled later in Settings using: ${MANAGEMENT_TLS_CERT_PATH}"
     fi
     echo "Enrollment token is available in the Management UI under Settings."
     if [[ "${DIRECTORY_ENABLED}" == "true" ]]; then
@@ -1406,6 +1467,7 @@ main() {
   collect_configuration
   ensure_service_user
   prepare_tls_certificate
+  write_service_restart_helper
   write_config
   build_and_install_binary
   if ((${#PROXY_INTERFACES[@]} > 0)); then

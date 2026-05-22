@@ -5,6 +5,7 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
     sync::{Arc, Mutex},
+    thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -38,6 +39,9 @@ use tracing::{info, warn};
 
 const SESSION_COOKIE_NAME: &str = "axiom_session";
 const SESSION_MAX_AGE_SECONDS: u64 = 8 * 60 * 60;
+const DEFAULT_MANAGEMENT_TLS_CERT_PATH: &str = "/etc/axiom/tls/axiom.crt";
+const DEFAULT_MANAGEMENT_TLS_KEY_PATH: &str = "/etc/axiom/tls/axiom.key";
+const AXIOM_RESTART_HELPER_PATH: &str = "/usr/local/sbin/axiom-restart-service";
 
 struct WebState {
     runtime: Arc<RuntimeState>,
@@ -86,6 +90,10 @@ pub async fn run_management_server(
         .route("/api/diagnostics", get(api_diagnostics))
         .route("/api/nodes/report", post(api_node_report))
         .route("/api/nodes/runtime-config", get(api_node_runtime_config))
+        .route(
+            "/api/management/tls",
+            get(api_management_tls).put(api_update_management_tls),
+        )
         .route("/api/enrollment-token", get(api_enrollment_token))
         .route(
             "/api/enrollment-token/rotate",
@@ -270,6 +278,133 @@ async fn api_node_runtime_config(
     .into_response()
 }
 
+async fn api_management_tls(headers: HeaderMap, State(state): State<Arc<WebState>>) -> Response {
+    if !is_authorized(&headers, &state) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(ErrorResponse {
+                message: "authentication required",
+            }),
+        )
+            .into_response();
+    }
+
+    let config = state.config.lock().expect("web config mutex poisoned");
+    Json(ManagementTlsResponse::from_config(
+        &config,
+        false,
+        "TLS settings loaded".to_string(),
+    ))
+    .into_response()
+}
+
+async fn api_update_management_tls(
+    headers: HeaderMap,
+    State(state): State<Arc<WebState>>,
+    Json(request): Json<ManagementTlsUpdateRequest>,
+) -> Response {
+    if !is_authorized(&headers, &state) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(ErrorResponse {
+                message: "authentication required",
+            }),
+        )
+            .into_response();
+    }
+
+    let restart_requested = request.restart_service.unwrap_or(true);
+    let response = {
+        let mut config = state.config.lock().expect("web config mutex poisoned");
+        let cert_path = normalized_tls_path(
+            request.cert_path,
+            &config.management.tls.cert_path,
+            DEFAULT_MANAGEMENT_TLS_CERT_PATH,
+        );
+        let key_path = normalized_tls_path(
+            request.key_path,
+            &config.management.tls.key_path,
+            DEFAULT_MANAGEMENT_TLS_KEY_PATH,
+        );
+
+        if request.enabled {
+            if !Path::new(&cert_path).is_file() {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(ManagementTlsResponse::from_config(
+                        &config,
+                        false,
+                        format!("certificate file was not found: {cert_path}"),
+                    )),
+                )
+                    .into_response();
+            }
+
+            if !Path::new(&key_path).is_file() {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(ManagementTlsResponse::from_config(
+                        &config,
+                        false,
+                        format!("private key file was not found: {key_path}"),
+                    )),
+                )
+                    .into_response();
+            }
+        }
+
+        let mut candidate = config.clone();
+        candidate.management.tls.enabled = request.enabled;
+        candidate.management.tls.cert_path = cert_path;
+        candidate.management.tls.key_path = key_path;
+
+        if let Err(error) = candidate.validate() {
+            warn!(?error, "invalid management TLS update rejected");
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ManagementTlsResponse::from_config(
+                    &candidate,
+                    false,
+                    "invalid TLS configuration".to_string(),
+                )),
+            )
+                .into_response();
+        }
+
+        if let Err(error) = persist_config(&state.config_path, &candidate) {
+            warn!(?error, "failed persisting management TLS update");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ManagementTlsResponse::from_config(
+                    &config,
+                    false,
+                    "failed saving TLS configuration".to_string(),
+                )),
+            )
+                .into_response();
+        }
+
+        let message = if restart_requested {
+            "TLS settings saved; Axiom service restart was scheduled".to_string()
+        } else {
+            "TLS settings saved; restart Axiom to apply the listener change".to_string()
+        };
+        *config = candidate;
+        ManagementTlsResponse::from_config(&config, false, message)
+    };
+
+    let mut response = response;
+    if restart_requested {
+        response.restart_scheduled = schedule_service_restart();
+        if !response.restart_scheduled {
+            response.message =
+                "TLS settings saved, but the restart helper could not be started".to_string();
+        }
+    }
+
+    Json(response).into_response()
+}
+
 async fn api_enrollment_token(headers: HeaderMap, State(state): State<Arc<WebState>>) -> Response {
     if !is_authorized(&headers, &state) {
         return (
@@ -285,15 +420,7 @@ async fn api_enrollment_token(headers: HeaderMap, State(state): State<Arc<WebSta
     Json(EnrollmentTokenResponse {
         token: config.node.enrollment_token.clone(),
         token_preview: token_preview(config.node.enrollment_token.as_deref()),
-        management_url: format!(
-            "{}://{}",
-            if config.management.tls.enabled {
-                "https"
-            } else {
-                "http"
-            },
-            config.management.listen_addr()
-        ),
+        management_url: current_management_url(&config),
         reporting_nodes: state
             .fleet_nodes
             .lock()
@@ -346,15 +473,7 @@ async fn api_rotate_enrollment_token(
         token_preview: token_preview(Some(&token)),
         management_url: {
             let config = state.config.lock().expect("web config mutex poisoned");
-            format!(
-                "{}://{}",
-                if config.management.tls.enabled {
-                    "https"
-                } else {
-                    "http"
-                },
-                config.management.listen_addr()
-            )
+            current_management_url(&config)
         },
         reporting_nodes: 0,
     })
@@ -1005,6 +1124,67 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
     diff == 0
 }
 
+fn normalized_tls_path(requested: Option<String>, current: &str, fallback: &str) -> String {
+    requested
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            let current = current.trim();
+            (!current.is_empty()).then(|| current.to_string())
+        })
+        .unwrap_or_else(|| fallback.to_string())
+}
+
+fn management_url(config: &AxiomConfig, https: bool) -> String {
+    format!(
+        "{}://{}",
+        if https { "https" } else { "http" },
+        config.management.listen_addr()
+    )
+}
+
+fn current_management_url(config: &AxiomConfig) -> String {
+    management_url(config, config.management.tls.enabled)
+}
+
+fn schedule_service_restart() -> bool {
+    match thread::Builder::new()
+        .name("axiom-service-restart".to_string())
+        .spawn(|| {
+            thread::sleep(Duration::from_millis(900));
+            let sudo_path = if Path::new("/usr/bin/sudo").is_file() {
+                "/usr/bin/sudo"
+            } else {
+                "sudo"
+            };
+
+            match Command::new(sudo_path)
+                .arg("-n")
+                .arg(AXIOM_RESTART_HELPER_PATH)
+                .status()
+            {
+                Ok(status) if status.success() => {
+                    info!("scheduled Axiom service restart through local helper");
+                }
+                Ok(status) => {
+                    warn!(
+                        ?status,
+                        "Axiom service restart helper returned non-zero status"
+                    );
+                }
+                Err(error) => {
+                    warn!(?error, "failed launching Axiom service restart helper");
+                }
+            }
+        }) {
+        Ok(_) => true,
+        Err(error) => {
+            warn!(?error, "failed spawning Axiom service restart task");
+            false
+        }
+    }
+}
+
 fn persist_config(path: &Path, config: &AxiomConfig) -> anyhow::Result<()> {
     let serialized = toml::to_string_pretty(config).context("failed serializing Axiom config")?;
 
@@ -1457,6 +1637,11 @@ struct NodeInfo {
 #[derive(Debug, Serialize)]
 struct ManagementSecurityStatus {
     https_enabled: bool,
+    cert_path: String,
+    key_path: String,
+    http_url: String,
+    https_url: String,
+    restart_command: String,
     directory_enabled: bool,
     directory_url: Option<String>,
     client_reverse_dns: bool,
@@ -1466,6 +1651,11 @@ impl ManagementSecurityStatus {
     fn from_config(config: &AxiomConfig) -> Self {
         Self {
             https_enabled: config.management.tls.enabled,
+            cert_path: tls_cert_path(config),
+            key_path: tls_key_path(config),
+            http_url: management_url(config, false),
+            https_url: management_url(config, true),
+            restart_command: "sudo systemctl restart axiom.service".to_string(),
             directory_enabled: config.management.directory.enabled,
             directory_url: config
                 .management
@@ -1475,6 +1665,22 @@ impl ManagementSecurityStatus {
             client_reverse_dns: config.management.directory.client_reverse_dns,
         }
     }
+}
+
+fn tls_cert_path(config: &AxiomConfig) -> String {
+    normalized_tls_path(
+        None,
+        &config.management.tls.cert_path,
+        DEFAULT_MANAGEMENT_TLS_CERT_PATH,
+    )
+}
+
+fn tls_key_path(config: &AxiomConfig) -> String {
+    normalized_tls_path(
+        None,
+        &config.management.tls.key_path,
+        DEFAULT_MANAGEMENT_TLS_KEY_PATH,
+    )
 }
 
 impl NodeInfo {
@@ -1528,6 +1734,41 @@ struct NodeAckResponse {
 struct NodeRuntimeConfigResponse {
     policy_runtime: PolicyRuntimeSnapshot,
     dns_policy_runtime: DnsPolicyRuntimeSnapshot,
+}
+
+#[derive(Debug, Deserialize)]
+struct ManagementTlsUpdateRequest {
+    enabled: bool,
+    cert_path: Option<String>,
+    key_path: Option<String>,
+    restart_service: Option<bool>,
+}
+
+#[derive(Debug, Serialize)]
+struct ManagementTlsResponse {
+    enabled: bool,
+    cert_path: String,
+    key_path: String,
+    current_url: String,
+    next_url: String,
+    restart_scheduled: bool,
+    restart_command: String,
+    message: String,
+}
+
+impl ManagementTlsResponse {
+    fn from_config(config: &AxiomConfig, restart_scheduled: bool, message: String) -> Self {
+        Self {
+            enabled: config.management.tls.enabled,
+            cert_path: tls_cert_path(config),
+            key_path: tls_key_path(config),
+            current_url: current_management_url(config),
+            next_url: current_management_url(config),
+            restart_scheduled,
+            restart_command: "sudo systemctl restart axiom.service".to_string(),
+            message,
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -2422,7 +2663,23 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
           <div class="rounded-md border border-zinc-800 bg-zinc-950/50 p-4">
             <p class="text-sm font-semibold text-white">Management Security</p>
             <p id="https-status" class="mt-2 text-sm text-zinc-500">Loading HTTPS status</p>
-            <p class="mt-1 text-xs text-zinc-500">Security headers are active on every response.</p>
+            <div class="mt-4 grid gap-3">
+              <label class="block">
+                <span class="text-xs font-semibold uppercase tracking-wide text-zinc-500">Certificate path</span>
+                <input id="tls-cert-path" type="text" class="mt-2 w-full rounded-md border border-zinc-700 bg-zinc-950 px-3 py-2 font-mono text-xs text-white">
+              </label>
+              <label class="block">
+                <span class="text-xs font-semibold uppercase tracking-wide text-zinc-500">Private key path</span>
+                <input id="tls-key-path" type="text" class="mt-2 w-full rounded-md border border-zinc-700 bg-zinc-950 px-3 py-2 font-mono text-xs text-white">
+              </label>
+              <div class="flex flex-wrap gap-2">
+                <button id="enable-https" class="rounded-md bg-emerald-400 px-3 py-2 text-sm font-semibold text-zinc-950 transition hover:bg-emerald-300">Enable HTTPS</button>
+                <button id="disable-https" class="rounded-md border border-zinc-700 px-3 py-2 text-sm text-zinc-200 transition hover:border-amber-300 hover:text-amber-200">Disable HTTPS</button>
+              </div>
+              <a id="tls-next-url" href="#" class="hidden text-sm font-semibold text-emerald-300 hover:text-emerald-200">Open updated management URL</a>
+              <p class="text-xs text-zinc-500">Installer creates a lab self-signed certificate here by default. Browser trust warnings are expected until a trusted enterprise certificate is installed.</p>
+              <code id="tls-restart-command" class="block rounded-md border border-zinc-800 bg-zinc-950 px-3 py-2 text-xs text-zinc-400">sudo systemctl restart axiom.service</code>
+            </div>
           </div>
           <div class="rounded-md border border-zinc-800 bg-zinc-950/50 p-4">
             <p class="text-sm font-semibold text-white">Two-factor Authentication</p>
@@ -2775,9 +3032,7 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
         `${stats.dns_monitored_queries || 0} monitored · ${stats.dns_udp_queries || 0} UDP · ${stats.dns_tcp_queries || 0} TCP`;
       document.getElementById("management-info").textContent = `${data.management_interface} at ${data.management_bind_addr}`;
       document.getElementById("refresh-state").textContent = `PID ${data.process_id} · ${data.config_path} · updated ${new Date().toLocaleTimeString()}`;
-      document.getElementById("https-status").textContent = data.security?.https_enabled
-        ? `HTTPS active at ${data.management_bind_addr}`
-        : `HTTP active at ${data.management_bind_addr}`;
+      updateTlsSettingsUi(data.security || {}, data.management_bind_addr);
       document.getElementById("directory-status").textContent = data.security?.directory_enabled
         ? `AD login enabled · ${text(data.security.directory_url)}`
         : "Local admin login only";
@@ -3336,6 +3591,80 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
       document.getElementById("diagnostics-state").textContent = "Diagnostics loaded";
     }
 
+    function updateTlsSettingsUi(security, bindAddr) {
+      const certInput = document.getElementById("tls-cert-path");
+      const keyInput = document.getElementById("tls-key-path");
+      const nextLink = document.getElementById("tls-next-url");
+
+      if (certInput && security.cert_path && document.activeElement !== certInput && !certInput.value) {
+        certInput.value = security.cert_path;
+      }
+      if (keyInput && security.key_path && document.activeElement !== keyInput && !keyInput.value) {
+        keyInput.value = security.key_path;
+      }
+
+      document.getElementById("https-status").textContent = security.https_enabled
+        ? `HTTPS active at ${bindAddr}`
+        : `HTTP active at ${bindAddr}; HTTPS can be enabled here`;
+
+      document.getElementById("tls-restart-command").textContent =
+        security.restart_command || "sudo systemctl restart axiom.service";
+
+      const nextUrl = security.https_enabled ? security.https_url : security.http_url;
+      if (nextUrl) {
+        nextLink.href = nextUrl;
+        nextLink.textContent = `Open ${nextUrl}`;
+        nextLink.classList.remove("hidden");
+      }
+    }
+
+    async function saveTlsSettings(enabled) {
+      const certPath = document.getElementById("tls-cert-path").value.trim();
+      const keyPath = document.getElementById("tls-key-path").value.trim();
+      const nextLink = document.getElementById("tls-next-url");
+
+      document.getElementById("https-status").textContent = enabled
+        ? "Saving HTTPS settings and restarting Axiom"
+        : "Saving HTTP settings and restarting Axiom";
+
+      const response = await fetch("/api/management/tls", {
+        method: "PUT",
+        headers: authHeaders({ "Content-Type": "application/json" }),
+        body: JSON.stringify({
+          enabled,
+          cert_path: certPath,
+          key_path: keyPath,
+          restart_service: true
+        })
+      });
+
+      const payload = await response.json().catch(() => ({
+        message: "TLS settings request failed"
+      }));
+
+      if (!response.ok) {
+        document.getElementById("https-status").textContent = payload.message || "TLS settings were rejected";
+        return;
+      }
+
+      if (payload.cert_path) {
+        document.getElementById("tls-cert-path").value = payload.cert_path;
+      }
+      if (payload.key_path) {
+        document.getElementById("tls-key-path").value = payload.key_path;
+      }
+
+      document.getElementById("https-status").textContent =
+        `${payload.message}. Open the updated URL after the service comes back.`;
+      if (payload.next_url) {
+        nextLink.href = payload.next_url;
+        nextLink.textContent = `Open ${payload.next_url}`;
+        nextLink.classList.remove("hidden");
+      }
+      document.getElementById("tls-restart-command").textContent =
+        payload.restart_command || "sudo systemctl restart axiom.service";
+    }
+
     function loadLocalSettings() {
       document.getElementById("settings-display-name").value =
         localStorage.getItem("axiomDisplayName") || "Axiom Administrator";
@@ -3361,6 +3690,8 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
     document.getElementById("save-settings").addEventListener("click", saveLocalSettings);
     document.getElementById("copy-enrollment-token").addEventListener("click", copyEnrollmentToken);
     document.getElementById("rotate-enrollment-token").addEventListener("click", rotateEnrollmentToken);
+    document.getElementById("enable-https").addEventListener("click", () => saveTlsSettings(true));
+    document.getElementById("disable-https").addEventListener("click", () => saveTlsSettings(false));
     document.querySelectorAll(".top-nav-button").forEach((button) => {
       button.addEventListener("click", () => setActiveView(button.dataset.view));
     });
