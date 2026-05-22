@@ -740,7 +740,7 @@ configure_management_tls() {
   MANAGEMENT_TLS_CERT_PATH="/etc/axiom/tls/axiom.crt"
   MANAGEMENT_TLS_KEY_PATH="/etc/axiom/tls/axiom.key"
 
-  if prompt_yes_no "Enable HTTPS for the Web Management UI" "yes"; then
+  if prompt_yes_no "Enable HTTPS for the Web Management UI" "no"; then
     MANAGEMENT_TLS_ENABLED="true"
     MANAGEMENT_TLS_CERT_PATH="$(prompt_optional "TLS certificate path" "${MANAGEMENT_TLS_CERT_PATH}")"
     MANAGEMENT_TLS_KEY_PATH="$(prompt_optional "TLS private key path" "${MANAGEMENT_TLS_KEY_PATH}")"
