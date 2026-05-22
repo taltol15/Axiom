@@ -61,6 +61,7 @@ install_missing_dependencies() {
   local missing_packages=()
   declare -A command_packages=(
     ["ip"]="iproute2"
+    ["cmake"]="cmake"
     ["systemctl"]="systemd"
     ["setcap"]="libcap2-bin"
     ["sha256sum"]="coreutils"
@@ -91,11 +92,12 @@ install_missing_dependencies() {
     ca-certificates \
     build-essential \
     binutils \
+    cmake \
     openssl \
     pkg-config \
     whiptail
 
-  for command_name in ip systemctl setcap sha256sum sysctl curl tar gzip cc ld.bfd openssl; do
+  for command_name in ip cmake systemctl setcap sha256sum sysctl curl tar gzip cc ld.bfd openssl; do
     if ! command -v "${command_name}" >/dev/null 2>&1; then
       echo "Required command '${command_name}' is still unavailable after dependency installation." >&2
       exit 1
