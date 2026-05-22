@@ -112,6 +112,8 @@ pub struct NodeConfig {
     pub management_url: Option<String>,
     #[serde(default)]
     pub enrollment_token: Option<String>,
+    #[serde(default)]
+    pub allow_invalid_management_tls: bool,
     #[serde(default = "default_heartbeat_interval_seconds")]
     pub heartbeat_interval_seconds: u64,
     #[serde(default)]
@@ -126,6 +128,7 @@ impl Default for NodeConfig {
             display_name: default_node_display_name(),
             management_url: None,
             enrollment_token: None,
+            allow_invalid_management_tls: false,
             heartbeat_interval_seconds: default_heartbeat_interval_seconds(),
             control: NodeControlConfig::default(),
         }
@@ -686,6 +689,10 @@ pub struct ManagementNicConfig {
     #[serde(default = "default_management_port")]
     pub port: u16,
     pub admin: AdminCredentials,
+    #[serde(default)]
+    pub tls: ManagementTlsConfig,
+    #[serde(default)]
+    pub directory: DirectoryConfig,
 }
 
 impl ManagementNicConfig {
@@ -701,6 +708,133 @@ impl ManagementNicConfig {
             ));
         }
         self.admin.validate()?;
+        self.tls.validate()?;
+        self.directory.validate()?;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ManagementTlsConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub cert_path: String,
+    #[serde(default)]
+    pub key_path: String,
+}
+
+impl Default for ManagementTlsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            cert_path: String::new(),
+            key_path: String::new(),
+        }
+    }
+}
+
+impl ManagementTlsConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        if !self.enabled {
+            return Ok(());
+        }
+
+        if self.cert_path.trim().is_empty() || self.key_path.trim().is_empty() {
+            return Err(ConfigError::Invalid(
+                "management.tls cert_path and key_path are required when TLS is enabled"
+                    .to_string(),
+            ));
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct DirectoryConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub url: String,
+    #[serde(default = "default_directory_user_bind_format")]
+    pub user_bind_format: String,
+    #[serde(default)]
+    pub bind_dn: Option<String>,
+    #[serde(default)]
+    pub bind_password: Option<String>,
+    #[serde(default)]
+    pub base_dn: String,
+    #[serde(default = "default_directory_user_filter")]
+    pub user_filter: String,
+    #[serde(default)]
+    pub required_group_dn: Option<String>,
+    #[serde(default = "default_directory_client_reverse_dns")]
+    pub client_reverse_dns: bool,
+}
+
+impl Default for DirectoryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            url: String::new(),
+            user_bind_format: default_directory_user_bind_format(),
+            bind_dn: None,
+            bind_password: None,
+            base_dn: String::new(),
+            user_filter: default_directory_user_filter(),
+            required_group_dn: None,
+            client_reverse_dns: default_directory_client_reverse_dns(),
+        }
+    }
+}
+
+impl DirectoryConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        if !self.enabled {
+            return Ok(());
+        }
+
+        if !(self.url.starts_with("ldap://") || self.url.starts_with("ldaps://")) {
+            return Err(ConfigError::Invalid(
+                "management.directory.url must start with ldap:// or ldaps://".to_string(),
+            ));
+        }
+
+        if !self.user_bind_format.contains("{username}") {
+            return Err(ConfigError::Invalid(
+                "management.directory.user_bind_format must contain {username}".to_string(),
+            ));
+        }
+
+        if self.base_dn.trim().is_empty() {
+            return Err(ConfigError::Invalid(
+                "management.directory.base_dn must not be empty when directory auth is enabled"
+                    .to_string(),
+            ));
+        }
+
+        if !self.user_filter.contains("{username}") {
+            return Err(ConfigError::Invalid(
+                "management.directory.user_filter must contain {username}".to_string(),
+            ));
+        }
+
+        let bind_dn_present = self
+            .bind_dn
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty());
+        let bind_password_present = self
+            .bind_password
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty());
+        if bind_dn_present != bind_password_present {
+            return Err(ConfigError::Invalid(
+                "management.directory bind_dn and bind_password must be configured together"
+                    .to_string(),
+            ));
+        }
+
         Ok(())
     }
 }
@@ -933,6 +1067,18 @@ fn default_node_control_enabled() -> bool {
 
 fn default_node_control_port() -> u16 {
     9443
+}
+
+fn default_directory_user_bind_format() -> String {
+    "{username}".to_string()
+}
+
+fn default_directory_user_filter() -> String {
+    "(sAMAccountName={username})".to_string()
+}
+
+fn default_directory_client_reverse_dns() -> bool {
+    true
 }
 
 fn default_signatures() -> Vec<SignaturePolicyConfig> {

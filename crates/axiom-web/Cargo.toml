@@ -13,6 +13,9 @@ axiom-control = { path = "../axiom-control" }
 axiom-core = { path = "../axiom-core" }
 axiom-net = { path = "../axiom-net" }
 axum.workspace = true
+axum-server.workspace = true
+getrandom.workspace = true
+ldap3.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true

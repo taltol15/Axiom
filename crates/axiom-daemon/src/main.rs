@@ -322,6 +322,7 @@ async fn run_node_agent(config: AxiomConfig, runtime: Arc<RuntimeState>) -> anyh
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(6))
         .user_agent("AxiomNodeAgent/0.1")
+        .danger_accept_invalid_certs(config.node.allow_invalid_management_tls)
         .build()
         .context("failed building node agent HTTP client")?;
     let mut interval = tokio::time::interval(Duration::from_secs(

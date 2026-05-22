@@ -3,6 +3,7 @@ role = "standalone_lab"
 node_id = "axiom-lab-01"
 display_name = "Axiom Standalone Lab"
 enrollment_token = "replace-with-random-token-for-lab-child-nodes"
+allow_invalid_management_tls = false
 heartbeat_interval_seconds = 5
 
 [node.control]
@@ -16,6 +17,13 @@ port = 8443
 [management.admin]
 username = "admin"
 password_hash = "sha256$6f3d970db1b6ea7a6a5fbeb048df1984$8d6a71d1567d30c18ccde438bdec831dcb7565e748a694ba1b485125807cfb32"
+
+[management.tls]
+enabled = false
+
+[management.directory]
+enabled = false
+client_reverse_dns = true
 
 [dns]
 enabled = true

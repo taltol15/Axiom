@@ -1,6 +1,7 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs,
+    net::IpAddr,
     path::{Path, PathBuf},
     process::Command,
     sync::{Arc, Mutex},
@@ -9,7 +10,8 @@ use std::{
 
 use anyhow::Context;
 use axiom_config::{
-    AdminCredentials, AxiomConfig, DnsPolicyConfig, NodeRole, PolicyConfig, ProxyListenerConfig,
+    AdminCredentials, AxiomConfig, DirectoryConfig, DnsPolicyConfig, NodeRole, PolicyConfig,
+    ProxyListenerConfig,
 };
 use axiom_control::{
     ControlApplyResponse, ControlPolicyBundle, EncryptedEnvelope, decrypt_payload, encrypt_payload,
@@ -21,11 +23,15 @@ use axiom_core::{
 use axiom_net::bind_tcp_listener_to_interface;
 use axum::{
     Json, Router,
+    body::Body,
     extract::State,
-    http::{HeaderMap, HeaderValue, StatusCode, header},
+    http::{HeaderMap, HeaderValue, Request, StatusCode, header},
+    middleware::{self, Next},
     response::{Html, IntoResponse, Redirect, Response},
     routing::{get, post},
 };
+use axum_server::tls_rustls::RustlsConfig;
+use ldap3::{LdapConnAsync, Scope, SearchEntry};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tracing::{info, warn};
@@ -38,6 +44,13 @@ struct WebState {
     config_path: PathBuf,
     config: Mutex<AxiomConfig>,
     fleet_nodes: Mutex<HashMap<String, FleetNodeStatus>>,
+    client_identities: Mutex<HashMap<String, ClientIdentityCacheEntry>>,
+}
+
+#[derive(Debug, Clone)]
+struct ClientIdentityCacheEntry {
+    hostname: String,
+    expires_unix_timestamp_seconds: u64,
 }
 
 pub async fn run_management_server(
@@ -62,6 +75,7 @@ pub async fn run_management_server(
         config_path,
         config: Mutex::new(config),
         fleet_nodes: Mutex::new(HashMap::new()),
+        client_identities: Mutex::new(HashMap::new()),
     });
 
     let app = Router::new()
@@ -72,6 +86,11 @@ pub async fn run_management_server(
         .route("/api/diagnostics", get(api_diagnostics))
         .route("/api/nodes/report", post(api_node_report))
         .route("/api/nodes/runtime-config", get(api_node_runtime_config))
+        .route("/api/enrollment-token", get(api_enrollment_token))
+        .route(
+            "/api/enrollment-token/rotate",
+            post(api_rotate_enrollment_token),
+        )
         .route("/api/policies", get(api_policies).put(api_update_policies))
         .route(
             "/api/dns-policy",
@@ -80,6 +99,7 @@ pub async fn run_management_server(
         .route("/api/policies/self-test", post(api_policy_self_test))
         .route("/api/login", post(api_login))
         .route("/api/logout", post(api_logout))
+        .layer(middleware::from_fn(add_security_headers))
         .with_state(state);
 
     info!(
@@ -88,8 +108,52 @@ pub async fn run_management_server(
         "management GUI server started"
     );
 
-    axum::serve(listener, app).await?;
+    if management.tls.enabled {
+        let tls_config =
+            RustlsConfig::from_pem_file(&management.tls.cert_path, &management.tls.key_path)
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed loading management TLS cert '{}' and key '{}'",
+                        management.tls.cert_path, management.tls.key_path
+                    )
+                })?;
+        axum_server::from_tcp_rustls(listener.into_std()?, tls_config)
+            .serve(app.into_make_service())
+            .await?;
+    } else {
+        axum::serve(listener, app).await?;
+    }
     Ok(())
+}
+
+async fn add_security_headers(request: Request<Body>, next: Next) -> Response {
+    let mut response = next.run(request).await;
+    let headers = response.headers_mut();
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert("x-frame-options", HeaderValue::from_static("DENY"));
+    headers.insert(
+        "referrer-policy",
+        HeaderValue::from_static("strict-origin-when-cross-origin"),
+    );
+    headers.insert(
+        "permissions-policy",
+        HeaderValue::from_static("camera=(), microphone=(), geolocation=()"),
+    );
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static(
+            "default-src 'self'; script-src 'self' https://cdn.tailwindcss.com 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'",
+        ),
+    );
+    headers.insert(
+        header::STRICT_TRANSPORT_SECURITY,
+        HeaderValue::from_static("max-age=31536000; includeSubDomains"),
+    );
+    response
 }
 
 async fn login_page(headers: HeaderMap, State(state): State<Arc<WebState>>) -> Response {
@@ -206,6 +270,97 @@ async fn api_node_runtime_config(
     Json(NodeRuntimeConfigResponse {
         policy_runtime: state.runtime.policy_runtime_snapshot(),
         dns_policy_runtime: state.runtime.dns_policy_runtime_snapshot(),
+    })
+    .into_response()
+}
+
+async fn api_enrollment_token(headers: HeaderMap, State(state): State<Arc<WebState>>) -> Response {
+    if !is_authorized(&headers, &state) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(ErrorResponse {
+                message: "authentication required",
+            }),
+        )
+            .into_response();
+    }
+
+    let config = state.config.lock().expect("web config mutex poisoned");
+    Json(EnrollmentTokenResponse {
+        token: config.node.enrollment_token.clone(),
+        token_preview: token_preview(config.node.enrollment_token.as_deref()),
+        management_url: format!(
+            "{}://{}",
+            if config.management.tls.enabled {
+                "https"
+            } else {
+                "http"
+            },
+            config.management.listen_addr()
+        ),
+        reporting_nodes: state
+            .fleet_nodes
+            .lock()
+            .expect("fleet nodes mutex poisoned")
+            .len(),
+    })
+    .into_response()
+}
+
+async fn api_rotate_enrollment_token(
+    headers: HeaderMap,
+    State(state): State<Arc<WebState>>,
+) -> Response {
+    if !is_authorized(&headers, &state) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(ErrorResponse {
+                message: "authentication required",
+            }),
+        )
+            .into_response();
+    }
+
+    let token = generate_enrollment_token();
+    let persisted = {
+        let mut config = state.config.lock().expect("web config mutex poisoned");
+        config.node.enrollment_token = Some(token.clone());
+        persist_config(&state.config_path, &config)
+    };
+
+    if let Err(error) = persisted {
+        warn!(?error, "failed rotating enrollment token");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                message: "failed rotating enrollment token",
+            }),
+        )
+            .into_response();
+    }
+
+    state
+        .fleet_nodes
+        .lock()
+        .expect("fleet nodes mutex poisoned")
+        .clear();
+
+    Json(EnrollmentTokenResponse {
+        token: Some(token.clone()),
+        token_preview: token_preview(Some(&token)),
+        management_url: {
+            let config = state.config.lock().expect("web config mutex poisoned");
+            format!(
+                "{}://{}",
+                if config.management.tls.enabled {
+                    "https"
+                } else {
+                    "http"
+                },
+                config.management.listen_addr()
+            )
+        },
+        reporting_nodes: 0,
     })
     .into_response()
 }
@@ -416,48 +571,59 @@ async fn api_login(
 ) -> Response {
     let provider = request.provider.unwrap_or(AuthProvider::Local);
 
-    if provider == AuthProvider::Ldap {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(LoginResponse {
-                authenticated: false,
-                token: None,
-                message: "ldap authentication is disabled in this deployment",
-            }),
-        )
-            .into_response();
-    }
-
     let admin = {
         let config = state.config.lock().expect("web config mutex poisoned");
         config.management.admin.clone()
     };
+    let tls_enabled = {
+        let config = state.config.lock().expect("web config mutex poisoned");
+        config.management.tls.enabled
+    };
+
+    if provider == AuthProvider::Ldap {
+        let directory = {
+            let config = state.config.lock().expect("web config mutex poisoned");
+            config.management.directory.clone()
+        };
+
+        if !directory.enabled {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(LoginResponse {
+                    authenticated: false,
+                    token: None,
+                    message: "directory authentication is disabled",
+                }),
+            )
+                .into_response();
+        }
+
+        match authenticate_directory_user(&directory, &request.username, &request.password).await {
+            Ok(()) => {
+                return authenticated_response(&admin, tls_enabled);
+            }
+            Err(error) => {
+                warn!(
+                    username = request.username,
+                    ?error,
+                    "directory login failed"
+                );
+                return (
+                    StatusCode::UNAUTHORIZED,
+                    Json(LoginResponse {
+                        authenticated: false,
+                        token: None,
+                        message: "invalid directory credentials",
+                    }),
+                )
+                    .into_response();
+            }
+        }
+    }
+
     let admin = &admin;
     if request.username == admin.username && verify_admin_password(admin, &request.password) {
-        let token = session_token(admin);
-        let cookie = format!(
-            "{SESSION_COOKIE_NAME}={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age={SESSION_MAX_AGE_SECONDS}"
-        );
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            header::SET_COOKIE,
-            HeaderValue::from_str(&cookie).unwrap_or_else(|_| {
-                HeaderValue::from_static(
-                    "axiom_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0",
-                )
-            }),
-        );
-
-        return (
-            StatusCode::OK,
-            headers,
-            Json(LoginResponse {
-                authenticated: true,
-                token: Some(token),
-                message: "authenticated",
-            }),
-        )
-            .into_response();
+        return authenticated_response(admin, tls_enabled);
     }
 
     warn!(username = request.username, "management login failed");
@@ -473,11 +639,47 @@ async fn api_login(
         .into_response()
 }
 
-async fn api_logout() -> Response {
+fn authenticated_response(admin: &AdminCredentials, tls_enabled: bool) -> Response {
+    let token = session_token(admin);
+    let secure_flag = if tls_enabled { "; Secure" } else { "" };
+    let cookie = format!(
+        "{SESSION_COOKIE_NAME}={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age={SESSION_MAX_AGE_SECONDS}{secure_flag}"
+    );
     let mut headers = HeaderMap::new();
     headers.insert(
         header::SET_COOKIE,
-        HeaderValue::from_static("axiom_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0"),
+        HeaderValue::from_str(&cookie).unwrap_or_else(|_| {
+            HeaderValue::from_static("axiom_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0")
+        }),
+    );
+
+    (
+        StatusCode::OK,
+        headers,
+        Json(LoginResponse {
+            authenticated: true,
+            token: Some(token),
+            message: "authenticated",
+        }),
+    )
+        .into_response()
+}
+
+async fn api_logout(State(state): State<Arc<WebState>>) -> Response {
+    let tls_enabled = {
+        let config = state.config.lock().expect("web config mutex poisoned");
+        config.management.tls.enabled
+    };
+    let secure_flag = if tls_enabled { "; Secure" } else { "" };
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::SET_COOKIE,
+        HeaderValue::from_str(&format!(
+            "axiom_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0{secure_flag}"
+        ))
+        .unwrap_or_else(|_| {
+            HeaderValue::from_static("axiom_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0")
+        }),
     );
 
     (
@@ -494,10 +696,14 @@ fn build_status_response(state: &WebState) -> StatusResponse {
     let config = state.config.lock().expect("web config mutex poisoned");
     let stats = state.runtime.snapshot();
     let deployment_warnings = build_deployment_warnings(&config, &stats);
+    let fleet_nodes = fleet_node_snapshots(state);
+    let client_identities =
+        resolve_client_identities(state, &config.management.directory, &stats, &fleet_nodes);
     StatusResponse {
         process_id: std::process::id(),
         config_path: state.config_path.display().to_string(),
         node: NodeInfo::from_config(&config),
+        security: ManagementSecurityStatus::from_config(&config),
         management_interface: config.management.interface.clone(),
         management_bind_addr: config.management.listen_addr().to_string(),
         configured_proxy_listeners: config.proxy_listeners.len(),
@@ -508,7 +714,8 @@ fn build_status_response(state: &WebState) -> StatusResponse {
             .collect(),
         dns: DnsStatus::from(&config.dns),
         deployment_warnings,
-        fleet_nodes: fleet_node_snapshots(state),
+        fleet_nodes,
+        client_identities,
         stats,
     }
 }
@@ -643,8 +850,130 @@ fn verify_admin_password(admin: &AdminCredentials, password: &str) -> bool {
     constant_time_eq(candidate.as_bytes(), expected_hash.as_bytes())
 }
 
+async fn authenticate_directory_user(
+    directory: &DirectoryConfig,
+    username: &str,
+    password: &str,
+) -> anyhow::Result<()> {
+    if username.trim().is_empty() || password.is_empty() {
+        return Err(anyhow::anyhow!("empty directory credentials"));
+    }
+
+    let (conn, mut ldap) = LdapConnAsync::new(&directory.url)
+        .await
+        .with_context(|| format!("failed connecting to directory {}", directory.url))?;
+    ldap3::drive!(conn);
+
+    let user_bind = directory
+        .user_bind_format
+        .replace("{username}", username.trim());
+    ldap.simple_bind(&user_bind, password)
+        .await
+        .context("directory user bind failed")?
+        .success()
+        .context("directory rejected user bind")?;
+
+    if let Some(required_group_dn) = directory
+        .required_group_dn
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        if let (Some(bind_dn), Some(bind_password)) = (
+            directory
+                .bind_dn
+                .as_deref()
+                .filter(|value| !value.is_empty()),
+            directory
+                .bind_password
+                .as_deref()
+                .filter(|value| !value.is_empty()),
+        ) {
+            ldap.simple_bind(bind_dn, bind_password)
+                .await
+                .context("directory service bind failed")?
+                .success()
+                .context("directory rejected service bind")?;
+        }
+
+        let filter = directory
+            .user_filter
+            .replace("{username}", &ldap_escape_filter_value(username.trim()));
+        let (entries, _) = ldap
+            .search(
+                &directory.base_dn,
+                Scope::Subtree,
+                &filter,
+                vec!["memberOf"],
+            )
+            .await
+            .context("directory group search failed")?
+            .success()
+            .context("directory group search returned an error")?;
+
+        let required_group = required_group_dn.to_ascii_lowercase();
+        let is_member = entries.into_iter().any(|entry| {
+            SearchEntry::construct(entry)
+                .attrs
+                .get("memberOf")
+                .map(|groups| {
+                    groups
+                        .iter()
+                        .any(|group| group.to_ascii_lowercase() == required_group)
+                })
+                .unwrap_or(false)
+        });
+
+        if !is_member {
+            let _ = ldap.unbind().await;
+            return Err(anyhow::anyhow!(
+                "directory user is not in the required group"
+            ));
+        }
+    }
+
+    let _ = ldap.unbind().await;
+    Ok(())
+}
+
+fn ldap_escape_filter_value(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'*' => escaped.push_str("\\2a"),
+            b'(' => escaped.push_str("\\28"),
+            b')' => escaped.push_str("\\29"),
+            b'\\' => escaped.push_str("\\5c"),
+            0 => escaped.push_str("\\00"),
+            _ => escaped.push(byte as char),
+        }
+    }
+    escaped
+}
+
 fn session_token(admin: &AdminCredentials) -> String {
     sha256_hex(format!("axiom-session:{}:{}", admin.username, admin.password_hash).as_bytes())
+}
+
+fn generate_enrollment_token() -> String {
+    let mut bytes = [0_u8; 32];
+    getrandom::fill(&mut bytes).expect("operating system random source is unavailable");
+    let mut token = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        token.push(hex_char(byte >> 4));
+        token.push(hex_char(byte & 0x0f));
+    }
+    token
+}
+
+fn token_preview(token: Option<&str>) -> String {
+    let Some(token) = token else {
+        return "not configured".to_string();
+    };
+    if token.len() <= 12 {
+        return token.to_string();
+    }
+    format!("{}...{}", &token[..6], &token[token.len() - 6..])
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -722,6 +1051,104 @@ fn run_diagnostic_command(command: &str, args: &[&str]) -> CommandOutput {
             stderr: error.to_string(),
         },
     }
+}
+
+fn resolve_client_identities(
+    state: &WebState,
+    directory: &DirectoryConfig,
+    stats: &StatusSnapshot,
+    fleet_nodes: &[FleetNodeStatus],
+) -> HashMap<String, String> {
+    if !directory.client_reverse_dns {
+        return HashMap::new();
+    }
+
+    let mut ips = HashSet::new();
+    if let Ok(value) = serde_json::to_value(stats) {
+        collect_client_ips_from_json(&value, &mut ips);
+    }
+    for node in fleet_nodes {
+        collect_client_ips_from_json(&node.stats, &mut ips);
+    }
+
+    let now = unix_timestamp_seconds();
+    let mut cache = state
+        .client_identities
+        .lock()
+        .expect("client identity cache mutex poisoned");
+    cache.retain(|_, entry| entry.expires_unix_timestamp_seconds > now);
+
+    for ip in ips.iter().take(96) {
+        if cache.contains_key(ip) {
+            continue;
+        }
+
+        if let Some(hostname) = reverse_lookup_hostname(ip) {
+            cache.insert(
+                ip.clone(),
+                ClientIdentityCacheEntry {
+                    hostname,
+                    expires_unix_timestamp_seconds: now + 3600,
+                },
+            );
+        }
+    }
+
+    cache
+        .iter()
+        .map(|(ip, entry)| (ip.clone(), entry.hostname.clone()))
+        .collect()
+}
+
+fn collect_client_ips_from_json(value: &serde_json::Value, ips: &mut HashSet<String>) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for key in ["peer_addr", "client_addr"] {
+                if let Some(raw) = map.get(key).and_then(serde_json::Value::as_str)
+                    && let Some(ip) = ip_from_endpoint(raw)
+                {
+                    ips.insert(ip);
+                }
+            }
+            for nested in map.values() {
+                collect_client_ips_from_json(nested, ips);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_client_ips_from_json(item, ips);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn ip_from_endpoint(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if let Ok(ip) = trimmed.parse::<IpAddr>() {
+        return Some(ip.to_string());
+    }
+
+    let without_port = trimmed.rsplit_once(':').map_or(trimmed, |(ip, _)| ip);
+    without_port.parse::<IpAddr>().ok().map(|ip| ip.to_string())
+}
+
+fn reverse_lookup_hostname(ip: &str) -> Option<String> {
+    let output = Command::new("getent").args(["hosts", ip]).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    stdout
+        .split_whitespace()
+        .nth(1)
+        .map(|value| value.trim_end_matches('.').to_string())
+        .filter(|value| !value.is_empty())
 }
 
 fn build_deployment_warnings(config: &AxiomConfig, stats: &StatusSnapshot) -> DeploymentWarnings {
@@ -994,6 +1421,7 @@ struct StatusResponse {
     process_id: u32,
     config_path: String,
     node: NodeInfo,
+    security: ManagementSecurityStatus,
     management_interface: String,
     management_bind_addr: String,
     configured_proxy_listeners: usize,
@@ -1001,6 +1429,7 @@ struct StatusResponse {
     dns: DnsStatus,
     deployment_warnings: DeploymentWarnings,
     fleet_nodes: Vec<FleetNodeStatus>,
+    client_identities: HashMap<String, String>,
     stats: StatusSnapshot,
 }
 
@@ -1027,6 +1456,29 @@ struct NodeInfo {
     role: NodeRole,
     management_url: Option<String>,
     heartbeat_interval_seconds: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct ManagementSecurityStatus {
+    https_enabled: bool,
+    directory_enabled: bool,
+    directory_url: Option<String>,
+    client_reverse_dns: bool,
+}
+
+impl ManagementSecurityStatus {
+    fn from_config(config: &AxiomConfig) -> Self {
+        Self {
+            https_enabled: config.management.tls.enabled,
+            directory_enabled: config.management.directory.enabled,
+            directory_url: config
+                .management
+                .directory
+                .enabled
+                .then(|| config.management.directory.url.clone()),
+            client_reverse_dns: config.management.directory.client_reverse_dns,
+        }
+    }
 }
 
 impl NodeInfo {
@@ -1080,6 +1532,14 @@ struct NodeAckResponse {
 struct NodeRuntimeConfigResponse {
     policy_runtime: PolicyRuntimeSnapshot,
     dns_policy_runtime: DnsPolicyRuntimeSnapshot,
+}
+
+#[derive(Debug, Serialize)]
+struct EnrollmentTokenResponse {
+    token: Option<String>,
+    token_preview: String,
+    management_url: String,
+    reporting_nodes: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -1284,6 +1744,35 @@ fn utf16le_test_payload(value: &str) -> Vec<u8> {
     payload
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn escapes_ldap_filter_values() {
+        assert_eq!(
+            ldap_escape_filter_value(r"tal*(ops)\admin"),
+            r"tal\2a\28ops\29\5cadmin"
+        );
+    }
+
+    #[test]
+    fn extracts_ip_from_socket_endpoint() {
+        assert_eq!(
+            ip_from_endpoint("10.0.0.22:50444"),
+            Some("10.0.0.22".to_string())
+        );
+    }
+
+    #[test]
+    fn token_preview_masks_long_tokens() {
+        assert_eq!(
+            token_preview(Some("abcdef1234567890")),
+            "abcdef...567890".to_string()
+        );
+    }
+}
+
 const LOGIN_HTML: &str = r##"<!doctype html>
 <html lang="en">
 <head>
@@ -1324,6 +1813,14 @@ const LOGIN_HTML: &str = r##"<!doctype html>
             <input id="password" name="password" type="password" autocomplete="current-password" required class="mt-2 w-full rounded-md border border-zinc-700 bg-zinc-950 px-4 py-3 text-white outline-none transition focus:border-emerald-400 focus:ring-2 focus:ring-emerald-400/20">
           </label>
 
+          <label class="block">
+            <span class="text-sm text-zinc-300">Provider</span>
+            <select id="provider" name="provider" class="mt-2 w-full rounded-md border border-zinc-700 bg-zinc-950 px-4 py-3 text-white outline-none transition focus:border-emerald-400 focus:ring-2 focus:ring-emerald-400/20">
+              <option value="local">Local Admin</option>
+              <option value="ldap">Active Directory</option>
+            </select>
+          </label>
+
           <button class="w-full rounded-md bg-emerald-400 px-4 py-3 font-semibold text-zinc-950 transition hover:bg-emerald-300 focus:outline-none focus:ring-2 focus:ring-emerald-300 focus:ring-offset-2 focus:ring-offset-zinc-950" type="submit">Log in</button>
           <p id="error" class="hidden rounded-md border border-red-500/30 bg-red-500/10 px-4 py-3 text-sm text-red-200"></p>
         </form>
@@ -1345,7 +1842,7 @@ const LOGIN_HTML: &str = r##"<!doctype html>
         body: JSON.stringify({
           username: document.getElementById("username").value,
           password: document.getElementById("password").value,
-          provider: "local"
+          provider: document.getElementById("provider").value
         })
       });
 
@@ -1680,6 +2177,21 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
         <div id="self-test-results" class="mt-4 grid gap-3 md:grid-cols-4"></div>
       </div>
 
+      <div class="grid gap-4 border-b border-zinc-800 px-6 py-5 md:grid-cols-3">
+        <div class="rounded-md border border-zinc-800 bg-zinc-950/50 p-4">
+          <p class="text-xs font-semibold uppercase tracking-wider text-zinc-500">Archive Handling</p>
+          <p id="policy-summary-archives" class="mt-2 text-lg font-semibold text-white">Loading</p>
+        </div>
+        <div class="rounded-md border border-zinc-800 bg-zinc-950/50 p-4">
+          <p class="text-xs font-semibold uppercase tracking-wider text-zinc-500">Signature Rules</p>
+          <p id="policy-summary-signatures" class="mt-2 text-lg font-semibold text-white">Loading</p>
+        </div>
+        <div class="rounded-md border border-zinc-800 bg-zinc-950/50 p-4">
+          <p class="text-xs font-semibold uppercase tracking-wider text-zinc-500">Entropy Detection</p>
+          <p id="policy-summary-entropy" class="mt-2 text-lg font-semibold text-white">Loading</p>
+        </div>
+      </div>
+
       <div class="grid gap-6 p-6 lg:grid-cols-[1fr_1fr]">
         <div>
           <h3 class="text-sm font-semibold uppercase tracking-wider text-zinc-400">SMB Transport Rules</h3>
@@ -1895,14 +2407,31 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
             </select>
           </label>
           <div class="rounded-md border border-zinc-800 bg-zinc-950/50 p-4">
-            <p class="text-sm font-semibold text-white">Two-factor Authentication</p>
-            <p class="mt-2 text-sm text-zinc-500">TOTP enrollment will be enforced here before production rollout.</p>
-            <button disabled class="mt-4 rounded-md border border-zinc-700 px-3 py-2 text-sm text-zinc-500">2FA coming next</button>
+            <div class="flex items-center justify-between gap-3">
+              <p class="text-sm font-semibold text-white">Node Enrollment Token</p>
+              <span id="enrollment-token-preview" class="rounded-full border border-emerald-400/40 px-2.5 py-1 text-xs font-semibold text-emerald-700">loading</span>
+            </div>
+            <input id="enrollment-token-value" readonly class="mt-3 w-full rounded-md border border-zinc-700 bg-zinc-950 px-3 py-2 font-mono text-xs text-white">
+            <div class="mt-3 flex flex-wrap gap-2">
+              <button id="copy-enrollment-token" class="rounded-md border border-zinc-700 px-3 py-2 text-sm text-zinc-200 transition hover:border-emerald-300 hover:text-emerald-200">Copy token</button>
+              <button id="rotate-enrollment-token" class="rounded-md border border-red-300 px-3 py-2 text-sm font-semibold text-red-700 transition hover:bg-red-50">Rotate token</button>
+            </div>
+            <p id="enrollment-token-state" class="mt-3 text-xs text-zinc-500">Token not loaded</p>
           </div>
           <div class="rounded-md border border-zinc-800 bg-zinc-950/50 p-4">
             <p class="text-sm font-semibold text-white">Directory Integration</p>
-            <p class="mt-2 text-sm text-zinc-500">Active Directory authentication and workstation enrichment will connect here.</p>
-            <button disabled class="mt-4 rounded-md border border-zinc-700 px-3 py-2 text-sm text-zinc-500">AD connector planned</button>
+            <p id="directory-status" class="mt-2 text-sm text-zinc-500">Loading directory status</p>
+            <p id="client-identity-status" class="mt-1 text-xs text-zinc-500">Loading client identity status</p>
+          </div>
+          <div class="rounded-md border border-zinc-800 bg-zinc-950/50 p-4">
+            <p class="text-sm font-semibold text-white">Management Security</p>
+            <p id="https-status" class="mt-2 text-sm text-zinc-500">Loading HTTPS status</p>
+            <p class="mt-1 text-xs text-zinc-500">Security headers are active on every response.</p>
+          </div>
+          <div class="rounded-md border border-zinc-800 bg-zinc-950/50 p-4">
+            <p class="text-sm font-semibold text-white">Two-factor Authentication</p>
+            <p class="mt-2 text-sm text-zinc-500">TOTP enrollment will be enforced in the next authentication hardening pass.</p>
+            <button disabled class="mt-4 rounded-md border border-zinc-700 px-3 py-2 text-sm text-zinc-500">2FA queued</button>
           </div>
         </div>
         <div class="border-t border-zinc-800 px-6 py-5">
@@ -1926,6 +2455,7 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
   <script>
     const token = localStorage.getItem("axiomToken") || "";
     const modes = ["disabled", "monitor", "block"];
+    let clientIdentities = {};
 
     function authHeaders(extra = {}) {
       return token ? { ...extra, Authorization: `Bearer ${token}` } : extra;
@@ -1944,6 +2474,19 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
 
     function text(value) {
       return value === null || value === undefined || value === "" ? "—" : String(value);
+    }
+
+    function endpointIp(value) {
+      const raw = text(value);
+      if (raw === "—") return "";
+      const parts = raw.split(":");
+      return parts.length > 1 ? parts.slice(0, -1).join(":") : raw;
+    }
+
+    function clientLabel(value) {
+      const ip = endpointIp(value);
+      const hostname = clientIdentities[ip];
+      return hostname ? `${hostname} (${text(value)})` : text(value);
     }
 
     function formatTime(seconds) {
@@ -2131,7 +2674,7 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
 
       renderList(
         "top-clients",
-        topCounts(dnsEvents, (event) => event.client_addr),
+        topCounts(dnsEvents, (event) => clientLabel(event.client_addr)),
         "No DNS clients observed yet."
       );
 
@@ -2144,7 +2687,7 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
           .slice(0, 10)
           .map((event) => ({
             title: event.query_name,
-            detail: `${text(event.client_addr)} · ${text(event.reason)}`,
+            detail: `${clientLabel(event.client_addr)} · ${text(event.reason)}`,
             value: "blocked",
             tone: "text-red-200"
           })),
@@ -2215,6 +2758,7 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
       }
 
       const data = await response.json();
+      clientIdentities = data.client_identities || {};
       const fleetNodes = data.fleet_nodes || [];
       const stats = aggregateStats(data.stats, fleetNodes);
       renderFleetNodes(data.node || {}, fleetNodes);
@@ -2235,6 +2779,15 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
         `${stats.dns_monitored_queries || 0} monitored · ${stats.dns_udp_queries || 0} UDP · ${stats.dns_tcp_queries || 0} TCP`;
       document.getElementById("management-info").textContent = `${data.management_interface} at ${data.management_bind_addr}`;
       document.getElementById("refresh-state").textContent = `PID ${data.process_id} · ${data.config_path} · updated ${new Date().toLocaleTimeString()}`;
+      document.getElementById("https-status").textContent = data.security?.https_enabled
+        ? `HTTPS active at ${data.management_bind_addr}`
+        : `HTTP active at ${data.management_bind_addr}`;
+      document.getElementById("directory-status").textContent = data.security?.directory_enabled
+        ? `AD login enabled · ${text(data.security.directory_url)}`
+        : "Local admin login only";
+      document.getElementById("client-identity-status").textContent = data.security?.client_reverse_dns
+        ? `${Object.keys(clientIdentities).length} client names resolved`
+        : "Client name resolution disabled";
       renderPolicyRuntime(stats.policy_runtime);
       renderDeploymentWarnings(data.deployment_warnings || {});
 
@@ -2257,7 +2810,7 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
           const actionClass = actionBadgeClass(event.action);
           return `
             <tr class="hover:bg-zinc-800/40">
-              <td class="whitespace-nowrap px-6 py-4 text-sm font-medium text-white">${text(event.client_addr)} · ${text(event.protocol).toUpperCase()}</td>
+              <td class="whitespace-nowrap px-6 py-4 text-sm font-medium text-white">${clientLabel(event.client_addr)} · ${text(event.protocol).toUpperCase()}</td>
               <td class="max-w-xs px-6 py-4 text-sm text-white">
                 <p class="truncate">${text(event.query_name)}</p>
                 <p class="mt-1 line-clamp-1 text-xs text-zinc-500">${text(event.reason)}</p>
@@ -2293,7 +2846,7 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
           const actionClass = blocked ? "border-red-400/40 bg-red-500/10 text-red-100" : monitored ? "border-amber-400/40 bg-amber-500/10 text-amber-100" : "border-emerald-400/40 bg-emerald-500/10 text-emerald-100";
           return `
             <tr class="hover:bg-zinc-800/40">
-              <td class="whitespace-nowrap px-6 py-4 text-sm font-medium text-white">${text(connection.peer_addr)}</td>
+              <td class="whitespace-nowrap px-6 py-4 text-sm font-medium text-white">${clientLabel(connection.peer_addr)}</td>
               <td class="whitespace-nowrap px-6 py-4 text-sm text-cyan-200">${text(connection.target_addr)}</td>
               <td class="whitespace-nowrap px-6 py-4 text-sm text-zinc-300">${text(connection.route_name)} · ${text(connection.interface)}</td>
               <td class="max-w-xs px-6 py-4 text-sm text-white">
@@ -2363,7 +2916,7 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
                 <p class="truncate">${text(activity.file_path)}</p>
                 <p class="mt-1 text-xs text-zinc-500">${text(activity.route_name)} · ${text(activity.interface)}</p>
               </td>
-              <td class="whitespace-nowrap px-6 py-4 text-sm text-zinc-300">${text(activity.peer_addr)}</td>
+              <td class="whitespace-nowrap px-6 py-4 text-sm text-zinc-300">${clientLabel(activity.peer_addr)}</td>
               <td class="whitespace-nowrap px-6 py-4 text-sm text-cyan-200">${text(activity.target_addr)}</td>
               <td class="whitespace-nowrap px-6 py-4 text-sm text-lime-200">${formatBytes(activity.smb_write_bytes || 0)} · ${text(activity.smb_write_requests || 0)} writes</td>
               <td class="whitespace-nowrap px-6 py-4 text-sm text-zinc-300">${text(activity.observed_events || 0)} seen · ${text(activity.blocked_events || 0)} blocked · ${text(activity.monitored_events || 0)} monitored</td>
@@ -2386,7 +2939,7 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
         action: event.action,
         subject: event.file_path || text(event.kind).replaceAll("_", " "),
         route: `${text(event.route_name)} · ${text(event.interface)} · ${text(event.direction)}`,
-        peer: event.peer_addr,
+        peer: clientLabel(event.peer_addr),
         target: event.target_addr,
         reason: `${text(event.reason)}${event.rule_name ? ` · ${text(event.rule_name)}` : ""}`
       }));
@@ -2398,7 +2951,7 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
         action: event.action,
         subject: event.query_name,
         route: `${text(event.protocol).toUpperCase()} · ${text(event.query_type)}${event.cache_hit ? " · cache hit" : ""}`,
-        peer: event.client_addr,
+        peer: clientLabel(event.client_addr),
         target: event.upstream_addr,
         reason: `${text(event.reason)} · rcode ${text(event.response_code)} · ${text(event.latency_millis)} ms`
       }));
@@ -2447,6 +3000,25 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
       element.value = value || "disabled";
     }
 
+    function renderSmbPolicySummary(policy) {
+      const archiveModes = [
+        policy.archive?.rar,
+        policy.archive?.seven_zip,
+        policy.archive?.zip,
+        policy.archive?.encrypted_zip
+      ];
+      const archiveBlocks = archiveModes.filter((mode) => mode === "block").length;
+      const signatureBlocks = (policy.signatures || []).filter((signature) => signature.mode === "block").length;
+      const signatureMonitors = (policy.signatures || []).filter((signature) => signature.mode === "monitor").length;
+
+      document.getElementById("policy-summary-archives").textContent =
+        `${archiveBlocks}/4 blocking`;
+      document.getElementById("policy-summary-signatures").textContent =
+        `${signatureBlocks} blocking · ${signatureMonitors} monitor`;
+      document.getElementById("policy-summary-entropy").textContent =
+        `${text(policy.entropy?.mode)} · threshold ${text(policy.entropy?.threshold)}`;
+    }
+
     async function loadPolicies() {
       const response = await fetch("/api/policies", { headers: authHeaders() });
       if (response.status === 401) {
@@ -2456,6 +3028,7 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
       }
 
       const policy = await response.json();
+      renderSmbPolicySummary(policy);
       fillModeSelect("policy-smb-encrypted-payload", policy.smb.encrypted_payload);
       fillModeSelect("policy-rar", policy.archive.rar);
       fillModeSelect("policy-seven-zip", policy.archive.seven_zip);
@@ -2496,6 +3069,57 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
         .map((record) => `${record.name}|${record.type}|${record.value}|${record.ttl_seconds || 300}`)
         .join("\n");
       document.getElementById("dns-policy-state").textContent = "DNS policy loaded";
+    }
+
+    async function loadEnrollmentToken() {
+      const response = await fetch("/api/enrollment-token", { headers: authHeaders() });
+      const payload = await response.json().catch(() => ({ message: "token load failed" }));
+      if (!response.ok) {
+        document.getElementById("enrollment-token-state").textContent = payload.message || "Token load failed";
+        return;
+      }
+
+      document.getElementById("enrollment-token-value").value = payload.token || "";
+      document.getElementById("enrollment-token-preview").textContent = payload.token_preview || "not configured";
+      document.getElementById("enrollment-token-state").textContent =
+        `${payload.reporting_nodes || 0} reporting nodes · management ${payload.management_url}`;
+    }
+
+    async function copyEnrollmentToken() {
+      const value = document.getElementById("enrollment-token-value").value;
+      if (!value) {
+        document.getElementById("enrollment-token-state").textContent = "No enrollment token configured";
+        return;
+      }
+      try {
+        await navigator.clipboard.writeText(value);
+        document.getElementById("enrollment-token-state").textContent = `Token copied · ${new Date().toLocaleTimeString()}`;
+      } catch (_) {
+        document.getElementById("enrollment-token-value").select();
+        document.getElementById("enrollment-token-state").textContent = "Token selected";
+      }
+    }
+
+    async function rotateEnrollmentToken() {
+      if (!confirm("Rotate the node enrollment token? Existing DNS and SMB nodes must be re-enrolled with the new token.")) {
+        return;
+      }
+
+      document.getElementById("enrollment-token-state").textContent = "Rotating token";
+      const response = await fetch("/api/enrollment-token/rotate", {
+        method: "POST",
+        headers: authHeaders()
+      });
+      const payload = await response.json().catch(() => ({ message: "token rotation failed" }));
+      if (!response.ok) {
+        document.getElementById("enrollment-token-state").textContent = payload.message || "Token rotation failed";
+        return;
+      }
+
+      document.getElementById("enrollment-token-value").value = payload.token || "";
+      document.getElementById("enrollment-token-preview").textContent = payload.token_preview || "rotated";
+      document.getElementById("enrollment-token-state").textContent = `Token rotated · management ${payload.management_url}`;
+      await refresh();
     }
 
     function readDnsPolicyPayload() {
@@ -2739,6 +3363,8 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
     document.getElementById("run-policy-self-test").addEventListener("click", runPolicySelfTest);
     document.getElementById("load-diagnostics").addEventListener("click", loadDiagnostics);
     document.getElementById("save-settings").addEventListener("click", saveLocalSettings);
+    document.getElementById("copy-enrollment-token").addEventListener("click", copyEnrollmentToken);
+    document.getElementById("rotate-enrollment-token").addEventListener("click", rotateEnrollmentToken);
     document.querySelectorAll(".top-nav-button").forEach((button) => {
       button.addEventListener("click", () => setActiveView(button.dataset.view));
     });
@@ -2751,6 +3377,7 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
     refresh();
     loadPolicies();
     loadDnsPolicy();
+    loadEnrollmentToken();
     setInterval(refresh, 2000);
   </script>
 </body>

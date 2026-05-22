@@ -23,8 +23,9 @@ smb_proxy       SMB proxy node enrolled to the management server
 standalone_lab  Single-machine lab mode
 ```
 
-The management server prints an enrollment token at the end of installation.
-Use that token when installing DNS and SMB nodes. Data-plane nodes post
+The management server exposes the node enrollment token in the Management UI
+under Settings, where admins can copy it or rotate it without logging in to
+Linux. Use that token when installing DNS and SMB nodes. Data-plane nodes post
 heartbeat/statistics to the management server and also expose a small control
 listener for policy push. When an admin clicks Save, the management server
 actively pushes the updated policy to the relevant DNS or SMB node. Control
@@ -63,6 +64,19 @@ installation, including Cloudflare, Google, Quad9, or custom resolver IPs. The
 installer also asks which NIC should be used for upstream resolver egress.
 When `whiptail` is available, the installer uses a terminal GUI/TUI; set
 `AXIOM_INSTALLER_CLI=1` to force the plain CLI wizard.
+
+The management role can enable HTTPS during installation. The installer can
+generate a local self-signed certificate for labs, while production deployments
+should replace it with an enterprise-issued certificate or trusted internal CA.
+If a DNS/SMB node points to an HTTPS management URL that uses a self-signed lab
+certificate, the installer asks whether that node should accept the private
+certificate for management heartbeat and policy recovery.
+
+Management login supports the local admin account and optional LDAP/Active
+Directory authentication. Directory settings are written under
+`[management.directory]`. When reverse DNS is enabled and the management server
+uses the DC/DNS resolver, client IPs in SMB and DNS telemetry are enriched with
+hostnames where PTR records exist.
 
 ## Policies
 

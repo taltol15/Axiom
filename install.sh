@@ -91,10 +91,11 @@ install_missing_dependencies() {
     ca-certificates \
     build-essential \
     binutils \
+    openssl \
     pkg-config \
     whiptail
 
-  for command_name in ip systemctl setcap sha256sum sysctl curl tar gzip cc ld.bfd; do
+  for command_name in ip systemctl setcap sha256sum sysctl curl tar gzip cc ld.bfd openssl; do
     if ! command -v "${command_name}" >/dev/null 2>&1; then
       echo "Required command '${command_name}' is still unavailable after dependency installation." >&2
       exit 1
@@ -668,6 +669,25 @@ prompt_nonempty() {
   done
 }
 
+prompt_optional() {
+  local prompt="$1"
+  local default_value="${2:-}"
+  local value
+
+  if use_tui; then
+    value="$(ui_input "${prompt}" "${default_value}")" || exit 1
+    printf "%s" "${value:-${default_value}}"
+  else
+    if [[ -n "${default_value}" ]]; then
+      printf "%s [%s]: " "${prompt}" "${default_value}" >&2
+    else
+      printf "%s [empty to skip]: " "${prompt}" >&2
+    fi
+    read -r value
+    printf "%s" "${value:-${default_value}}"
+  fi
+}
+
 prompt_admin_credentials() {
   ADMIN_USERNAME="$(prompt_nonempty "Set Web UI admin username")"
 
@@ -706,15 +726,79 @@ configure_management_ui() {
   discovered_management_ip="$(get_interface_ipv4 "${MANAGEMENT_INTERFACE}")"
   MANAGEMENT_BIND_IP="$(prompt_ipv4 "Management UI bind IPv4 for ${MANAGEMENT_INTERFACE}" "${discovered_management_ip}")"
   MANAGEMENT_PORT="$(prompt_port "Management UI TCP port" "${MANAGEMENT_DEFAULT_PORT}")"
+  configure_management_tls
+  configure_directory_integration
   prompt_admin_credentials
   ADMIN_PASSWORD_HASH="$(sha256_password_hash "${ADMIN_PASSWORD}")"
   unset ADMIN_PASSWORD
+}
+
+configure_management_tls() {
+  MANAGEMENT_TLS_ENABLED="false"
+  MANAGEMENT_TLS_CERT_PATH="/etc/axiom/tls/axiom.crt"
+  MANAGEMENT_TLS_KEY_PATH="/etc/axiom/tls/axiom.key"
+
+  if prompt_yes_no "Enable HTTPS for the Web Management UI" "yes"; then
+    MANAGEMENT_TLS_ENABLED="true"
+    MANAGEMENT_TLS_CERT_PATH="$(prompt_optional "TLS certificate path" "${MANAGEMENT_TLS_CERT_PATH}")"
+    MANAGEMENT_TLS_KEY_PATH="$(prompt_optional "TLS private key path" "${MANAGEMENT_TLS_KEY_PATH}")"
+  fi
+}
+
+configure_directory_integration() {
+  DIRECTORY_ENABLED="false"
+  DIRECTORY_URL=""
+  DIRECTORY_USER_BIND_FORMAT="{username}"
+  DIRECTORY_BIND_DN=""
+  DIRECTORY_BIND_PASSWORD=""
+  DIRECTORY_BASE_DN=""
+  DIRECTORY_USER_FILTER="(sAMAccountName={username})"
+  DIRECTORY_REQUIRED_GROUP_DN=""
+  DIRECTORY_CLIENT_REVERSE_DNS="true"
+
+  if ! prompt_yes_no "Enable Active Directory login for the Management UI" "no"; then
+    return
+  fi
+
+  DIRECTORY_ENABLED="true"
+  DIRECTORY_URL="$(prompt_nonempty "LDAP URL, for example ldap://192.168.0.10:389 or ldaps://dc01.domain.local:636")"
+  DIRECTORY_BASE_DN="$(prompt_nonempty "LDAP base DN, for example DC=example,DC=local")"
+  DIRECTORY_USER_BIND_FORMAT="$(prompt_optional "User bind format" "{username}")"
+  DIRECTORY_USER_FILTER="$(prompt_optional "User search filter" "(sAMAccountName={username})")"
+  DIRECTORY_REQUIRED_GROUP_DN="$(prompt_optional "Required admin group DN")"
+  DIRECTORY_BIND_DN="$(prompt_optional "Service bind DN for group checks")"
+  if [[ -n "${DIRECTORY_BIND_DN}" ]]; then
+    if use_tui; then
+      DIRECTORY_BIND_PASSWORD="$(ui_password "Service bind password")" || exit 1
+    else
+      read -r -s -p "Service bind password: " DIRECTORY_BIND_PASSWORD
+      echo
+    fi
+  fi
+
+  if prompt_yes_no "Resolve client names through reverse DNS" "yes"; then
+    DIRECTORY_CLIENT_REVERSE_DNS="true"
+  else
+    DIRECTORY_CLIENT_REVERSE_DNS="false"
+  fi
 }
 
 configure_agent_management_stub() {
   MANAGEMENT_INTERFACE="${LOCAL_AGENT_MANAGEMENT_INTERFACE}"
   MANAGEMENT_BIND_IP="${LOCAL_AGENT_MANAGEMENT_IP}"
   MANAGEMENT_PORT="${MANAGEMENT_DEFAULT_PORT}"
+  MANAGEMENT_TLS_ENABLED="false"
+  MANAGEMENT_TLS_CERT_PATH=""
+  MANAGEMENT_TLS_KEY_PATH=""
+  DIRECTORY_ENABLED="false"
+  DIRECTORY_URL=""
+  DIRECTORY_USER_BIND_FORMAT="{username}"
+  DIRECTORY_BIND_DN=""
+  DIRECTORY_BIND_PASSWORD=""
+  DIRECTORY_BASE_DN=""
+  DIRECTORY_USER_FILTER="(sAMAccountName={username})"
+  DIRECTORY_REQUIRED_GROUP_DN=""
+  DIRECTORY_CLIENT_REVERSE_DNS="false"
   ADMIN_USERNAME="local-agent-node"
   ADMIN_PASSWORD_HASH="$(sha256_password_hash "$(random_secret)")"
 }
@@ -722,6 +806,13 @@ configure_agent_management_stub() {
 configure_agent_registration() {
   NODE_MANAGEMENT_URL="$(prompt_nonempty "Management server URL, for example http://10.0.0.5:8443")"
   NODE_ENROLLMENT_TOKEN="$(prompt_nonempty "Enrollment token from the Axiom management server")"
+  NODE_ALLOW_INVALID_MANAGEMENT_TLS="false"
+
+  if [[ "${NODE_MANAGEMENT_URL}" == https://* ]]; then
+    if prompt_yes_no "Allow this node to trust a self-signed Management HTTPS certificate" "no"; then
+      NODE_ALLOW_INVALID_MANAGEMENT_TLS="true"
+    fi
+  fi
 }
 
 select_node_control_interface() {
@@ -883,9 +974,22 @@ collect_configuration() {
   NODE_ID=""
   NODE_DISPLAY_NAME=""
   NODE_CONTROL_ENABLED="false"
+  NODE_ALLOW_INVALID_MANAGEMENT_TLS="false"
   NODE_CONTROL_INTERFACE=""
   NODE_CONTROL_BIND_IP=""
   NODE_CONTROL_PORT="${NODE_CONTROL_DEFAULT_PORT}"
+  MANAGEMENT_TLS_ENABLED="false"
+  MANAGEMENT_TLS_CERT_PATH=""
+  MANAGEMENT_TLS_KEY_PATH=""
+  DIRECTORY_ENABLED="false"
+  DIRECTORY_URL=""
+  DIRECTORY_USER_BIND_FORMAT="{username}"
+  DIRECTORY_BIND_DN=""
+  DIRECTORY_BIND_PASSWORD=""
+  DIRECTORY_BASE_DN=""
+  DIRECTORY_USER_FILTER="(sAMAccountName={username})"
+  DIRECTORY_REQUIRED_GROUP_DN=""
+  DIRECTORY_CLIENT_REVERSE_DNS="false"
   PROXY_NAMES=()
   PROXY_INTERFACES=()
   PROXY_VLANS=()
@@ -972,6 +1076,7 @@ write_config() {
     if [[ -n "${NODE_ENROLLMENT_TOKEN}" ]]; then
       echo "enrollment_token = \"$(toml_escape "${NODE_ENROLLMENT_TOKEN}")\""
     fi
+    echo "allow_invalid_management_tls = ${NODE_ALLOW_INVALID_MANAGEMENT_TLS}"
     echo "heartbeat_interval_seconds = 5"
     echo
     echo "[node.control]"
@@ -990,6 +1095,30 @@ write_config() {
     echo "[management.admin]"
     echo "username = \"$(toml_escape "${ADMIN_USERNAME}")\""
     echo "password_hash = \"$(toml_escape "${ADMIN_PASSWORD_HASH}")\""
+    echo
+    echo "[management.tls]"
+    echo "enabled = ${MANAGEMENT_TLS_ENABLED}"
+    if [[ "${MANAGEMENT_TLS_ENABLED}" == "true" ]]; then
+      echo "cert_path = \"$(toml_escape "${MANAGEMENT_TLS_CERT_PATH}")\""
+      echo "key_path = \"$(toml_escape "${MANAGEMENT_TLS_KEY_PATH}")\""
+    fi
+    echo
+    echo "[management.directory]"
+    echo "enabled = ${DIRECTORY_ENABLED}"
+    echo "client_reverse_dns = ${DIRECTORY_CLIENT_REVERSE_DNS}"
+    if [[ "${DIRECTORY_ENABLED}" == "true" ]]; then
+      echo "url = \"$(toml_escape "${DIRECTORY_URL}")\""
+      echo "user_bind_format = \"$(toml_escape "${DIRECTORY_USER_BIND_FORMAT}")\""
+      if [[ -n "${DIRECTORY_BIND_DN}" ]]; then
+        echo "bind_dn = \"$(toml_escape "${DIRECTORY_BIND_DN}")\""
+        echo "bind_password = \"$(toml_escape "${DIRECTORY_BIND_PASSWORD}")\""
+      fi
+      echo "base_dn = \"$(toml_escape "${DIRECTORY_BASE_DN}")\""
+      echo "user_filter = \"$(toml_escape "${DIRECTORY_USER_FILTER}")\""
+      if [[ -n "${DIRECTORY_REQUIRED_GROUP_DN}" ]]; then
+        echo "required_group_dn = \"$(toml_escape "${DIRECTORY_REQUIRED_GROUP_DN}")\""
+      fi
+    fi
     echo
     echo "[dns]"
     echo "enabled = ${DNS_ENABLED}"
@@ -1083,6 +1212,41 @@ write_config() {
   ${SUDO} install -d -m 0770 -o root -g "${SERVICE_GROUP}" "${CONFIG_DIR}"
   ${SUDO} install -m 0660 -o root -g "${SERVICE_GROUP}" "${temp_config}" "${CONFIG_PATH}"
   rm -f "${temp_config}"
+}
+
+prepare_tls_certificate() {
+  if [[ "${MANAGEMENT_TLS_ENABLED}" != "true" ]]; then
+    return
+  fi
+
+  local tls_dir
+  tls_dir="$(dirname "${MANAGEMENT_TLS_CERT_PATH}")"
+  ${SUDO} install -d -m 0750 -o root -g "${SERVICE_GROUP}" "${tls_dir}"
+
+  if [[ -f "${MANAGEMENT_TLS_CERT_PATH}" && -f "${MANAGEMENT_TLS_KEY_PATH}" ]]; then
+    ${SUDO} chown root:"${SERVICE_GROUP}" "${MANAGEMENT_TLS_CERT_PATH}" "${MANAGEMENT_TLS_KEY_PATH}"
+    ${SUDO} chmod 0644 "${MANAGEMENT_TLS_CERT_PATH}"
+    ${SUDO} chmod 0640 "${MANAGEMENT_TLS_KEY_PATH}"
+    return
+  fi
+
+  local subject_alt_name
+  subject_alt_name="IP:${MANAGEMENT_BIND_IP},DNS:axiom-management"
+
+  ${SUDO} openssl req \
+    -x509 \
+    -nodes \
+    -newkey rsa:3072 \
+    -sha256 \
+    -days 825 \
+    -subj "/CN=${MANAGEMENT_BIND_IP}" \
+    -addext "subjectAltName=${subject_alt_name}" \
+    -keyout "${MANAGEMENT_TLS_KEY_PATH}" \
+    -out "${MANAGEMENT_TLS_CERT_PATH}"
+
+  ${SUDO} chown root:"${SERVICE_GROUP}" "${MANAGEMENT_TLS_CERT_PATH}" "${MANAGEMENT_TLS_KEY_PATH}"
+  ${SUDO} chmod 0644 "${MANAGEMENT_TLS_CERT_PATH}"
+  ${SUDO} chmod 0640 "${MANAGEMENT_TLS_KEY_PATH}"
 }
 
 build_and_install_binary() {
@@ -1206,8 +1370,16 @@ print_summary() {
   echo "Service: axiom.service"
   echo "Role: ${NODE_ROLE}"
   if [[ "${NODE_ROLE}" == "management" || "${NODE_ROLE}" == "standalone_lab" ]]; then
-    echo "Management UI: http://${MANAGEMENT_BIND_IP}:${MANAGEMENT_PORT}/"
-    echo "Enrollment token for DNS/SMB nodes: ${NODE_ENROLLMENT_TOKEN}"
+    if [[ "${MANAGEMENT_TLS_ENABLED}" == "true" ]]; then
+      echo "Management UI: https://${MANAGEMENT_BIND_IP}:${MANAGEMENT_PORT}/"
+      echo "TLS certificate: ${MANAGEMENT_TLS_CERT_PATH}"
+    else
+      echo "Management UI: http://${MANAGEMENT_BIND_IP}:${MANAGEMENT_PORT}/"
+    fi
+    echo "Enrollment token is available in the Management UI under Settings."
+    if [[ "${DIRECTORY_ENABLED}" == "true" ]]; then
+      echo "Directory login: ${DIRECTORY_URL}"
+    fi
   else
     echo "Management server: ${NODE_MANAGEMENT_URL}"
     echo "Node ID: ${NODE_ID}"
@@ -1231,6 +1403,7 @@ main() {
   load_interfaces
   collect_configuration
   ensure_service_user
+  prepare_tls_certificate
   write_config
   build_and_install_binary
   if ((${#PROXY_INTERFACES[@]} > 0)); then
