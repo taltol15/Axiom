@@ -1294,7 +1294,6 @@ exec "\${SYSTEMCTL_PATH}" restart axiom.service
 EOF
 
   cat > "${temp_sudoers}" <<EOF
-Defaults:${SERVICE_USER} !requiretty
 ${SERVICE_USER} ALL=(root) NOPASSWD: ${RESTART_HELPER_PATH}
 EOF
 
