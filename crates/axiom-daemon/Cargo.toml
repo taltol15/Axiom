@@ -13,6 +13,7 @@ axiom-control = { path = "../axiom-control" }
 axiom-core = { path = "../axiom-core" }
 axiom-dns = { path = "../axiom-dns" }
 axiom-net = { path = "../axiom-net" }
+axiom-reputation = { path = "../axiom-reputation" }
 axiom-web = { path = "../axiom-web" }
 axum.workspace = true
 reqwest.workspace = true

@@ -8,11 +8,15 @@ use std::{
 use anyhow::Context;
 use axiom_config::ProxyListenerConfig;
 use axiom_core::{
-    InspectionContext, InspectionResult, RuntimeState, Smb2CreateRequest, Smb2CreateResponse,
-    Smb2WriteRequest, ThreatEvent, TrafficDirection, contains_smb2_network_interface_info_request,
-    contains_smb2_server_side_copy_request, extract_smb2_create_requests,
-    extract_smb2_create_responses, extract_smb2_write_requests,
+    CompletedFileTransfer, InspectionContext, InspectionResult, RuntimeState, Smb2CloseRequest,
+    Smb2CreateRequest, Smb2CreateResponse, Smb2ReadRequest, Smb2ReadResponse, Smb2WriteRequest,
+    ThreatEvent, TrafficDirection, contains_smb2_network_interface_info_request,
+    contains_smb2_server_side_copy_request, extract_smb2_close_requests,
+    extract_smb2_create_requests, extract_smb2_create_responses, extract_smb2_read_requests,
+    extract_smb2_read_responses, extract_smb2_write_requests,
 };
+use md5::Md5;
+use sha2::{Digest, Sha256};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{
@@ -255,6 +259,21 @@ async fn inspect_and_forward_frame(
     } else {
         Vec::new()
     };
+    let read_requests = if direction == TrafficDirection::ClientToServer {
+        extract_smb2_read_requests(&frame)
+    } else {
+        Vec::new()
+    };
+    let close_requests = if direction == TrafficDirection::ClientToServer {
+        extract_smb2_close_requests(&frame)
+    } else {
+        Vec::new()
+    };
+    let read_responses = if direction == TrafficDirection::ServerToClient {
+        extract_smb2_read_responses(&frame)
+    } else {
+        Vec::new()
+    };
     let file_path_hint = if direction == TrafficDirection::ClientToServer {
         create_requests
             .first()
@@ -283,7 +302,13 @@ async fn inspect_and_forward_frame(
             telemetry.observe_create_request(state, &context, create_request, frame.len());
         }
         for write_request in write_requests {
-            telemetry.observe_write_request(state, &context, write_request);
+            telemetry.observe_write_request(state, &context, write_request, &frame);
+        }
+        for read_request in read_requests {
+            telemetry.observe_read_request(read_request);
+        }
+        for close_request in close_requests {
+            telemetry.observe_close_request(state, &context, close_request);
         }
         if contains_smb2_network_interface_info_request(&frame) {
             state.record_smb_multichannel_blocked(&context, frame.len() as u64);
@@ -309,6 +334,9 @@ async fn inspect_and_forward_frame(
     } else {
         for create_response in extract_smb2_create_responses(&frame) {
             telemetry.observe_create_response(create_response);
+        }
+        for read_response in read_responses {
+            telemetry.observe_read_response(&context, read_response, &frame);
         }
     }
 
@@ -482,6 +510,9 @@ fn build_smb2_error_response(request_frame: &[u8], status: u32) -> Option<Vec<u8
 struct ConnectionTelemetry {
     pending_create_paths: StdMutex<HashMap<u64, String>>,
     open_file_paths: StdMutex<HashMap<[u8; 16], String>>,
+    open_file_creation_times: StdMutex<HashMap<[u8; 16], Option<u64>>>,
+    pending_read_file_ids: StdMutex<HashMap<u64, [u8; 16]>>,
+    file_hashes: StdMutex<HashMap<[u8; 16], FileHashState>>,
     observed_file_paths: StdMutex<HashSet<String>>,
     latest_write_file_path: StdMutex<Option<String>>,
 }
@@ -521,7 +552,21 @@ impl ConnectionTelemetry {
         self.open_file_paths
             .lock()
             .expect("open file path mutex poisoned")
-            .insert(response.file_id, file_path);
+            .insert(response.file_id, file_path.clone());
+        self.open_file_creation_times
+            .lock()
+            .expect("open file creation time mutex poisoned")
+            .insert(
+                response.file_id,
+                response.creation_time_unix_timestamp_seconds,
+            );
+        self.file_hashes
+            .lock()
+            .expect("file hashes mutex poisoned")
+            .entry(response.file_id)
+            .or_insert_with(|| {
+                FileHashState::new(file_path, response.creation_time_unix_timestamp_seconds)
+            });
     }
 
     fn file_path_for_id(&self, file_id: &[u8; 16]) -> Option<String> {
@@ -544,6 +589,7 @@ impl ConnectionTelemetry {
         state: &RuntimeState,
         context: &InspectionContext<'_>,
         request: Smb2WriteRequest,
+        frame: &[u8],
     ) {
         let file_path = self
             .open_file_paths
@@ -558,10 +604,219 @@ impl ConnectionTelemetry {
                 .lock()
                 .expect("latest write file path mutex poisoned") = Some(file_path.clone());
             state.record_file_write_payload(context, &file_path, request.length as u64);
+            if let Some(payload) = request
+                .data_range
+                .and_then(|(start, end)| frame.get(start..end))
+            {
+                self.update_hash_for_file_id(
+                    &request.file_id,
+                    &file_path,
+                    context.direction,
+                    payload,
+                );
+            }
         } else {
             state.record_smb_write_payload_for_connection(context, request.length as u64);
         }
     }
+
+    fn observe_read_request(&self, request: Smb2ReadRequest) {
+        self.pending_read_file_ids
+            .lock()
+            .expect("pending read file ids mutex poisoned")
+            .insert(request.message_id, request.file_id);
+    }
+
+    fn observe_read_response(
+        &self,
+        context: &InspectionContext<'_>,
+        response: Smb2ReadResponse,
+        frame: &[u8],
+    ) {
+        let Some(file_id) = self
+            .pending_read_file_ids
+            .lock()
+            .expect("pending read file ids mutex poisoned")
+            .remove(&response.message_id)
+        else {
+            return;
+        };
+
+        let Some(file_path) = self.file_path_for_id(&file_id) else {
+            return;
+        };
+
+        if let Some(payload) = response
+            .data_range
+            .and_then(|(start, end)| frame.get(start..end))
+        {
+            self.update_hash_for_file_id(&file_id, &file_path, context.direction, payload);
+        }
+    }
+
+    fn observe_close_request(
+        &self,
+        state: &RuntimeState,
+        context: &InspectionContext<'_>,
+        request: Smb2CloseRequest,
+    ) {
+        let transfer = self
+            .file_hashes
+            .lock()
+            .expect("file hashes mutex poisoned")
+            .remove(&request.file_id)
+            .and_then(|hash_state| hash_state.finish(context));
+
+        self.open_file_paths
+            .lock()
+            .expect("open file path mutex poisoned")
+            .remove(&request.file_id);
+        self.open_file_creation_times
+            .lock()
+            .expect("open file creation time mutex poisoned")
+            .remove(&request.file_id);
+
+        if let Some(transfer) = transfer {
+            state.record_completed_file_transfer(transfer);
+        }
+    }
+
+    fn update_hash_for_file_id(
+        &self,
+        file_id: &[u8; 16],
+        file_path: &str,
+        direction: TrafficDirection,
+        payload: &[u8],
+    ) {
+        if payload.is_empty() {
+            return;
+        }
+
+        let creation_time = self
+            .open_file_creation_times
+            .lock()
+            .expect("open file creation time mutex poisoned")
+            .get(file_id)
+            .copied()
+            .flatten();
+
+        let mut hashes = self.file_hashes.lock().expect("file hashes mutex poisoned");
+        hashes
+            .entry(*file_id)
+            .or_insert_with(|| FileHashState::new(file_path.to_string(), creation_time))
+            .update(direction, payload);
+    }
+}
+
+#[derive(Debug)]
+struct FileHashState {
+    file_path: String,
+    creation_time: Option<u64>,
+    direction: Option<TrafficDirection>,
+    sha256: Sha256,
+    md5: Md5,
+    bytes: u64,
+    first_seen_unix_timestamp_seconds: u64,
+    last_seen_unix_timestamp_seconds: u64,
+}
+
+impl FileHashState {
+    fn new(file_path: String, creation_time: Option<u64>) -> Self {
+        let now = unix_timestamp_seconds();
+        Self {
+            file_path,
+            creation_time,
+            direction: None,
+            sha256: Sha256::new(),
+            md5: Md5::new(),
+            bytes: 0,
+            first_seen_unix_timestamp_seconds: now,
+            last_seen_unix_timestamp_seconds: now,
+        }
+    }
+
+    fn update(&mut self, direction: TrafficDirection, payload: &[u8]) {
+        self.direction = Some(direction);
+        self.sha256.update(payload);
+        self.md5.update(payload);
+        self.bytes = self.bytes.saturating_add(payload.len() as u64);
+        self.last_seen_unix_timestamp_seconds = unix_timestamp_seconds();
+    }
+
+    fn finish(self, context: &InspectionContext<'_>) -> Option<CompletedFileTransfer> {
+        if self.bytes == 0 {
+            return None;
+        }
+        let direction = self.direction.unwrap_or(context.direction);
+        let sha256 = hex_lower(&self.sha256.finalize());
+        let md5 = hex_lower(&self.md5.finalize());
+        let extension = file_extension(&self.file_path);
+        let mime_type = extension.as_deref().map(guess_mime_type);
+
+        Some(CompletedFileTransfer {
+            route_name: context.route_name.to_string(),
+            interface: context.interface.to_string(),
+            direction,
+            peer_addr: context.peer_addr,
+            target_addr: context.target_addr,
+            destination_share: Some(context.route_name.to_string()),
+            source_user: None,
+            file_name: self.file_path,
+            extension,
+            mime_type,
+            file_size: self.bytes,
+            creation_time: self.creation_time,
+            upload_timestamp: self.first_seen_unix_timestamp_seconds,
+            sha256,
+            md5,
+        })
+    }
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        output.push(HEX[(byte >> 4) as usize] as char);
+        output.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    output
+}
+
+fn file_extension(file_path: &str) -> Option<String> {
+    let name = file_path.rsplit(['\\', '/']).next().unwrap_or(file_path);
+    name.rsplit_once('.')
+        .map(|(_, extension)| extension.to_ascii_lowercase())
+        .filter(|extension| !extension.is_empty())
+}
+
+fn guess_mime_type(extension: &str) -> String {
+    match extension {
+        "txt" | "log" | "csv" => "text/plain",
+        "pdf" => "application/pdf",
+        "zip" => "application/zip",
+        "rar" => "application/vnd.rar",
+        "7z" => "application/x-7z-compressed",
+        "exe" | "dll" => "application/vnd.microsoft.portable-executable",
+        "doc" => "application/msword",
+        "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "xls" => "application/vnd.ms-excel",
+        "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "ppt" => "application/vnd.ms-powerpoint",
+        "pptx" => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        "jpg" | "jpeg" => "image/jpeg",
+        "png" => "image/png",
+        "gif" => "image/gif",
+        _ => "application/octet-stream",
+    }
+    .to_string()
+}
+
+fn unix_timestamp_seconds() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_else(|_| std::time::Duration::from_secs(0))
+        .as_secs()
 }
 
 struct ConnectionGuard {

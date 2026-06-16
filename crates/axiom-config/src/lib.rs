@@ -5,6 +5,7 @@ use std::{
     path::Path,
 };
 
+use axiom_reputation::KnownBadAction;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -535,6 +536,8 @@ pub struct PolicyConfig {
     pub archive: ArchivePolicyConfig,
     #[serde(default)]
     pub entropy: EntropyPolicyConfig,
+    #[serde(default)]
+    pub reputation: ReputationPolicyConfig,
     #[serde(default = "default_signatures")]
     pub signatures: Vec<SignaturePolicyConfig>,
 }
@@ -542,6 +545,7 @@ pub struct PolicyConfig {
 impl PolicyConfig {
     pub fn validate(&self) -> Result<(), ConfigError> {
         self.entropy.validate()?;
+        self.reputation.validate()?;
 
         for signature in &self.signatures {
             signature.validate()?;
@@ -557,6 +561,7 @@ impl Default for PolicyConfig {
             smb: SmbPolicyConfig::default(),
             archive: ArchivePolicyConfig::default(),
             entropy: EntropyPolicyConfig::default(),
+            reputation: ReputationPolicyConfig::default(),
             signatures: default_signatures(),
         }
     }
@@ -633,6 +638,38 @@ impl Default for EntropyPolicyConfig {
             mode: PolicyMode::Monitor,
             threshold: default_entropy_threshold(),
             minimum_chunk_size: default_entropy_minimum_chunk_size(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ReputationPolicyConfig {
+    #[serde(default = "default_reputation_enabled")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub known_bad_action: KnownBadAction,
+    #[serde(default = "default_reputation_cache_ttl_seconds")]
+    pub cache_ttl_seconds: u64,
+}
+
+impl ReputationPolicyConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        if self.cache_ttl_seconds == 0 {
+            return Err(ConfigError::Invalid(
+                "policy.reputation.cache_ttl_seconds must be greater than zero".to_string(),
+            ));
+        }
+
+        Ok(())
+    }
+}
+
+impl Default for ReputationPolicyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_reputation_enabled(),
+            known_bad_action: KnownBadAction::Alert,
+            cache_ttl_seconds: default_reputation_cache_ttl_seconds(),
         }
     }
 }
@@ -1023,6 +1060,14 @@ fn default_entropy_threshold() -> f64 {
 
 fn default_entropy_minimum_chunk_size() -> usize {
     8 * 1024
+}
+
+fn default_reputation_enabled() -> bool {
+    true
+}
+
+fn default_reputation_cache_ttl_seconds() -> u64 {
+    3600
 }
 
 fn default_dns_cache_ttl_seconds() -> u64 {

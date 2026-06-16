@@ -1181,6 +1181,11 @@ write_config() {
     echo "threshold = 7.9"
     echo "minimum_chunk_size = 8192"
     echo
+    echo "[policy.reputation]"
+    echo "enabled = true"
+    echo "known_bad_action = \"alert\""
+    echo "cache_ttl_seconds = 3600"
+    echo
     echo "[[policy.signatures]]"
     echo "name = \"Axiom synthetic test marker\""
     echo "pattern = \"AXIOM_TEST_THREAT\""

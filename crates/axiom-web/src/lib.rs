@@ -22,14 +22,18 @@ use axiom_core::{
     RuntimeState, StatusSnapshot, TrafficDirection,
 };
 use axiom_net::bind_tcp_listener_to_interface;
+use axiom_reputation::{
+    FileReputationReport, ReputationBulkImportRequest, ReputationCreateRequest, ReputationError,
+    ReputationLookupResponse, ReputationStore, ReputationUpdateRequest,
+};
 use axum::{
     Json, Router,
     body::Body,
-    extract::State,
+    extract::{Path as AxumPath, State},
     http::{HeaderMap, HeaderValue, Request, StatusCode, header},
     middleware::{self, Next},
     response::{Html, IntoResponse, Redirect, Response},
-    routing::{get, post},
+    routing::{get, post, put},
 };
 use axum_server::tls_rustls::RustlsConfig;
 use ldap3::{LdapConnAsync, Scope, SearchEntry};
@@ -47,6 +51,7 @@ struct WebState {
     runtime: Arc<RuntimeState>,
     config_path: PathBuf,
     config: Mutex<AxiomConfig>,
+    reputation: Arc<ReputationStore>,
     fleet_nodes: Mutex<HashMap<String, FleetNodeStatus>>,
     client_identities: Mutex<HashMap<String, ClientIdentityCacheEntry>>,
 }
@@ -74,10 +79,15 @@ pub async fn run_management_server(
                 )
             })?;
 
+    let reputation = Arc::new(
+        ReputationStore::open_default()
+            .context("failed opening management reputation store under /var/lib/axiom")?,
+    );
     let state = Arc::new(WebState {
         runtime,
         config_path,
         config: Mutex::new(config),
+        reputation,
         fleet_nodes: Mutex::new(HashMap::new()),
         client_identities: Mutex::new(HashMap::new()),
     });
@@ -93,6 +103,20 @@ pub async fn run_management_server(
         .route(
             "/api/management/tls",
             get(api_management_tls).put(api_update_management_tls),
+        )
+        .route(
+            "/api/reputation",
+            get(api_reputation).post(api_create_reputation),
+        )
+        .route("/api/reputation/import", post(api_import_reputation))
+        .route("/api/reputation/files", post(api_report_file_reputation))
+        .route(
+            "/api/reputation/lookup/{sha256}",
+            get(api_lookup_reputation),
+        )
+        .route(
+            "/api/reputation/{id}",
+            put(api_update_reputation).delete(api_delete_reputation),
         )
         .route("/api/enrollment-token", get(api_enrollment_token))
         .route(
@@ -274,6 +298,136 @@ async fn api_node_runtime_config(
     Json(NodeRuntimeConfigResponse {
         policy_runtime: state.runtime.policy_runtime_snapshot(),
         dns_policy_runtime: state.runtime.dns_policy_runtime_snapshot(),
+    })
+    .into_response()
+}
+
+async fn api_reputation(headers: HeaderMap, State(state): State<Arc<WebState>>) -> Response {
+    if !is_authorized(&headers, &state) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(ApiErrorResponse::new("authentication required")),
+        )
+            .into_response();
+    }
+
+    Json(state.reputation.list()).into_response()
+}
+
+async fn api_lookup_reputation(
+    headers: HeaderMap,
+    State(state): State<Arc<WebState>>,
+    AxumPath(sha256): AxumPath<String>,
+) -> Response {
+    if !is_authorized(&headers, &state) && !is_node_authorized(&headers, &state) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(ApiErrorResponse::new("authentication required")),
+        )
+            .into_response();
+    }
+
+    match state.reputation.lookup(&sha256) {
+        Ok(response) => Json(response).into_response(),
+        Err(error) => reputation_error_response(error),
+    }
+}
+
+async fn api_create_reputation(
+    headers: HeaderMap,
+    State(state): State<Arc<WebState>>,
+    Json(request): Json<ReputationCreateRequest>,
+) -> Response {
+    if !is_authorized(&headers, &state) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(ApiErrorResponse::new("authentication required")),
+        )
+            .into_response();
+    }
+
+    let actor = admin_actor(&state);
+    match state.reputation.create(request, &actor) {
+        Ok(entry) => Json(entry).into_response(),
+        Err(error) => reputation_error_response(error),
+    }
+}
+
+async fn api_update_reputation(
+    headers: HeaderMap,
+    State(state): State<Arc<WebState>>,
+    AxumPath(id): AxumPath<u64>,
+    Json(request): Json<ReputationUpdateRequest>,
+) -> Response {
+    if !is_authorized(&headers, &state) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(ApiErrorResponse::new("authentication required")),
+        )
+            .into_response();
+    }
+
+    let actor = admin_actor(&state);
+    match state.reputation.update(id, request, &actor) {
+        Ok(entry) => Json(entry).into_response(),
+        Err(error) => reputation_error_response(error),
+    }
+}
+
+async fn api_delete_reputation(
+    headers: HeaderMap,
+    State(state): State<Arc<WebState>>,
+    AxumPath(id): AxumPath<u64>,
+) -> Response {
+    if !is_authorized(&headers, &state) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(ApiErrorResponse::new("authentication required")),
+        )
+            .into_response();
+    }
+
+    let actor = admin_actor(&state);
+    match state.reputation.delete(id, &actor) {
+        Ok(entry) => Json(entry).into_response(),
+        Err(error) => reputation_error_response(error),
+    }
+}
+
+async fn api_import_reputation(
+    headers: HeaderMap,
+    State(state): State<Arc<WebState>>,
+    Json(request): Json<ReputationBulkImportRequest>,
+) -> Response {
+    if !is_authorized(&headers, &state) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(ApiErrorResponse::new("authentication required")),
+        )
+            .into_response();
+    }
+
+    let actor = admin_actor(&state);
+    Json(state.reputation.bulk_import(request, &actor)).into_response()
+}
+
+async fn api_report_file_reputation(
+    headers: HeaderMap,
+    State(state): State<Arc<WebState>>,
+    Json(report): Json<FileReputationReport>,
+) -> Response {
+    if !is_node_authorized(&headers, &state) && !is_authorized(&headers, &state) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(ApiErrorResponse::new("node enrollment token required")),
+        )
+            .into_response();
+    }
+
+    let verdict = state.reputation.record_file_report(report);
+    Json(ReputationLookupResponse {
+        verdict,
+        entry: None,
     })
     .into_response()
 }
@@ -1975,6 +2129,40 @@ struct ErrorResponse {
     message: &'static str,
 }
 
+#[derive(Debug, Serialize)]
+struct ApiErrorResponse {
+    message: String,
+}
+
+impl ApiErrorResponse {
+    fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+fn admin_actor(state: &WebState) -> String {
+    state
+        .config
+        .lock()
+        .expect("web config mutex poisoned")
+        .management
+        .admin
+        .username
+        .clone()
+}
+
+fn reputation_error_response(error: ReputationError) -> Response {
+    let status = match error {
+        ReputationError::InvalidSha256 | ReputationError::InvalidMd5 => StatusCode::BAD_REQUEST,
+        ReputationError::NotFound => StatusCode::NOT_FOUND,
+        ReputationError::DuplicateSha256 => StatusCode::CONFLICT,
+    };
+
+    (status, Json(ApiErrorResponse::new(error.to_string()))).into_response()
+}
+
 fn utf16le_test_payload(value: &str) -> Vec<u8> {
     let mut payload = b"\x00\x00\x00\x90\xfeSMBself-test-padding".to_vec();
     payload.extend(value.encode_utf16().flat_map(|unit| unit.to_le_bytes()));
@@ -2213,6 +2401,7 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
         <button data-view="nodes" class="top-nav-button rounded-md border border-zinc-700 px-4 py-2 text-sm font-medium text-zinc-200 transition hover:border-emerald-300 hover:text-emerald-100">Nodes</button>
         <button data-view="smb" class="top-nav-button rounded-md border border-zinc-700 px-4 py-2 text-sm font-medium text-zinc-200 transition hover:border-emerald-300 hover:text-emerald-100">SMB Protection</button>
         <button data-view="dns" class="top-nav-button rounded-md border border-zinc-700 px-4 py-2 text-sm font-medium text-zinc-200 transition hover:border-emerald-300 hover:text-emerald-100">DNS Security</button>
+        <button data-view="security" class="top-nav-button rounded-md border border-zinc-700 px-4 py-2 text-sm font-medium text-zinc-200 transition hover:border-emerald-300 hover:text-emerald-100">Security</button>
         <button data-view="audit" class="top-nav-button rounded-md border border-zinc-700 px-4 py-2 text-sm font-medium text-zinc-200 transition hover:border-emerald-300 hover:text-emerald-100">Global Audit Log</button>
         <button data-view="settings" class="top-nav-button rounded-md border border-zinc-700 px-4 py-2 text-sm font-medium text-zinc-200 transition hover:border-emerald-300 hover:text-emerald-100">Settings</button>
       </nav>
@@ -2481,6 +2670,26 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
           </div>
         </div>
 
+        <div>
+          <h3 class="text-sm font-semibold uppercase tracking-wider text-zinc-400">Reputation Rule</h3>
+          <div class="mt-4 grid gap-4 sm:grid-cols-2">
+            <label class="block">
+              <span class="text-sm text-zinc-300">Known Bad Action</span>
+              <select id="policy-reputation-known-bad-action" class="mt-2 w-full rounded-md border border-zinc-700 bg-zinc-950 px-3 py-2 text-white">
+                <option value="alert">alert</option>
+                <option value="allow">allow</option>
+                <option value="block">block</option>
+                <option value="quarantine">quarantine</option>
+              </select>
+            </label>
+            <label class="block">
+              <span class="text-sm text-zinc-300">Cache TTL Seconds</span>
+              <input id="policy-reputation-cache-ttl" type="number" min="1" class="mt-2 w-full rounded-md border border-zinc-700 bg-zinc-950 px-3 py-2 text-white">
+            </label>
+          </div>
+          <p class="mt-2 text-xs leading-5 text-zinc-500">V1 default is alert only. Block and quarantine are policy states for enforcement-ready rollout.</p>
+        </div>
+
         <div class="lg:col-span-2">
           <h3 class="text-sm font-semibold uppercase tracking-wider text-zinc-400">Signatures</h3>
           <textarea id="policy-signatures" rows="5" spellcheck="false" class="mt-4 w-full rounded-md border border-zinc-700 bg-zinc-950 px-4 py-3 font-mono text-sm text-white outline-none focus:border-emerald-400"></textarea>
@@ -2599,6 +2808,102 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
     </section>
     </section>
 
+    <section id="view-security" class="dashboard-view">
+      <section class="rounded-lg border border-zinc-800 bg-zinc-900">
+        <div class="flex flex-col gap-4 border-b border-zinc-800 px-6 py-5 lg:flex-row lg:items-end lg:justify-between">
+          <div>
+            <h2 class="text-xl font-semibold text-white">Reputation Center</h2>
+            <p id="reputation-state" class="mt-1 text-sm text-zinc-400">Loading reputation database</p>
+          </div>
+          <div class="flex flex-wrap gap-2">
+            <input id="reputation-search" type="search" placeholder="Search hash, verdict, source or notes" class="w-80 max-w-full rounded-md border border-zinc-700 bg-zinc-950 px-3 py-2 text-sm text-white">
+            <select id="reputation-filter" class="rounded-md border border-zinc-700 bg-zinc-950 px-3 py-2 text-sm text-white">
+              <option value="all">all verdicts</option>
+              <option value="known_good">known_good</option>
+              <option value="known_bad">known_bad</option>
+              <option value="unknown">unknown</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="grid gap-4 border-b border-zinc-800 p-6 md:grid-cols-4">
+          <div class="rounded-md border border-zinc-800 bg-zinc-950/50 p-4">
+            <p class="text-xs font-semibold uppercase tracking-wider text-zinc-500">Known Good</p>
+            <p id="rep-known-good" class="mt-3 text-3xl font-semibold text-emerald-200">0</p>
+          </div>
+          <div class="rounded-md border border-zinc-800 bg-zinc-950/50 p-4">
+            <p class="text-xs font-semibold uppercase tracking-wider text-zinc-500">Known Bad</p>
+            <p id="rep-known-bad" class="mt-3 text-3xl font-semibold text-red-200">0</p>
+          </div>
+          <div class="rounded-md border border-zinc-800 bg-zinc-950/50 p-4">
+            <p class="text-xs font-semibold uppercase tracking-wider text-zinc-500">Unknown</p>
+            <p id="rep-unknown" class="mt-3 text-3xl font-semibold text-amber-200">0</p>
+          </div>
+          <div class="rounded-md border border-zinc-800 bg-zinc-950/50 p-4">
+            <p class="text-xs font-semibold uppercase tracking-wider text-zinc-500">Pending Scans</p>
+            <p id="rep-pending-scans" class="mt-3 text-3xl font-semibold text-sky-200">0</p>
+          </div>
+        </div>
+
+        <div class="grid gap-6 border-b border-zinc-800 p-6 lg:grid-cols-[1fr_1fr]">
+          <section class="rounded-md border border-zinc-800 bg-zinc-950/40 p-4">
+            <h3 class="text-sm font-semibold uppercase tracking-wider text-zinc-400">Add Hash</h3>
+            <div class="mt-4 grid gap-3">
+              <input id="rep-add-sha256" placeholder="SHA256" class="rounded-md border border-zinc-700 bg-zinc-950 px-3 py-2 font-mono text-xs text-white">
+              <input id="rep-add-md5" placeholder="MD5 optional" class="rounded-md border border-zinc-700 bg-zinc-950 px-3 py-2 font-mono text-xs text-white">
+              <select id="rep-add-verdict" class="rounded-md border border-zinc-700 bg-zinc-950 px-3 py-2 text-sm text-white">
+                <option value="known_good">known_good</option>
+                <option value="known_bad">known_bad</option>
+                <option value="unknown">unknown</option>
+              </select>
+              <textarea id="rep-add-notes" rows="3" placeholder="Notes" class="rounded-md border border-zinc-700 bg-zinc-950 px-3 py-2 text-sm text-white"></textarea>
+              <button id="rep-add-button" class="rounded-md bg-emerald-400 px-4 py-2 text-sm font-semibold text-zinc-950 transition hover:bg-emerald-300">Add reputation entry</button>
+            </div>
+          </section>
+
+          <section class="rounded-md border border-zinc-800 bg-zinc-950/40 p-4">
+            <h3 class="text-sm font-semibold uppercase tracking-wider text-zinc-400">Bulk Import</h3>
+            <textarea id="rep-import-contents" rows="8" spellcheck="false" placeholder="sha256,verdict,notes" class="mt-4 w-full rounded-md border border-zinc-700 bg-zinc-950 px-3 py-2 font-mono text-xs text-white"></textarea>
+            <button id="rep-import-button" class="mt-3 rounded-md border border-emerald-400/40 px-4 py-2 text-sm font-semibold text-emerald-100 transition hover:border-emerald-300 hover:bg-emerald-400/10">Import hashes</button>
+            <p class="mt-2 text-xs text-zinc-500">CSV/TXT format: sha256,verdict,notes</p>
+          </section>
+        </div>
+
+        <div class="overflow-x-auto">
+          <table class="min-w-full divide-y divide-zinc-800">
+            <thead class="bg-zinc-950/60">
+              <tr>
+                <th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-zinc-400">SHA256</th>
+                <th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-zinc-400">MD5</th>
+                <th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-zinc-400">Verdict</th>
+                <th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-zinc-400">Source</th>
+                <th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-zinc-400">Hit Count</th>
+                <th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-zinc-400">Last Seen</th>
+                <th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-zinc-400">Notes</th>
+                <th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-zinc-400">Action</th>
+              </tr>
+            </thead>
+            <tbody id="reputation-table-body" class="divide-y divide-zinc-800"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="mt-8 grid gap-6 lg:grid-cols-2">
+        <section class="rounded-lg border border-zinc-800 bg-zinc-900">
+          <div class="border-b border-zinc-800 px-6 py-5">
+            <h2 class="text-xl font-semibold text-white">Top Seen Files</h2>
+          </div>
+          <div id="rep-top-seen" class="divide-y divide-zinc-800"></div>
+        </section>
+        <section class="rounded-lg border border-zinc-800 bg-zinc-900">
+          <div class="border-b border-zinc-800 px-6 py-5">
+            <h2 class="text-xl font-semibold text-white">Recent File Observations</h2>
+          </div>
+          <div id="rep-recent-observations" class="divide-y divide-zinc-800"></div>
+        </section>
+      </section>
+    </section>
+
     <section id="view-audit" class="dashboard-view">
       <section class="rounded-lg border border-zinc-800 bg-zinc-900">
         <div class="flex flex-col gap-2 border-b border-zinc-800 px-6 py-5 md:flex-row md:items-end md:justify-between">
@@ -2709,6 +3014,7 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
     const token = localStorage.getItem("axiomToken") || "";
     const modes = ["disabled", "monitor", "block"];
     let clientIdentities = {};
+    let reputationEntries = [];
 
     function authHeaders(extra = {}) {
       return token ? { ...extra, Authorization: `Bearer ${token}` } : extra;
@@ -2757,7 +3063,7 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
     }
 
     function setActiveView(name) {
-      const knownViews = new Set(["overview", "nodes", "smb", "dns", "audit", "settings"]);
+      const knownViews = new Set(["overview", "nodes", "smb", "dns", "security", "audit", "settings"]);
       if (!knownViews.has(name)) name = "overview";
       document.querySelectorAll(".dashboard-view").forEach((section) => {
         section.classList.toggle("active", section.id === `view-${name}`);
@@ -2823,7 +3129,9 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
         "allowed_chunks", "monitored_chunks", "blocked_chunks", "observed_file_events",
         "audit_events", "stream_bytes_client_to_server", "stream_bytes_server_to_client",
         "bytes_client_to_server", "bytes_server_to_client", "smb_write_requests",
-        "smb_write_bytes", "server_side_copy_requests", "dns_queries", "dns_udp_queries",
+        "smb_write_bytes", "server_side_copy_requests", "completed_file_hashes",
+        "known_good_reputation_events", "known_bad_reputation_events", "unknown_reputation_events",
+        "dns_queries", "dns_udp_queries",
         "dns_tcp_queries", "dns_blocked_queries", "dns_monitored_queries", "dns_cache_hits",
         "dns_upstream_errors", "monitored_threats", "blocked_threats"
       ];
@@ -3288,6 +3596,10 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
       fillModeSelect("policy-entropy-mode", policy.entropy.mode);
       document.getElementById("policy-entropy-threshold").value = policy.entropy.threshold;
       document.getElementById("policy-entropy-minimum").value = policy.entropy.minimum_chunk_size;
+      document.getElementById("policy-reputation-known-bad-action").value =
+        policy.reputation?.known_bad_action || "alert";
+      document.getElementById("policy-reputation-cache-ttl").value =
+        policy.reputation?.cache_ttl_seconds || 3600;
       document.getElementById("policy-signatures").value = (policy.signatures || [])
         .map((signature) => `${signature.name}|${signature.mode}|${signature.pattern}`)
         .join("\n");
@@ -3320,6 +3632,163 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
         .map((record) => `${record.name}|${record.type}|${record.value}|${record.ttl_seconds || 300}`)
         .join("\n");
       document.getElementById("dns-policy-state").textContent = "DNS policy loaded";
+    }
+
+    async function loadReputationCenter() {
+      const response = await fetch("/api/reputation", { headers: authHeaders() });
+      const payload = await response.json().catch(() => ({ message: "reputation load failed" }));
+      if (!response.ok) {
+        document.getElementById("reputation-state").textContent = payload.message || "Reputation load failed";
+        return;
+      }
+
+      reputationEntries = payload.entries || [];
+      const summary = payload.summary || {};
+      document.getElementById("rep-known-good").textContent = summary.known_good_count || 0;
+      document.getElementById("rep-known-bad").textContent = summary.known_bad_count || 0;
+      document.getElementById("rep-unknown").textContent = summary.unknown_count || 0;
+      document.getElementById("rep-pending-scans").textContent = summary.pending_scans || 0;
+      document.getElementById("reputation-state").textContent =
+        `${summary.total_entries || reputationEntries.length} entries · ${summary.pending_scans || 0} pending scans`;
+      renderReputationTable();
+      renderReputationSimpleList("rep-top-seen", payload.top_seen_files || [], "No file reputation hits yet.");
+      renderReputationObservations(payload.recent_observations || []);
+    }
+
+    function verdictClass(verdict) {
+      if (verdict === "known_bad") return "text-red-200 border-red-400/40 bg-red-400/10";
+      if (verdict === "known_good") return "text-emerald-200 border-emerald-400/40 bg-emerald-400/10";
+      return "text-amber-200 border-amber-400/40 bg-amber-400/10";
+    }
+
+    function renderReputationTable() {
+      const query = document.getElementById("reputation-search").value.trim().toLowerCase();
+      const filter = document.getElementById("reputation-filter").value;
+      const entries = reputationEntries
+        .filter((entry) => filter === "all" || entry.verdict === filter)
+        .filter((entry) => {
+          if (!query) return true;
+          return [entry.sha256, entry.md5, entry.verdict, entry.source, entry.notes]
+            .filter(Boolean)
+            .some((value) => String(value).toLowerCase().includes(query));
+        })
+        .slice(0, 100);
+
+      const body = document.getElementById("reputation-table-body");
+      if (!entries.length) {
+        body.innerHTML = `<tr><td colspan="8" class="px-6 py-6 text-sm text-zinc-400">No reputation entries matched.</td></tr>`;
+        return;
+      }
+
+      body.innerHTML = entries.map((entry) => `
+        <tr>
+          <td class="max-w-xs truncate px-6 py-4 font-mono text-xs text-zinc-200" title="${text(entry.sha256)}">${text(entry.sha256)}</td>
+          <td class="px-6 py-4 font-mono text-xs text-zinc-400">${text(entry.md5)}</td>
+          <td class="px-6 py-4"><span class="rounded-full border px-2.5 py-1 text-xs font-semibold ${verdictClass(entry.verdict)}">${text(entry.verdict)}</span></td>
+          <td class="px-6 py-4 text-sm text-zinc-300">${text(entry.source)}</td>
+          <td class="px-6 py-4 text-sm text-zinc-300">${entry.hit_count || 0}</td>
+          <td class="px-6 py-4 text-sm text-zinc-400">${formatTime(entry.last_seen)}</td>
+          <td class="max-w-sm truncate px-6 py-4 text-sm text-zinc-300" title="${text(entry.notes)}">${text(entry.notes)}</td>
+          <td class="px-6 py-4"><button data-rep-delete="${entry.id}" class="rounded-md border border-red-400/40 px-2.5 py-1 text-xs font-semibold text-red-200 hover:bg-red-400/10">Delete</button></td>
+        </tr>
+      `).join("");
+
+      document.querySelectorAll("[data-rep-delete]").forEach((button) => {
+        button.addEventListener("click", () => deleteReputationEntry(button.dataset.repDelete));
+      });
+    }
+
+    function renderReputationSimpleList(id, entries, emptyText) {
+      const container = document.getElementById(id);
+      if (!entries.length) {
+        container.innerHTML = `<div class="px-6 py-5 text-sm text-zinc-400">${emptyText}</div>`;
+        return;
+      }
+      container.innerHTML = entries.map((entry) => `
+        <div class="px-6 py-4">
+          <div class="flex items-center justify-between gap-4">
+            <p class="truncate font-mono text-xs text-zinc-200">${text(entry.sha256)}</p>
+            <span class="rounded-full border px-2.5 py-1 text-xs font-semibold ${verdictClass(entry.verdict)}">${text(entry.verdict)}</span>
+          </div>
+          <p class="mt-2 text-sm text-zinc-400">${entry.hit_count || 0} hits · last seen ${formatTime(entry.last_seen)}</p>
+        </div>
+      `).join("");
+    }
+
+    function renderReputationObservations(observations) {
+      const container = document.getElementById("rep-recent-observations");
+      if (!observations.length) {
+        container.innerHTML = `<div class="px-6 py-5 text-sm text-zinc-400">No SMB file observations reported yet.</div>`;
+        return;
+      }
+      container.innerHTML = observations.slice(0, 20).map((item) => `
+        <div class="px-6 py-4">
+          <div class="flex flex-wrap items-center gap-2">
+            <span class="rounded-full border px-2.5 py-1 text-xs font-semibold ${verdictClass(item.verdict)}">${text(item.verdict)}</span>
+            <p class="text-sm font-semibold text-white">${text(item.file_name)}</p>
+          </div>
+          <p class="mt-2 text-xs text-zinc-400">${text(item.source_ip)} → ${text(item.target_addr)} · ${formatBytes(item.file_size)} · ${formatTime(item.observed_at)}</p>
+          <p class="mt-1 truncate font-mono text-xs text-zinc-500">${text(item.sha256)}</p>
+        </div>
+      `).join("");
+    }
+
+    async function addReputationEntry() {
+      document.getElementById("reputation-state").textContent = "Adding reputation entry";
+      const response = await fetch("/api/reputation", {
+        method: "POST",
+        headers: authHeaders({ "Content-Type": "application/json" }),
+        body: JSON.stringify({
+          sha256: document.getElementById("rep-add-sha256").value.trim(),
+          md5: document.getElementById("rep-add-md5").value.trim() || null,
+          verdict: document.getElementById("rep-add-verdict").value,
+          notes: document.getElementById("rep-add-notes").value.trim(),
+          source: "Administrator"
+        })
+      });
+      const payload = await response.json().catch(() => ({ message: "add failed" }));
+      if (!response.ok) {
+        document.getElementById("reputation-state").textContent = payload.message || "Reputation add failed";
+        return;
+      }
+      document.getElementById("rep-add-sha256").value = "";
+      document.getElementById("rep-add-md5").value = "";
+      document.getElementById("rep-add-notes").value = "";
+      await loadReputationCenter();
+    }
+
+    async function importReputationEntries() {
+      document.getElementById("reputation-state").textContent = "Importing reputation entries";
+      const response = await fetch("/api/reputation/import", {
+        method: "POST",
+        headers: authHeaders({ "Content-Type": "application/json" }),
+        body: JSON.stringify({
+          contents: document.getElementById("rep-import-contents").value,
+          source: "Manual Import"
+        })
+      });
+      const payload = await response.json().catch(() => ({ message: "import failed" }));
+      if (!response.ok) {
+        document.getElementById("reputation-state").textContent = payload.message || "Import failed";
+        return;
+      }
+      document.getElementById("reputation-state").textContent =
+        `Imported ${payload.imported || 0}, skipped ${payload.skipped || 0}`;
+      await loadReputationCenter();
+    }
+
+    async function deleteReputationEntry(id) {
+      if (!confirm("Delete this reputation entry?")) return;
+      const response = await fetch(`/api/reputation/${id}`, {
+        method: "DELETE",
+        headers: authHeaders()
+      });
+      if (!response.ok) {
+        const payload = await response.json().catch(() => ({ message: "delete failed" }));
+        document.getElementById("reputation-state").textContent = payload.message || "Delete failed";
+        return;
+      }
+      await loadReputationCenter();
     }
 
     async function loadEnrollmentToken() {
@@ -3445,6 +3914,11 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
           mode: document.getElementById("policy-entropy-mode").value,
           threshold: Number(document.getElementById("policy-entropy-threshold").value),
           minimum_chunk_size: Number(document.getElementById("policy-entropy-minimum").value)
+        },
+        reputation: {
+          enabled: true,
+          known_bad_action: document.getElementById("policy-reputation-known-bad-action").value,
+          cache_ttl_seconds: Number(document.getElementById("policy-reputation-cache-ttl").value || 3600)
         },
         signatures
       };
@@ -3692,6 +4166,10 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
     document.getElementById("rotate-enrollment-token").addEventListener("click", rotateEnrollmentToken);
     document.getElementById("enable-https").addEventListener("click", () => saveTlsSettings(true));
     document.getElementById("disable-https").addEventListener("click", () => saveTlsSettings(false));
+    document.getElementById("rep-add-button").addEventListener("click", addReputationEntry);
+    document.getElementById("rep-import-button").addEventListener("click", importReputationEntries);
+    document.getElementById("reputation-search").addEventListener("input", renderReputationTable);
+    document.getElementById("reputation-filter").addEventListener("change", renderReputationTable);
     document.querySelectorAll(".top-nav-button").forEach((button) => {
       button.addEventListener("click", () => setActiveView(button.dataset.view));
     });
@@ -3704,6 +4182,7 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
     refresh();
     loadPolicies();
     loadDnsPolicy();
+    loadReputationCenter();
     loadEnrollmentToken();
     setInterval(refresh, 2000);
   </script>

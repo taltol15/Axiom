@@ -1,5 +1,5 @@
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     env, fs,
     path::PathBuf,
     sync::{Arc, Mutex},
@@ -11,7 +11,11 @@ use axiom_config::{AxiomConfig, DnsConfig, NodeRole, ProxyListenerConfig};
 use axiom_control::{
     ControlApplyResponse, ControlPolicyBundle, EncryptedEnvelope, decrypt_payload, encrypt_payload,
 };
-use axiom_core::{RuntimeState, StreamPolicy};
+use axiom_core::{CompletedFileTransfer, RuntimeState, StreamPolicy};
+use axiom_reputation::{
+    FileReputationReport, KnownBadAction, ReputationLookupResponse, ReputationVerdict,
+    cache_expiry_timestamp,
+};
 use axum::{
     Json, Router,
     extract::State,
@@ -328,6 +332,7 @@ async fn run_node_agent(config: AxiomConfig, runtime: Arc<RuntimeState>) -> anyh
     let mut interval = tokio::time::interval(Duration::from_secs(
         config.node.heartbeat_interval_seconds.max(1),
     ));
+    let mut reputation_cache: HashMap<String, CachedReputation> = HashMap::new();
 
     info!(
         node_id = config.node.node_id,
@@ -348,6 +353,16 @@ async fn run_node_agent(config: AxiomConfig, runtime: Arc<RuntimeState>) -> anyh
             );
         }
 
+        process_completed_file_reputation(
+            &client,
+            &management_url,
+            &enrollment_token,
+            &config,
+            &runtime,
+            &mut reputation_cache,
+        )
+        .await;
+
         if let Err(error) = post_node_report(
             &client,
             &management_url,
@@ -360,6 +375,181 @@ async fn run_node_agent(config: AxiomConfig, runtime: Arc<RuntimeState>) -> anyh
             warn!(?error, "failed posting node report to management server");
         }
     }
+}
+
+#[derive(Debug, Clone)]
+struct CachedReputation {
+    verdict: ReputationVerdict,
+    expires_at_unix_timestamp_seconds: u64,
+    hit_count: u64,
+    last_seen_unix_timestamp_seconds: u64,
+}
+
+async fn process_completed_file_reputation(
+    client: &reqwest::Client,
+    management_url: &str,
+    enrollment_token: &str,
+    config: &AxiomConfig,
+    runtime: &RuntimeState,
+    cache: &mut HashMap<String, CachedReputation>,
+) {
+    let policy = runtime.policy_config().reputation;
+    if !policy.enabled {
+        return;
+    }
+
+    let transfers = runtime.drain_completed_file_transfers(64);
+    if transfers.is_empty() {
+        return;
+    }
+
+    for transfer in transfers {
+        let verdict = match cached_or_lookup_reputation(
+            client,
+            management_url,
+            enrollment_token,
+            &transfer.sha256,
+            policy.cache_ttl_seconds,
+            cache,
+        )
+        .await
+        {
+            Ok(verdict) => verdict,
+            Err(error) => {
+                warn!(
+                    sha256 = transfer.sha256,
+                    ?error,
+                    "management reputation lookup failed; failing open"
+                );
+                ReputationVerdict::Unknown
+            }
+        };
+
+        if let Err(error) =
+            post_file_reputation_report(client, management_url, enrollment_token, config, &transfer)
+                .await
+        {
+            warn!(
+                sha256 = transfer.sha256,
+                ?error,
+                "failed posting SMB file reputation report"
+            );
+        }
+
+        let action = if verdict == ReputationVerdict::KnownBad {
+            policy.known_bad_action
+        } else {
+            KnownBadAction::Allow
+        };
+        let reason = match verdict {
+            ReputationVerdict::KnownGood => {
+                format!("reputation known_good for {}", transfer.sha256)
+            }
+            ReputationVerdict::KnownBad => format!(
+                "reputation known_bad for {}; configured action {:?}",
+                transfer.sha256, action
+            ),
+            ReputationVerdict::Unknown => {
+                format!(
+                    "reputation unknown for {}; queued for async scan",
+                    transfer.sha256
+                )
+            }
+        };
+        runtime.record_reputation_verdict(&transfer, verdict, action, reason);
+    }
+}
+
+async fn cached_or_lookup_reputation(
+    client: &reqwest::Client,
+    management_url: &str,
+    enrollment_token: &str,
+    sha256: &str,
+    ttl_seconds: u64,
+    cache: &mut HashMap<String, CachedReputation>,
+) -> anyhow::Result<ReputationVerdict> {
+    let now = unix_timestamp_seconds();
+    if let Some(entry) = cache.get_mut(sha256)
+        && entry.expires_at_unix_timestamp_seconds > now
+    {
+        entry.hit_count = entry.hit_count.saturating_add(1);
+        entry.last_seen_unix_timestamp_seconds = now;
+        return Ok(entry.verdict);
+    }
+
+    let response = client
+        .get(format!("{management_url}/api/reputation/lookup/{sha256}"))
+        .bearer_auth(enrollment_token)
+        .send()
+        .await
+        .context("reputation lookup request failed")?;
+
+    if !response.status().is_success() {
+        return Err(anyhow::anyhow!(
+            "management returned HTTP {} for reputation lookup",
+            response.status()
+        ));
+    }
+
+    let payload: ReputationLookupResponse = response
+        .json()
+        .await
+        .context("failed decoding reputation lookup response")?;
+    cache.insert(
+        sha256.to_string(),
+        CachedReputation {
+            verdict: payload.verdict,
+            expires_at_unix_timestamp_seconds: cache_expiry_timestamp(ttl_seconds),
+            hit_count: 1,
+            last_seen_unix_timestamp_seconds: now,
+        },
+    );
+
+    Ok(payload.verdict)
+}
+
+async fn post_file_reputation_report(
+    client: &reqwest::Client,
+    management_url: &str,
+    enrollment_token: &str,
+    config: &AxiomConfig,
+    transfer: &CompletedFileTransfer,
+) -> anyhow::Result<()> {
+    let report = FileReputationReport {
+        node_id: config.node.node_id.clone(),
+        route_name: transfer.route_name.clone(),
+        interface: transfer.interface.clone(),
+        direction: format!("{:?}", transfer.direction).to_ascii_lowercase(),
+        source_ip: transfer.peer_addr.ip().to_string(),
+        target_addr: transfer.target_addr.to_string(),
+        destination_share: transfer.destination_share.clone(),
+        source_user: transfer.source_user.clone(),
+        file_name: transfer.file_name.clone(),
+        extension: transfer.extension.clone(),
+        mime_type: transfer.mime_type.clone(),
+        file_size: transfer.file_size,
+        creation_time: transfer.creation_time,
+        upload_timestamp: transfer.upload_timestamp,
+        sha256: transfer.sha256.clone(),
+        md5: transfer.md5.clone(),
+    };
+
+    let response = client
+        .post(format!("{management_url}/api/reputation/files"))
+        .bearer_auth(enrollment_token)
+        .json(&report)
+        .send()
+        .await
+        .context("file reputation report request failed")?;
+
+    if !response.status().is_success() {
+        return Err(anyhow::anyhow!(
+            "management returned HTTP {} for file reputation report",
+            response.status()
+        ));
+    }
+
+    Ok(())
 }
 
 async fn pull_runtime_config(

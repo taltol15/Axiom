@@ -11,6 +11,8 @@ anyhow.workspace = true
 axiom-config = { path = "../axiom-config" }
 axiom-core = { path = "../axiom-core" }
 libc.workspace = true
+md-5.workspace = true
+sha2.workspace = true
 socket2.workspace = true
 tokio.workspace = true
 tracing.workspace = true

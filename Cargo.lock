@@ -124,6 +124,7 @@ dependencies = [
 name = "axiom-config"
 version = "0.1.0"
 dependencies = [
+ "axiom-reputation",
  "serde",
  "thiserror",
  "toml",
@@ -147,6 +148,7 @@ name = "axiom-core"
 version = "0.1.0"
 dependencies = [
  "axiom-config",
+ "axiom-reputation",
  "serde",
  "serde_json",
 ]
@@ -161,6 +163,7 @@ dependencies = [
  "axiom-core",
  "axiom-dns",
  "axiom-net",
+ "axiom-reputation",
  "axiom-web",
  "axum",
  "reqwest",
@@ -193,9 +196,21 @@ dependencies = [
  "axiom-config",
  "axiom-core",
  "libc",
+ "md-5",
+ "sha2",
  "socket2",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "axiom-reputation"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "thiserror",
 ]
 
 [[package]]
@@ -207,6 +222,7 @@ dependencies = [
  "axiom-control",
  "axiom-core",
  "axiom-net",
+ "axiom-reputation",
  "axum",
  "axum-server",
  "getrandom 0.3.4",
@@ -499,7 +515,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1032,6 +1048,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
 
 [[package]]
+name = "md-5"
+version = "0.10.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d89e7ee0cfbedfc4da3340218492196241d89eefb6dab27de5df917a6d2e78cf"
+dependencies = [
+ "cfg-if",
+ "digest",
+]
+
+[[package]]
 name = "memchr"
 version = "2.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1076,7 +1102,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1621,7 +1647,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3a766e1110788c36f4fa1c2b71b387a7815aa65f88ce0229841826633d93723e"
 dependencies = [
  "libc",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

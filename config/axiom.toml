@@ -64,6 +64,11 @@ mode = "monitor"
 threshold = 7.9
 minimum_chunk_size = 8192
 
+[policy.reputation]
+enabled = true
+known_bad_action = "alert"
+cache_ttl_seconds = 3600
+
 [[policy.signatures]]
 name = "Axiom synthetic test marker"
 pattern = "AXIOM_TEST_THREAT"

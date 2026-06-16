@@ -11,11 +11,13 @@ use std::{
 };
 
 use axiom_config::{DnsPolicyConfig, PolicyConfig, PolicyMode};
+use axiom_reputation::{KnownBadAction, ReputationVerdict};
 use serde::Serialize;
 
 const MAX_RETAINED_THREAT_EVENTS: usize = 128;
 const MAX_RETAINED_AUDIT_EVENTS: usize = 512;
 const MAX_RETAINED_DNS_EVENTS: usize = 512;
+const MAX_RETAINED_FILE_HASH_EVENTS: usize = 512;
 const MAX_TRACKED_FILE_ACTIVITIES: usize = 512;
 const ARCHIVE_MAX_PATTERN_LEN: usize = 8;
 const STREAM_INSPECTION_TAIL_LEN: usize = 4096;
@@ -37,6 +39,7 @@ pub struct AppState {
     recent_threats: Mutex<VecDeque<ThreatEvent>>,
     recent_audit_events: Mutex<VecDeque<AuditEvent>>,
     recent_dns_events: Mutex<VecDeque<DnsQueryEvent>>,
+    completed_file_hashes: Mutex<VecDeque<CompletedFileTransfer>>,
 }
 
 impl AppState {
@@ -56,6 +59,9 @@ impl AppState {
             recent_threats: Mutex::new(VecDeque::with_capacity(MAX_RETAINED_THREAT_EVENTS)),
             recent_audit_events: Mutex::new(VecDeque::with_capacity(MAX_RETAINED_AUDIT_EVENTS)),
             recent_dns_events: Mutex::new(VecDeque::with_capacity(MAX_RETAINED_DNS_EVENTS)),
+            completed_file_hashes: Mutex::new(VecDeque::with_capacity(
+                MAX_RETAINED_FILE_HASH_EVENTS,
+            )),
         }
     }
 
@@ -326,6 +332,107 @@ impl AppState {
         });
     }
 
+    pub fn record_completed_file_transfer(&self, transfer: CompletedFileTransfer) {
+        self.counters
+            .completed_file_hashes
+            .fetch_add(1, Ordering::Relaxed);
+        let context = InspectionContext {
+            route_name: &transfer.route_name,
+            interface: &transfer.interface,
+            direction: transfer.direction,
+            peer_addr: transfer.peer_addr,
+            target_addr: transfer.target_addr,
+            file_path_hint: Some(&transfer.file_name),
+        };
+        self.push_audit_event(AuditEvent::from_context(
+            &context,
+            AuditEventKind::FileHashCompleted,
+            AuditSeverity::Info,
+            Some(transfer.file_name.clone()),
+            "hash".to_string(),
+            format!(
+                "SMB file hash completed sha256={} md5={} size={}",
+                transfer.sha256, transfer.md5, transfer.file_size
+            ),
+            Some(transfer.file_size),
+            Some("SMB streaming hash".to_string()),
+        ));
+
+        let mut completed = self
+            .completed_file_hashes
+            .lock()
+            .expect("completed file hash mutex poisoned");
+        if completed.len() == MAX_RETAINED_FILE_HASH_EVENTS {
+            completed.pop_front();
+        }
+        completed.push_back(transfer);
+    }
+
+    pub fn drain_completed_file_transfers(&self, max_items: usize) -> Vec<CompletedFileTransfer> {
+        let mut completed = self
+            .completed_file_hashes
+            .lock()
+            .expect("completed file hash mutex poisoned");
+        let mut drained = Vec::new();
+        for _ in 0..max_items {
+            let Some(item) = completed.pop_front() else {
+                break;
+            };
+            drained.push(item);
+        }
+        drained
+    }
+
+    pub fn record_reputation_verdict(
+        &self,
+        transfer: &CompletedFileTransfer,
+        verdict: ReputationVerdict,
+        action: KnownBadAction,
+        reason: String,
+    ) {
+        match verdict {
+            ReputationVerdict::KnownBad => {
+                self.counters
+                    .known_bad_reputation_events
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            ReputationVerdict::KnownGood => {
+                self.counters
+                    .known_good_reputation_events
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            ReputationVerdict::Unknown => {
+                self.counters
+                    .unknown_reputation_events
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        let context = InspectionContext {
+            route_name: &transfer.route_name,
+            interface: &transfer.interface,
+            direction: transfer.direction,
+            peer_addr: transfer.peer_addr,
+            target_addr: transfer.target_addr,
+            file_path_hint: Some(&transfer.file_name),
+        };
+        let severity = match verdict {
+            ReputationVerdict::KnownBad => AuditSeverity::Critical,
+            ReputationVerdict::Unknown => AuditSeverity::Warning,
+            ReputationVerdict::KnownGood => AuditSeverity::Info,
+        };
+        self.push_audit_event(AuditEvent::from_context(
+            &context,
+            AuditEventKind::ReputationVerdict,
+            severity,
+            Some(transfer.file_name.clone()),
+            format!("{action:?}").to_ascii_lowercase(),
+            reason,
+            Some(transfer.file_size),
+            Some(format!("{verdict:?}")),
+        ));
+    }
+
     pub fn record_server_side_copy_requested(&self, context: &InspectionContext<'_>) {
         self.counters
             .server_side_copy_requests
@@ -586,6 +693,19 @@ impl AppState {
             server_side_copy_requests: self
                 .counters
                 .server_side_copy_requests
+                .load(Ordering::Relaxed),
+            completed_file_hashes: self.counters.completed_file_hashes.load(Ordering::Relaxed),
+            known_good_reputation_events: self
+                .counters
+                .known_good_reputation_events
+                .load(Ordering::Relaxed),
+            known_bad_reputation_events: self
+                .counters
+                .known_bad_reputation_events
+                .load(Ordering::Relaxed),
+            unknown_reputation_events: self
+                .counters
+                .unknown_reputation_events
                 .load(Ordering::Relaxed),
             dns_queries: self.counters.dns_queries.load(Ordering::Relaxed),
             dns_udp_queries: self.counters.dns_udp_queries.load(Ordering::Relaxed),
@@ -891,6 +1011,10 @@ struct TrafficCounters {
     smb_write_requests: AtomicU64,
     smb_write_bytes: AtomicU64,
     server_side_copy_requests: AtomicU64,
+    completed_file_hashes: AtomicU64,
+    known_good_reputation_events: AtomicU64,
+    known_bad_reputation_events: AtomicU64,
+    unknown_reputation_events: AtomicU64,
     dns_queries: AtomicU64,
     dns_udp_queries: AtomicU64,
     dns_tcp_queries: AtomicU64,
@@ -921,6 +1045,10 @@ pub struct StatusSnapshot {
     pub smb_write_requests: u64,
     pub smb_write_bytes: u64,
     pub server_side_copy_requests: u64,
+    pub completed_file_hashes: u64,
+    pub known_good_reputation_events: u64,
+    pub known_bad_reputation_events: u64,
+    pub unknown_reputation_events: u64,
     pub dns_queries: u64,
     pub dns_udp_queries: u64,
     pub dns_tcp_queries: u64,
@@ -1049,6 +1177,25 @@ pub struct FileActivityStats {
     pub last_rule_name: Option<String>,
     pub last_bytes_in_chunk: Option<u64>,
     pub last_activity_unix_timestamp_seconds: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CompletedFileTransfer {
+    pub route_name: String,
+    pub interface: String,
+    pub direction: TrafficDirection,
+    pub peer_addr: SocketAddr,
+    pub target_addr: SocketAddr,
+    pub destination_share: Option<String>,
+    pub source_user: Option<String>,
+    pub file_name: String,
+    pub extension: Option<String>,
+    pub mime_type: Option<String>,
+    pub file_size: u64,
+    pub creation_time: Option<u64>,
+    pub upload_timestamp: u64,
+    pub sha256: String,
+    pub md5: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1241,8 +1388,10 @@ pub enum AuditEventKind {
     ConnectionOpened,
     ConnectionClosed,
     FileObserved,
+    FileHashCompleted,
     PolicyDetection,
     PolicyBlocked,
+    ReputationVerdict,
     ServerSideCopyRequested,
 }
 
@@ -1611,12 +1760,33 @@ pub struct Smb2CreateRequest {
 pub struct Smb2CreateResponse {
     pub message_id: u64,
     pub file_id: [u8; 16],
+    pub creation_time_unix_timestamp_seconds: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Smb2WriteRequest {
     pub file_id: [u8; 16],
     pub length: u32,
+    pub data_range: Option<(usize, usize)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Smb2ReadRequest {
+    pub message_id: u64,
+    pub file_id: [u8; 16],
+    pub length: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Smb2ReadResponse {
+    pub message_id: u64,
+    pub length: u32,
+    pub data_range: Option<(usize, usize)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Smb2CloseRequest {
+    pub file_id: [u8; 16],
 }
 
 pub fn calculate_shannon_entropy(bytes: &[u8]) -> f64 {
@@ -1751,9 +1921,13 @@ pub fn extract_smb2_create_responses(chunk: &[u8]) -> Vec<Smb2CreateResponse> {
             continue;
         };
 
+        let creation_time_unix_timestamp_seconds = read_u64_le(chunk, body_offset + 8)
+            .and_then(windows_filetime_to_unix_timestamp_seconds);
+
         responses.push(Smb2CreateResponse {
             message_id,
             file_id,
+            creation_time_unix_timestamp_seconds,
         });
     }
 
@@ -1793,6 +1967,7 @@ pub fn extract_smb2_write_requests(chunk: &[u8]) -> Vec<Smb2WriteRequest> {
             continue;
         }
 
+        let data_offset = read_u16_le(chunk, body_offset + 2).map(usize::from);
         let Some(file_id_bytes) = chunk.get(body_offset + 16..body_offset + 32) else {
             continue;
         };
@@ -1800,7 +1975,148 @@ pub fn extract_smb2_write_requests(chunk: &[u8]) -> Vec<Smb2WriteRequest> {
             continue;
         };
 
-        requests.push(Smb2WriteRequest { file_id, length });
+        let data_range = data_offset.and_then(|offset| {
+            let start = header_offset.saturating_add(offset);
+            let end = start.saturating_add(length as usize);
+            (start < end && end <= chunk.len()).then_some((start, end))
+        });
+
+        requests.push(Smb2WriteRequest {
+            file_id,
+            length,
+            data_range,
+        });
+    }
+
+    requests
+}
+
+pub fn extract_smb2_read_requests(chunk: &[u8]) -> Vec<Smb2ReadRequest> {
+    let mut requests = Vec::new();
+
+    for header_offset in smb2_header_offsets(chunk) {
+        let Some(command) = read_u16_le(chunk, header_offset + 12) else {
+            continue;
+        };
+        if command != 8 {
+            continue;
+        }
+
+        let Some(message_id) = read_u64_le(chunk, header_offset + 24) else {
+            continue;
+        };
+
+        let body_offset = header_offset + 64;
+        let Some(structure_size) = read_u16_le(chunk, body_offset) else {
+            continue;
+        };
+        if structure_size != 49 {
+            continue;
+        }
+
+        let Some(length) = read_u32_le(chunk, body_offset + 4) else {
+            continue;
+        };
+        let Some(file_id_bytes) = chunk.get(body_offset + 16..body_offset + 32) else {
+            continue;
+        };
+        let Ok(file_id) = <[u8; 16]>::try_from(file_id_bytes) else {
+            continue;
+        };
+
+        requests.push(Smb2ReadRequest {
+            message_id,
+            file_id,
+            length,
+        });
+    }
+
+    requests
+}
+
+pub fn extract_smb2_read_responses(chunk: &[u8]) -> Vec<Smb2ReadResponse> {
+    let mut responses = Vec::new();
+
+    for header_offset in smb2_header_offsets(chunk) {
+        let Some(command) = read_u16_le(chunk, header_offset + 12) else {
+            continue;
+        };
+        if command != 8 {
+            continue;
+        }
+
+        let Some(status) = read_u32_le(chunk, header_offset + 8) else {
+            continue;
+        };
+        if status != 0 {
+            continue;
+        }
+
+        let Some(message_id) = read_u64_le(chunk, header_offset + 24) else {
+            continue;
+        };
+
+        let body_offset = header_offset + 64;
+        let Some(structure_size) = read_u16_le(chunk, body_offset) else {
+            continue;
+        };
+        if structure_size != 17 {
+            continue;
+        }
+
+        let Some(data_offset) = read_u8(chunk, body_offset + 2).map(usize::from) else {
+            continue;
+        };
+        let Some(length) = read_u32_le(chunk, body_offset + 4) else {
+            continue;
+        };
+        if length == 0 {
+            continue;
+        }
+
+        let data_range = {
+            let start = header_offset.saturating_add(data_offset);
+            let end = start.saturating_add(length as usize);
+            (start < end && end <= chunk.len()).then_some((start, end))
+        };
+
+        responses.push(Smb2ReadResponse {
+            message_id,
+            length,
+            data_range,
+        });
+    }
+
+    responses
+}
+
+pub fn extract_smb2_close_requests(chunk: &[u8]) -> Vec<Smb2CloseRequest> {
+    let mut requests = Vec::new();
+
+    for header_offset in smb2_header_offsets(chunk) {
+        let Some(command) = read_u16_le(chunk, header_offset + 12) else {
+            continue;
+        };
+        if command != 6 {
+            continue;
+        }
+
+        let body_offset = header_offset + 64;
+        let Some(structure_size) = read_u16_le(chunk, body_offset) else {
+            continue;
+        };
+        if structure_size != 24 {
+            continue;
+        }
+
+        let Some(file_id_bytes) = chunk.get(body_offset + 8..body_offset + 24) else {
+            continue;
+        };
+        let Ok(file_id) = <[u8; 16]>::try_from(file_id_bytes) else {
+            continue;
+        };
+
+        requests.push(Smb2CloseRequest { file_id });
     }
 
     requests
@@ -1908,6 +2224,10 @@ fn first_smb2_header_offset(chunk: &[u8]) -> Option<usize> {
     chunk.windows(4).position(|window| window == b"\xFESMB")
 }
 
+fn read_u8(bytes: &[u8], offset: usize) -> Option<u8> {
+    bytes.get(offset).copied()
+}
+
 fn read_u16_le(bytes: &[u8], offset: usize) -> Option<u16> {
     let pair = bytes.get(offset..offset + 2)?;
     Some(u16::from_le_bytes([pair[0], pair[1]]))
@@ -1923,6 +2243,16 @@ fn read_u64_le(bytes: &[u8], offset: usize) -> Option<u64> {
     Some(u64::from_le_bytes([
         octet[0], octet[1], octet[2], octet[3], octet[4], octet[5], octet[6], octet[7],
     ]))
+}
+
+fn windows_filetime_to_unix_timestamp_seconds(filetime: u64) -> Option<u64> {
+    if filetime == 0 {
+        return None;
+    }
+
+    const WINDOWS_TO_UNIX_EPOCH_SECONDS: u64 = 11_644_473_600;
+    let seconds = filetime / 10_000_000;
+    seconds.checked_sub(WINDOWS_TO_UNIX_EPOCH_SECONDS)
 }
 
 fn decode_utf16le_path(bytes: &[u8]) -> Option<String> {
@@ -2208,6 +2538,7 @@ mod tests {
                 threshold: 7.90,
                 minimum_chunk_size: 8192,
             },
+            reputation: axiom_config::ReputationPolicyConfig::default(),
             signatures: Vec::new(),
         });
         let context = test_context();
@@ -2283,6 +2614,7 @@ mod tests {
             vec![Smb2WriteRequest {
                 file_id: test_file_id(),
                 length: 65_536,
+                data_range: None,
             }]
         );
     }
@@ -2298,6 +2630,7 @@ mod tests {
             vec![Smb2CreateResponse {
                 message_id: 42,
                 file_id: test_file_id(),
+                creation_time_unix_timestamp_seconds: None,
             }]
         );
     }
