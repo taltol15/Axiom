@@ -1217,6 +1217,7 @@ write_config() {
     echo "state_path = \"/var/lib/axiom/license-state.json\""
     echo "trial_days = 30"
     echo "warn_before_expiry_days = 14"
+    echo "public_key_hex = \"\""
     echo
     echo "[dns]"
     echo "enabled = ${DNS_ENABLED}"

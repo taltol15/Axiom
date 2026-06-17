@@ -24,7 +24,7 @@ axum = "0.8.9"
 axum-server = { version = "0.7", features = ["tls-rustls"] }
 base64 = "0.22"
 chacha20poly1305 = "0.10"
-ed25519-dalek = { version = "2", default-features = false, features = ["std"] }
+ed25519-dalek = { version = "2", default-features = false, features = ["std", "rand_core"] }
 getrandom = "0.3"
 ldap3 = { version = "0.12", default-features = false, features = ["tls-rustls-ring"] }
 libc = "0.2"

@@ -78,6 +78,53 @@ Directory authentication. Directory settings are written under
 uses the DC/DNS resolver, client IPs in SMB and DNS telemetry are enriched with
 hostnames where PTR records exist.
 
+## Offline Licensing
+
+Axiom starts with a local offline trial when no license is installed. The
+management UI exposes the activation request under Settings, and an admin can
+install a signed license package there without giving the server internet
+access.
+
+For lab issuance, generate an Ed25519 key pair on a trusted issuing workstation:
+
+```bash
+cargo run -p axiom-license --bin axiom-license-tool -- generate-key
+```
+
+Keep the private key outside git and customer systems. For lab testing only,
+copy the generated `public_key_hex` into the management server config:
+
+```toml
+[license]
+public_key_hex = "generated_public_key_hex"
+```
+
+Restart management after changing the public key:
+
+```bash
+sudo systemctl restart axiom
+```
+
+Then copy the Activation Request from the management UI and issue a license:
+
+```bash
+export AXIOM_LICENSE_PRIVATE_KEY_HEX="generated_private_key_hex"
+cargo run -p axiom-license --bin axiom-license-tool -- issue \
+  --request activation-request.txt \
+  --customer "Customer Lab" \
+  --edition enterprise \
+  --days 365 \
+  --max-smb-nodes 5 \
+  --max-dns-nodes 5 \
+  --max-protected-clients 5000 \
+  --max-reputation-entries 100000 \
+  --output license.json
+```
+
+Paste `license.json` into Settings -> Offline Licensing -> Install signed
+license. Production issuance should use the official Axiom signing key, with
+only the public verification key present in customer deployments.
+
 ## Policies
 
 The management UI includes runtime policy controls for SMB archive detection,

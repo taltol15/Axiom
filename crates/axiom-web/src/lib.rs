@@ -2454,6 +2454,83 @@ const LOGIN_HTML: &str = r##"<!doctype html>
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Axiom Management Login</title>
   <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background: #09090b;
+      color: #f8fafc;
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      letter-spacing: 0;
+    }
+    main { display: grid; min-height: 100vh; grid-template-columns: 1fr; }
+    section { padding: 3rem 2rem; }
+    section:first-child {
+      align-items: center;
+      background:
+        radial-gradient(circle at 20% 20%, rgba(16, 185, 129, 0.28), transparent 30%),
+        radial-gradient(circle at 80% 10%, rgba(14, 165, 233, 0.18), transparent 28%),
+        linear-gradient(135deg, #09090b, #18181b 58%, #052e2b);
+      display: flex;
+      overflow: hidden;
+      position: relative;
+    }
+    section:last-child { align-items: center; display: flex; justify-content: center; }
+    h1 { color: #fff; font-size: clamp(3rem, 8vw, 5.5rem); line-height: 1; margin: 0; }
+    h2 { color: #fff; font-size: 1.875rem; line-height: 2.25rem; margin: 0.75rem 0 0; }
+    p { margin: 0; }
+    form { display: grid; gap: 1.25rem; }
+    label, span { display: block; }
+    input, select {
+      background: #09090b;
+      border: 1px solid #3f3f46;
+      border-radius: 6px;
+      color: #fff;
+      margin-top: 0.5rem;
+      outline: none;
+      padding: 0.75rem 1rem;
+      width: 100%;
+    }
+    input:focus, select:focus {
+      border-color: #34d399;
+      box-shadow: 0 0 0 3px rgba(52, 211, 153, 0.18);
+    }
+    button {
+      background: #34d399;
+      border: 0;
+      border-radius: 6px;
+      color: #09090b;
+      cursor: pointer;
+      font-weight: 700;
+      padding: 0.75rem 1rem;
+      width: 100%;
+    }
+    button:hover { background: #6ee7b7; }
+    .max-w-3xl { max-width: 48rem; }
+    .max-w-md { max-width: 28rem; }
+    .w-full { width: 100%; }
+    .rounded-lg { border-radius: 8px; }
+    .border { border: 1px solid #27272a; }
+    .bg-zinc-900\/80 { background: rgba(24, 24, 27, 0.82); }
+    .p-8 { padding: 2rem; }
+    .shadow-2xl { box-shadow: 0 24px 70px rgba(0, 0, 0, 0.34); }
+    .mb-8 { margin-bottom: 2rem; }
+    .mt-2 { margin-top: 0.5rem; }
+    .mt-3 { margin-top: 0.75rem; }
+    .mt-6 { margin-top: 1.5rem; }
+    .mb-8 { margin-bottom: 2rem; }
+    .text-sm { font-size: 0.875rem; line-height: 1.25rem; }
+    .text-lg { font-size: 1.125rem; line-height: 1.75rem; }
+    .text-zinc-300 { color: #d4d4d8; }
+    .text-emerald-300 { color: #6ee7b7; }
+    .hidden { display: none; }
+    .uppercase { text-transform: uppercase; }
+    [class*="tracking-"] { letter-spacing: 0 !important; }
+    @media (min-width: 1024px) {
+      main { grid-template-columns: 1.1fr 0.9fr; }
+    }
+  </style>
 </head>
 <body class="min-h-screen bg-zinc-950 text-zinc-100">
   <main class="grid min-h-screen grid-cols-1 lg:grid-cols-[1.1fr_0.9fr]">
@@ -2543,16 +2620,164 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
   <title>Axiom Dashboard</title>
   <script src="https://cdn.tailwindcss.com"></script>
   <style>
+    :root {
+      --page: #eef5f8;
+      --page-soft: #f8fafc;
+      --surface: rgba(255, 255, 255, 0.94);
+      --surface-strong: #ffffff;
+      --surface-subtle: #f1f5f9;
+      --border: #d7e1ea;
+      --border-strong: #b8c7d5;
+      --text: #0f172a;
+      --muted: #64748b;
+      --faint: #94a3b8;
+      --nav: #0f172a;
+      --nav-soft: #111827;
+      --accent: #34d399;
+      --accent-strong: #10b981;
+      --danger: #ef4444;
+      --warning: #d97706;
+      --info: #0284c7;
+      --shadow: 0 14px 36px rgba(15, 23, 42, 0.08);
+      --shadow-soft: 0 8px 22px rgba(15, 23, 42, 0.06);
+    }
+
+    html[data-theme="dark"] {
+      --page: #07111f;
+      --page-soft: #0b1220;
+      --surface: rgba(15, 23, 42, 0.94);
+      --surface-strong: #111827;
+      --surface-subtle: #0b1220;
+      --border: #263244;
+      --border-strong: #334155;
+      --text: #f8fafc;
+      --muted: #a8b3c5;
+      --faint: #7b8798;
+      --nav: #050b16;
+      --nav-soft: #0b1220;
+      --shadow: 0 18px 42px rgba(0, 0, 0, 0.22);
+      --shadow-soft: 0 10px 28px rgba(0, 0, 0, 0.18);
+    }
+
+    * { box-sizing: border-box; }
+
+    .min-h-screen { min-height: 100vh; }
+    .mx-auto { margin-left: auto; margin-right: auto; }
+    .max-w-7xl { max-width: 80rem; }
+    .max-w-full { max-width: 100%; }
+    .w-full { width: 100%; }
+    .w-80 { width: 20rem; }
+    .w-fit { width: fit-content; }
+    .min-w-full { min-width: 100%; }
+    .min-w-0 { min-width: 0; }
+    .max-h-96 { max-height: 24rem; }
+    .flex { display: flex; }
+    .grid { display: grid; }
+    .block { display: block; }
+    .hidden { display: none; }
+    .inline-flex { display: inline-flex; }
+    .flex-col { flex-direction: column; }
+    .flex-wrap { flex-wrap: wrap; }
+    .items-center { align-items: center; }
+    .items-start { align-items: flex-start; }
+    .items-end { align-items: flex-end; }
+    .justify-between { justify-content: space-between; }
+    .gap-1 { gap: 0.25rem; }
+    .gap-2 { gap: 0.5rem; }
+    .gap-3 { gap: 0.75rem; }
+    .gap-4 { gap: 1rem; }
+    .gap-5 { gap: 1.25rem; }
+    .gap-6 { gap: 1.5rem; }
+    .shrink-0 { flex-shrink: 0; }
+    .grid-cols-1 { grid-template-columns: repeat(1, minmax(0, 1fr)); }
+    .overflow-x-auto { overflow-x: auto; }
+    .overflow-auto { overflow: auto; }
+    .overflow-hidden { overflow: hidden; }
+    .truncate { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .whitespace-nowrap { white-space: nowrap; }
+    .whitespace-pre-wrap { white-space: pre-wrap; }
+    .rounded-full { border-radius: 9999px; }
+    .border { border-width: 1px; border-style: solid; }
+    .border-b { border-bottom-width: 1px; border-bottom-style: solid; }
+    .border-t { border-top-width: 1px; border-top-style: solid; }
+    .divide-y > :not([hidden]) ~ :not([hidden]) { border-top-width: 1px; border-top-style: solid; }
+    .p-4 { padding: 1rem; }
+    .p-6 { padding: 1.5rem; }
+    .px-2\.5 { padding-left: 0.625rem; padding-right: 0.625rem; }
+    .px-3 { padding-left: 0.75rem; padding-right: 0.75rem; }
+    .px-4 { padding-left: 1rem; padding-right: 1rem; }
+    .px-6 { padding-left: 1.5rem; padding-right: 1.5rem; }
+    .py-1 { padding-top: 0.25rem; padding-bottom: 0.25rem; }
+    .py-2 { padding-top: 0.5rem; padding-bottom: 0.5rem; }
+    .py-3 { padding-top: 0.75rem; padding-bottom: 0.75rem; }
+    .py-4 { padding-top: 1rem; padding-bottom: 1rem; }
+    .py-5 { padding-top: 1.25rem; padding-bottom: 1.25rem; }
+    .py-6 { padding-top: 1.5rem; padding-bottom: 1.5rem; }
+    .py-8 { padding-top: 2rem; padding-bottom: 2rem; }
+    .mt-1 { margin-top: 0.25rem; }
+    .mt-2 { margin-top: 0.5rem; }
+    .mt-3 { margin-top: 0.75rem; }
+    .mt-4 { margin-top: 1rem; }
+    .mt-8 { margin-top: 2rem; }
+    .uppercase { text-transform: uppercase; }
+    .font-mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; }
+    .font-medium { font-weight: 500; }
+    .font-semibold { font-weight: 650; }
+    .text-left { text-align: left; }
+    .text-right { text-align: right; }
+    .text-xs { font-size: 0.75rem; line-height: 1rem; }
+    .text-sm { font-size: 0.875rem; line-height: 1.25rem; }
+    .text-lg { font-size: 1.125rem; line-height: 1.75rem; }
+    .text-xl { font-size: 1.25rem; line-height: 1.75rem; }
+    [class*="tracking-"] { letter-spacing: 0 !important; }
+
+    @media (min-width: 640px) {
+      .sm\:grid-cols-2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .sm\:grid-cols-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    }
+
+    @media (min-width: 768px) {
+      .md\:grid-cols-2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .md\:grid-cols-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+      .md\:grid-cols-4 { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+      .md\:flex-row { flex-direction: row; }
+      .md\:items-center { align-items: center; }
+      .md\:items-end { align-items: flex-end; }
+      .md\:justify-between { justify-content: space-between; }
+    }
+
+    @media (min-width: 1024px) {
+      .lg\:grid-cols-2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .lg\:grid-cols-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+      .lg\:grid-cols-\[1fr_1fr\] { grid-template-columns: 1fr 1fr; }
+      .lg\:col-span-2 { grid-column: span 2 / span 2; }
+      .lg\:col-span-3 { grid-column: span 3 / span 3; }
+      .lg\:flex-row { flex-direction: row; }
+      .lg\:items-center { align-items: center; }
+      .lg\:justify-between { justify-content: space-between; }
+      .lg\:text-right { text-align: right; }
+    }
+
+    @media (min-width: 1280px) {
+      .xl\:grid-cols-5 { grid-template-columns: repeat(5, minmax(0, 1fr)); }
+    }
+
     body {
       background:
-        linear-gradient(180deg, #eef5f8 0%, #f7fafc 44%, #edf2f7 100%);
-      color: #111827;
+        linear-gradient(180deg, var(--page) 0%, var(--page-soft) 46%, var(--page) 100%);
+      color: var(--text);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      letter-spacing: 0;
+      margin: 0;
     }
 
     header {
-      background: #0f172a !important;
-      border-color: #1e293b !important;
+      background: linear-gradient(90deg, var(--nav) 0%, var(--nav-soft) 100%) !important;
+      border-color: rgba(148, 163, 184, 0.18) !important;
       box-shadow: 0 18px 46px rgba(15, 23, 42, 0.18);
+      position: sticky;
+      top: 0;
+      z-index: 30;
     }
 
     header h1,
@@ -2561,27 +2786,68 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
       color: #f8fafc !important;
     }
 
-    main > section,
+    main > .dashboard-view > section,
     main article {
-      background: rgba(255, 255, 255, 0.92) !important;
-      border-color: #d8e2ea !important;
-      box-shadow: 0 12px 30px rgba(15, 23, 42, 0.07);
+      background: var(--surface) !important;
+      border-color: var(--border) !important;
+      box-shadow: var(--shadow);
     }
 
     main article {
-      min-height: 132px;
+      min-height: 142px;
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+      overflow: hidden;
+      position: relative;
+    }
+
+    main article::before {
+      background: linear-gradient(90deg, var(--accent), transparent);
+      content: "";
+      height: 3px;
+      inset: 0 0 auto 0;
+      opacity: 0.75;
+      position: absolute;
     }
 
     main .text-white,
     main .text-zinc-100,
     main .text-zinc-200,
     main .text-zinc-300 {
-      color: #111827 !important;
+      color: var(--text) !important;
     }
 
     main .text-zinc-400,
     main .text-zinc-500 {
-      color: #64748b !important;
+      color: var(--muted) !important;
+    }
+
+    html:not([data-theme="dark"]) main .text-emerald-100,
+    html:not([data-theme="dark"]) main .text-emerald-200,
+    html:not([data-theme="dark"]) main .text-emerald-300,
+    html:not([data-theme="dark"]) main .text-emerald-700 {
+      color: #047857 !important;
+    }
+
+    html:not([data-theme="dark"]) main .text-red-100,
+    html:not([data-theme="dark"]) main .text-red-200,
+    html:not([data-theme="dark"]) main .text-red-300,
+    html:not([data-theme="dark"]) main .text-red-700 {
+      color: #b91c1c !important;
+    }
+
+    html:not([data-theme="dark"]) main .text-amber-100,
+    html:not([data-theme="dark"]) main .text-amber-200,
+    html:not([data-theme="dark"]) main .text-amber-500,
+    html:not([data-theme="dark"]) main .text-amber-700 {
+      color: #b45309 !important;
+    }
+
+    html:not([data-theme="dark"]) main .text-sky-200,
+    html:not([data-theme="dark"]) main .text-cyan-200,
+    html:not([data-theme="dark"]) main .text-cyan-300 {
+      color: #0369a1 !important;
     }
 
     main .bg-zinc-950,
@@ -2589,35 +2855,59 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
     main .bg-zinc-950\/60,
     main .bg-zinc-900,
     main .hover\:bg-zinc-800\/40:hover {
-      background-color: #ffffff !important;
+      background-color: var(--surface-strong) !important;
     }
 
     main .border-zinc-700,
     main .border-zinc-800,
     main .divide-zinc-800 > :not([hidden]) ~ :not([hidden]) {
-      border-color: #d8e2ea !important;
+      border-color: var(--border) !important;
     }
 
     select,
     input {
-      background: #f8fafc !important;
-      color: #111827 !important;
-      border-color: #cbd5e1 !important;
+      background: var(--surface-strong) !important;
+      color: var(--text) !important;
+      border-color: var(--border-strong) !important;
     }
 
     textarea,
     pre {
-      background: #101827 !important;
+      background: #0b1220 !important;
       color: #dbeafe !important;
       border-color: #263247 !important;
     }
 
+    table {
+      border-collapse: separate;
+      border-spacing: 0;
+      font-size: 0.9rem;
+    }
+
     table thead {
-      background: #f1f5f9 !important;
+      background: var(--surface-subtle) !important;
+    }
+
+    table th {
+      color: var(--muted) !important;
+      white-space: nowrap;
+    }
+
+    table td {
+      color: var(--text);
+      vertical-align: top;
+    }
+
+    tbody tr {
+      transition: background-color 140ms ease;
+    }
+
+    tbody tr:hover {
+      background: rgba(52, 211, 153, 0.08) !important;
     }
 
     .policy-preset {
-      background: #ffffff !important;
+      background: var(--surface-strong) !important;
     }
 
     .dashboard-view {
@@ -2626,12 +2916,71 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
 
     .dashboard-view.active {
       display: block;
+      animation: axiom-fade 160ms ease-out;
+    }
+
+    @keyframes axiom-fade {
+      from { opacity: 0; transform: translateY(4px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+
+    .top-nav-button {
+      background: rgba(15, 23, 42, 0.32);
+      border-color: rgba(148, 163, 184, 0.28) !important;
+      color: #e2e8f0 !important;
+      min-height: 42px;
     }
 
     .top-nav-button.active {
-      background: #34d399;
-      border-color: #34d399;
+      background: var(--accent);
+      border-color: var(--accent);
       color: #0f172a !important;
+      box-shadow: 0 10px 24px rgba(52, 211, 153, 0.22);
+    }
+
+    .top-nav-button:hover {
+      background: rgba(52, 211, 153, 0.12);
+      border-color: rgba(52, 211, 153, 0.65) !important;
+      color: #ecfdf5 !important;
+    }
+
+    .rounded-lg {
+      border-radius: 8px !important;
+    }
+
+    .rounded-md {
+      border-radius: 6px !important;
+    }
+
+    .text-4xl {
+      font-size: clamp(2rem, 3vw, 2.6rem) !important;
+      line-height: 1.08 !important;
+    }
+
+    .text-3xl {
+      font-size: clamp(1.65rem, 2.5vw, 2.1rem) !important;
+      line-height: 1.12 !important;
+    }
+
+    footer {
+      background: var(--nav) !important;
+      border-color: rgba(148, 163, 184, 0.18) !important;
+    }
+
+    @media (max-width: 768px) {
+      header {
+        position: static;
+      }
+
+      nav[aria-label="Dashboard sections"] {
+        overflow-x: auto;
+        flex-wrap: nowrap;
+        padding-bottom: 1rem;
+      }
+
+      .top-nav-button {
+        flex: 0 0 auto;
+      }
     }
   </style>
 </head>
@@ -4510,16 +4859,28 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
         payload.restart_command || "sudo systemctl restart axiom.service";
     }
 
+    function applyTheme(theme) {
+      const selected = theme || "system";
+      const effective = selected === "system"
+        ? (window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light")
+        : selected;
+      document.documentElement.dataset.theme = effective;
+      document.documentElement.dataset.themePreference = selected;
+    }
+
     function loadLocalSettings() {
       document.getElementById("settings-display-name").value =
         localStorage.getItem("axiomDisplayName") || "Axiom Administrator";
-      document.getElementById("settings-theme").value =
-        localStorage.getItem("axiomTheme") || "system";
+      const theme = localStorage.getItem("axiomTheme") || "system";
+      document.getElementById("settings-theme").value = theme;
+      applyTheme(theme);
     }
 
     function saveLocalSettings() {
       localStorage.setItem("axiomDisplayName", document.getElementById("settings-display-name").value.trim() || "Axiom Administrator");
-      localStorage.setItem("axiomTheme", document.getElementById("settings-theme").value);
+      const theme = document.getElementById("settings-theme").value;
+      localStorage.setItem("axiomTheme", theme);
+      applyTheme(theme);
       document.getElementById("settings-state").textContent = `Settings saved locally · ${new Date().toLocaleTimeString()}`;
     }
 
@@ -4539,6 +4900,7 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
     document.getElementById("install-license").addEventListener("click", installLicense);
     document.getElementById("enable-https").addEventListener("click", () => saveTlsSettings(true));
     document.getElementById("disable-https").addEventListener("click", () => saveTlsSettings(false));
+    document.getElementById("settings-theme").addEventListener("change", (event) => applyTheme(event.target.value));
     document.getElementById("rep-add-button").addEventListener("click", addReputationEntry);
     document.getElementById("rep-import-button").addEventListener("click", importReputationEntries);
     document.getElementById("reputation-search").addEventListener("input", renderReputationTable);

@@ -5,7 +5,7 @@ use std::{
 };
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
-use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -29,6 +29,8 @@ pub struct LicenseConfig {
     pub trial_days: u64,
     #[serde(default = "default_warn_before_expiry_days")]
     pub warn_before_expiry_days: u64,
+    #[serde(default)]
+    pub public_key_hex: Option<String>,
 }
 
 impl Default for LicenseConfig {
@@ -39,6 +41,7 @@ impl Default for LicenseConfig {
             state_path: default_license_state_path(),
             trial_days: default_trial_days(),
             warn_before_expiry_days: default_warn_before_expiry_days(),
+            public_key_hex: None,
         }
     }
 }
@@ -60,6 +63,16 @@ impl LicenseConfig {
         if self.trial_days == 0 {
             return Err(LicenseError::InvalidConfig(
                 "license.trial_days must be greater than zero".to_string(),
+            ));
+        }
+
+        if let Some(public_key_hex) = self.public_key_hex.as_deref()
+            && !public_key_hex.trim().is_empty()
+            && decode_hex_32(public_key_hex.trim()).is_err()
+        {
+            return Err(LicenseError::InvalidConfig(
+                "license.public_key_hex must be a 32-byte hex encoded Ed25519 public key"
+                    .to_string(),
             ));
         }
 
@@ -174,6 +187,10 @@ pub enum LicenseError {
     InvalidSignature,
     #[error("license public key is invalid")]
     InvalidPublicKey,
+    #[error("license private key is invalid")]
+    InvalidPrivateKey,
+    #[error("license random source failed: {0}")]
+    Random(String),
     #[error("license signature encoding is invalid")]
     InvalidSignatureEncoding,
     #[error("license is not valid for this machine")]
@@ -207,7 +224,11 @@ pub fn evaluate_license(config: &LicenseConfig, usage: LicenseUsage) -> LicenseS
         );
     }
 
-    match load_license(&config.license_path, &fingerprint) {
+    match load_license(
+        &config.license_path,
+        &fingerprint,
+        license_public_key_hex(config),
+    ) {
         Ok(Some(payload)) => status_from_payload(
             config,
             payload,
@@ -249,15 +270,70 @@ pub fn install_license_text(
     let fingerprint = machine_fingerprint();
     let normalized = normalize_license_text(license_text)?;
     let envelope: LicenseEnvelope = serde_json::from_str(&normalized)?;
-    verify_license_envelope(&envelope, &fingerprint)?;
+    verify_license_envelope(&envelope, &fingerprint, license_public_key_hex(config))?;
 
     write_file(&config.license_path, normalized.as_bytes())?;
     Ok(evaluate_license(config, usage))
 }
 
+pub fn default_public_key_hex() -> &'static str {
+    AXIOM_LICENSE_PUBLIC_KEY_HEX
+}
+
+pub fn decode_activation_request_text(value: &str) -> Result<ActivationRequest, LicenseError> {
+    let trimmed = value.trim();
+    if trimmed.starts_with('{') {
+        return serde_json::from_str(trimmed).map_err(LicenseError::Parse);
+    }
+
+    let decoded = BASE64
+        .decode(trimmed)
+        .map_err(|_| LicenseError::InvalidSignatureEncoding)?;
+    let decoded_text =
+        String::from_utf8(decoded).map_err(|_| LicenseError::InvalidSignatureEncoding)?;
+    serde_json::from_str(&decoded_text).map_err(LicenseError::Parse)
+}
+
+pub fn generate_signing_key_hex() -> Result<(String, String), LicenseError> {
+    let mut private_key = [0_u8; 32];
+    getrandom::fill(&mut private_key).map_err(|error| LicenseError::Random(error.to_string()))?;
+    let public_key = SigningKey::from_bytes(&private_key).verifying_key();
+    Ok((hex(&private_key), hex(public_key.as_bytes())))
+}
+
+pub fn public_key_hex_from_private_key_hex(private_key_hex: &str) -> Result<String, LicenseError> {
+    let private_key_bytes =
+        decode_hex_32(private_key_hex.trim()).map_err(|_| LicenseError::InvalidPrivateKey)?;
+    let public_key = SigningKey::from_bytes(&private_key_bytes).verifying_key();
+    Ok(hex(public_key.as_bytes()))
+}
+
+pub fn sign_license_payload(
+    payload: &LicensePayload,
+    private_key_hex: &str,
+) -> Result<LicenseEnvelope, LicenseError> {
+    let private_key_bytes =
+        decode_hex_32(private_key_hex.trim()).map_err(|_| LicenseError::InvalidPrivateKey)?;
+    let signing_key = SigningKey::from_bytes(&private_key_bytes);
+    let payload_bytes = serde_json::to_vec(payload)?;
+    let signature = signing_key.sign(&payload_bytes);
+
+    Ok(LicenseEnvelope {
+        payload: payload.clone(),
+        signature: BASE64.encode(signature.to_bytes()),
+    })
+}
+
+pub fn encode_license_envelope_b64(envelope: &LicenseEnvelope) -> Result<String, LicenseError> {
+    serde_json::to_vec_pretty(envelope)
+        .map(|bytes| BASE64.encode(bytes))
+        .map_err(LicenseError::Parse)
+}
+
 fn load_license(
     license_path: &str,
     machine_fingerprint: &str,
+    public_key_hex: &str,
 ) -> Result<Option<LicensePayload>, LicenseError> {
     let path = Path::new(license_path);
     if !path.exists() {
@@ -266,13 +342,14 @@ fn load_license(
 
     let contents = read_to_string(path)?;
     let envelope: LicenseEnvelope = serde_json::from_str(&contents)?;
-    verify_license_envelope(&envelope, machine_fingerprint)?;
+    verify_license_envelope(&envelope, machine_fingerprint, public_key_hex)?;
     Ok(Some(envelope.payload))
 }
 
 fn verify_license_envelope(
     envelope: &LicenseEnvelope,
     machine_fingerprint: &str,
+    public_key_hex: &str,
 ) -> Result<(), LicenseError> {
     if let Some(expected_fingerprint) = &envelope.payload.machine_fingerprint
         && expected_fingerprint != machine_fingerprint
@@ -281,7 +358,7 @@ fn verify_license_envelope(
     }
 
     let public_key_bytes =
-        decode_hex_32(AXIOM_LICENSE_PUBLIC_KEY_HEX).map_err(|_| LicenseError::InvalidPublicKey)?;
+        decode_hex_32(public_key_hex).map_err(|_| LicenseError::InvalidPublicKey)?;
     let verifying_key =
         VerifyingKey::from_bytes(&public_key_bytes).map_err(|_| LicenseError::InvalidPublicKey)?;
     let signature_bytes = BASE64
@@ -552,6 +629,15 @@ fn normalize_license_text(value: &str) -> Result<String, LicenseError> {
     serde_json::to_string_pretty(&envelope).map_err(LicenseError::Parse)
 }
 
+fn license_public_key_hex(config: &LicenseConfig) -> &str {
+    config
+        .public_key_hex
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(AXIOM_LICENSE_PUBLIC_KEY_HEX)
+}
+
 fn build_activation_request(
     config: &LicenseConfig,
     usage: LicenseUsage,
@@ -762,6 +848,57 @@ mod tests {
         assert!(status.valid);
         assert!(status.trial);
         assert!(Path::new(&config.state_path).exists());
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn signed_license_installs_with_configured_public_key() {
+        let base =
+            std::env::temp_dir().join(format!("axiom-license-signed-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+
+        let (private_key_hex, public_key_hex) = generate_signing_key_hex().unwrap();
+        let config = LicenseConfig {
+            license_path: base.join("license.json").display().to_string(),
+            state_path: base.join("license-state.json").display().to_string(),
+            public_key_hex: Some(public_key_hex),
+            ..LicenseConfig::default()
+        };
+
+        let usage = LicenseUsage {
+            management_nodes: 1,
+            smb_nodes: 1,
+            dns_nodes: 1,
+            protected_clients: 20,
+            reputation_entries: 8,
+        };
+        let activation = evaluate_license(&config, usage.clone()).activation_request;
+        let payload = LicensePayload {
+            license_id: "LIC-TEST-001".to_string(),
+            customer_name: "Axiom Test Lab".to_string(),
+            edition: "lab".to_string(),
+            issued_at_unix_timestamp_seconds: unix_timestamp_seconds(),
+            expires_at_unix_timestamp_seconds: unix_timestamp_seconds() + 86_400 * 30,
+            features: vec!["management".to_string(), "smb_protection".to_string()],
+            limits: LicenseLimits {
+                max_smb_nodes: Some(3),
+                max_dns_nodes: Some(3),
+                max_protected_clients: Some(100),
+                max_reputation_entries: Some(1_000),
+            },
+            machine_fingerprint: Some(activation.machine_fingerprint),
+            allowed_node_ids: Vec::new(),
+            notes: Some("test license".to_string()),
+        };
+        let envelope = sign_license_payload(&payload, &private_key_hex).unwrap();
+        let license_text = serde_json::to_string_pretty(&envelope).unwrap();
+        let status = install_license_text(&config, &license_text, usage).unwrap();
+
+        assert_eq!(status.state, LicenseState::Licensed);
+        assert!(status.valid);
+        assert_eq!(status.license_id.as_deref(), Some("LIC-TEST-001"));
 
         let _ = fs::remove_dir_all(&base);
     }

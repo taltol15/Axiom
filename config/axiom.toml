@@ -31,6 +31,7 @@ license_path = "/etc/axiom/license.json"
 state_path = "/var/lib/axiom/license-state.json"
 trial_days = 30
 warn_before_expiry_days = 14
+public_key_hex = ""
 
 [dns]
 enabled = true
