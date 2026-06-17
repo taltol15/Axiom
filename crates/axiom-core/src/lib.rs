@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     fs::OpenOptions,
     io::Write,
     net::SocketAddr,
@@ -40,6 +40,7 @@ pub struct AppState {
     recent_audit_events: Mutex<VecDeque<AuditEvent>>,
     recent_dns_events: Mutex<VecDeque<DnsQueryEvent>>,
     completed_file_hashes: Mutex<VecDeque<CompletedFileTransfer>>,
+    known_bad_reputation_hashes: RwLock<HashSet<String>>,
 }
 
 impl AppState {
@@ -62,6 +63,7 @@ impl AppState {
             completed_file_hashes: Mutex::new(VecDeque::with_capacity(
                 MAX_RETAINED_FILE_HASH_EVENTS,
             )),
+            known_bad_reputation_hashes: RwLock::new(HashSet::new()),
         }
     }
 
@@ -246,6 +248,26 @@ impl AppState {
 
     pub fn record_allowed_chunk(&self) {
         self.counters.allowed_chunks.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn update_known_bad_reputation_hashes(&self, hashes: Vec<String>) {
+        let normalized_hashes = hashes
+            .into_iter()
+            .map(|hash| hash.trim().to_ascii_lowercase())
+            .filter(|hash| hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()))
+            .collect();
+        *self
+            .known_bad_reputation_hashes
+            .write()
+            .expect("known bad reputation hashes lock poisoned") = normalized_hashes;
+    }
+
+    pub fn is_known_bad_reputation_hash(&self, sha256: &str) -> bool {
+        let normalized = sha256.trim().to_ascii_lowercase();
+        self.known_bad_reputation_hashes
+            .read()
+            .expect("known bad reputation hashes lock poisoned")
+            .contains(&normalized)
     }
 
     pub fn record_file_observed(

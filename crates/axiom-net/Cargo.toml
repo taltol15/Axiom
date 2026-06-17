@@ -10,6 +10,7 @@ rust-version.workspace = true
 anyhow.workspace = true
 axiom-config = { path = "../axiom-config" }
 axiom-core = { path = "../axiom-core" }
+axiom-reputation = { path = "../axiom-reputation" }
 libc.workspace = true
 md-5.workspace = true
 sha2.workspace = true

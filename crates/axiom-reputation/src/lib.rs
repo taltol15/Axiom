@@ -313,6 +313,18 @@ impl ReputationStore {
         }
     }
 
+    pub fn known_bad_sha256s(&self) -> Vec<String> {
+        let db = self.db.lock().expect("reputation db mutex poisoned");
+        let mut hashes: Vec<_> = db
+            .entries
+            .iter()
+            .filter(|entry| entry.verdict == ReputationVerdict::KnownBad)
+            .map(|entry| entry.sha256.clone())
+            .collect();
+        hashes.sort();
+        hashes
+    }
+
     pub fn create(
         &self,
         request: ReputationCreateRequest,
@@ -781,6 +793,40 @@ mod tests {
 
         let second_lookup = store.lookup(&sha256).unwrap();
         assert_eq!(second_lookup.entry.unwrap().hit_count, 2);
+    }
+
+    #[test]
+    fn known_bad_feed_contains_only_bad_hashes() {
+        let store = test_store("known-bad-feed");
+        let bad_sha256 = "1".repeat(64);
+        let good_sha256 = "2".repeat(64);
+
+        store
+            .create(
+                ReputationCreateRequest {
+                    sha256: bad_sha256.clone(),
+                    md5: None,
+                    verdict: ReputationVerdict::KnownBad,
+                    source: Some("Administrator".to_string()),
+                    notes: None,
+                },
+                "admin",
+            )
+            .unwrap();
+        store
+            .create(
+                ReputationCreateRequest {
+                    sha256: good_sha256,
+                    md5: None,
+                    verdict: ReputationVerdict::KnownGood,
+                    source: Some("Administrator".to_string()),
+                    notes: None,
+                },
+                "admin",
+            )
+            .unwrap();
+
+        assert_eq!(store.known_bad_sha256s(), vec![bad_sha256]);
     }
 
     #[test]

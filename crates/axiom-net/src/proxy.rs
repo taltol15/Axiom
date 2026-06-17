@@ -6,7 +6,7 @@ use std::{
 };
 
 use anyhow::Context;
-use axiom_config::ProxyListenerConfig;
+use axiom_config::{PolicyMode, ProxyListenerConfig};
 use axiom_core::{
     CompletedFileTransfer, InspectionContext, InspectionResult, RuntimeState, Smb2CloseRequest,
     Smb2CreateRequest, Smb2CreateResponse, Smb2ReadRequest, Smb2ReadResponse, Smb2WriteRequest,
@@ -15,6 +15,7 @@ use axiom_core::{
     extract_smb2_create_requests, extract_smb2_create_responses, extract_smb2_read_requests,
     extract_smb2_read_responses, extract_smb2_write_requests,
 };
+use axiom_reputation::KnownBadAction;
 use md5::Md5;
 use sha2::{Digest, Sha256};
 use tokio::{
@@ -297,12 +298,17 @@ async fn inspect_and_forward_frame(
         file_path_hint: file_path_hint.as_deref(),
     };
 
+    let mut known_bad_reputation_match = None;
     if direction == TrafficDirection::ClientToServer {
         for create_request in create_requests {
             telemetry.observe_create_request(state, &context, create_request, frame.len());
         }
         for write_request in write_requests {
-            telemetry.observe_write_request(state, &context, write_request, &frame);
+            if let Some(reputation_match) =
+                telemetry.observe_write_request(state, &context, write_request, &frame)
+            {
+                known_bad_reputation_match = Some(reputation_match);
+            }
         }
         for read_request in read_requests {
             telemetry.observe_read_request(read_request);
@@ -337,6 +343,58 @@ async fn inspect_and_forward_frame(
         }
         for read_response in read_responses {
             telemetry.observe_read_response(&context, read_response, &frame);
+        }
+    }
+
+    if let Some(reputation_match) = known_bad_reputation_match {
+        let reputation_policy = state.policy_config().reputation;
+        if reputation_policy.enabled
+            && matches!(
+                reputation_policy.known_bad_action,
+                KnownBadAction::Block | KnownBadAction::Quarantine
+            )
+        {
+            let action = match reputation_policy.known_bad_action {
+                KnownBadAction::Quarantine => "quarantine",
+                _ => "block",
+            };
+            let event = ThreatEvent::now(
+                &context,
+                PolicyMode::Block,
+                "Known bad reputation hash".to_string(),
+                format!(
+                    "{action} reputation action triggered for SHA256 {} on '{}'",
+                    reputation_match.sha256, reputation_match.file_path
+                ),
+                frame.len(),
+                0.0,
+            );
+            record_blocked_event(state, event);
+            warn!(
+                route = route.name,
+                interface = route.interface(),
+                ?direction,
+                peer = %peer_addr,
+                target = %target_addr,
+                file_path = reputation_match.file_path,
+                sha256 = reputation_match.sha256,
+                bytes_seen = reputation_match.bytes,
+                action,
+                "blocked SMB frame by known bad reputation hash"
+            );
+
+            if let Some(response_writer) = block_response_writer
+                && let Some(response) = build_smb2_error_response(&frame, STATUS_ACCESS_DENIED)
+            {
+                let mut client_writer = response_writer.lock().await;
+                client_writer.write_all(&response).await?;
+                client_writer.shutdown().await?;
+            }
+
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "stream blocked by known bad reputation hash",
+            ));
         }
     }
 
@@ -590,7 +648,7 @@ impl ConnectionTelemetry {
         context: &InspectionContext<'_>,
         request: Smb2WriteRequest,
         frame: &[u8],
-    ) {
+    ) -> Option<KnownBadReputationMatch> {
         let file_path = self
             .open_file_paths
             .lock()
@@ -608,16 +666,26 @@ impl ConnectionTelemetry {
                 .data_range
                 .and_then(|(start, end)| frame.get(start..end))
             {
-                self.update_hash_for_file_id(
+                let progress = self.update_hash_for_file_id(
                     &request.file_id,
                     &file_path,
                     context.direction,
                     payload,
                 );
+                if let Some(progress) = progress
+                    && state.is_known_bad_reputation_hash(&progress.sha256)
+                {
+                    return Some(KnownBadReputationMatch {
+                        file_path,
+                        sha256: progress.sha256,
+                        bytes: progress.bytes,
+                    });
+                }
             }
         } else {
             state.record_smb_write_payload_for_connection(context, request.length as u64);
         }
+        None
     }
 
     fn observe_read_request(&self, request: Smb2ReadRequest) {
@@ -650,7 +718,7 @@ impl ConnectionTelemetry {
             .data_range
             .and_then(|(start, end)| frame.get(start..end))
         {
-            self.update_hash_for_file_id(&file_id, &file_path, context.direction, payload);
+            let _ = self.update_hash_for_file_id(&file_id, &file_path, context.direction, payload);
         }
     }
 
@@ -687,9 +755,9 @@ impl ConnectionTelemetry {
         file_path: &str,
         direction: TrafficDirection,
         payload: &[u8],
-    ) {
+    ) -> Option<FileHashProgress> {
         if payload.is_empty() {
-            return;
+            return None;
         }
 
         let creation_time = self
@@ -701,11 +769,25 @@ impl ConnectionTelemetry {
             .flatten();
 
         let mut hashes = self.file_hashes.lock().expect("file hashes mutex poisoned");
-        hashes
+        let hash_state = hashes
             .entry(*file_id)
-            .or_insert_with(|| FileHashState::new(file_path.to_string(), creation_time))
-            .update(direction, payload);
+            .or_insert_with(|| FileHashState::new(file_path.to_string(), creation_time));
+        hash_state.update(direction, payload);
+        Some(hash_state.progress())
     }
+}
+
+#[derive(Debug, Clone)]
+struct KnownBadReputationMatch {
+    file_path: String,
+    sha256: String,
+    bytes: u64,
+}
+
+#[derive(Debug, Clone)]
+struct FileHashProgress {
+    sha256: String,
+    bytes: u64,
 }
 
 #[derive(Debug)]
@@ -741,6 +823,13 @@ impl FileHashState {
         self.md5.update(payload);
         self.bytes = self.bytes.saturating_add(payload.len() as u64);
         self.last_seen_unix_timestamp_seconds = unix_timestamp_seconds();
+    }
+
+    fn progress(&self) -> FileHashProgress {
+        FileHashProgress {
+            sha256: hex_lower(&self.sha256.clone().finalize()),
+            bytes: self.bytes,
+        }
     }
 
     fn finish(self, context: &InspectionContext<'_>) -> Option<CompletedFileTransfer> {
@@ -942,6 +1031,21 @@ mod tests {
         assert_eq!(u32::from_le_bytes(response[20..24].try_into().unwrap()), 1);
         assert_eq!(u64::from_le_bytes(response[28..36].try_into().unwrap()), 42);
         assert_eq!(u16::from_le_bytes(response[68..70].try_into().unwrap()), 9);
+    }
+
+    #[test]
+    fn file_hash_progress_tracks_streamed_sha256() {
+        let mut state = FileHashState::new("bad.txt".to_string(), None);
+        state.update(TrafficDirection::ClientToServer, b"hello ");
+        state.update(TrafficDirection::ClientToServer, b"world");
+
+        let progress = state.progress();
+
+        assert_eq!(
+            progress.sha256,
+            "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
+        );
+        assert_eq!(progress.bytes, 11);
     }
 
     fn smb2_test_frame(command: u16, message_id: u64) -> Vec<u8> {

@@ -589,6 +589,12 @@ async fn pull_runtime_config(
         runtime.update_dns_policy(dns_policy);
     }
 
+    if let Some(hashes_value) = payload.get("known_bad_reputation_hashes") {
+        let hashes = serde_json::from_value(hashes_value.clone())
+            .context("failed decoding known bad reputation hashes from management")?;
+        runtime.update_known_bad_reputation_hashes(hashes);
+    }
+
     Ok(())
 }
 

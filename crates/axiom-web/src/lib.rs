@@ -318,6 +318,7 @@ async fn api_node_runtime_config(
     Json(NodeRuntimeConfigResponse {
         policy_runtime: state.runtime.policy_runtime_snapshot(),
         dns_policy_runtime: state.runtime.dns_policy_runtime_snapshot(),
+        known_bad_reputation_hashes: state.reputation.known_bad_sha256s(),
     })
     .into_response()
 }
@@ -1944,6 +1945,7 @@ struct NodeAckResponse {
 struct NodeRuntimeConfigResponse {
     policy_runtime: PolicyRuntimeSnapshot,
     dns_policy_runtime: DnsPolicyRuntimeSnapshot,
+    known_bad_reputation_hashes: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2743,7 +2745,7 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
               <input id="policy-reputation-cache-ttl" type="number" min="1" class="mt-2 w-full rounded-md border border-zinc-700 bg-zinc-950 px-3 py-2 text-white">
             </label>
           </div>
-          <p class="mt-2 text-xs leading-5 text-zinc-500">V1 default is alert only. Block and quarantine are policy states for enforcement-ready rollout.</p>
+          <p class="mt-2 text-xs leading-5 text-zinc-500">V1 default is alert. Block/quarantine deny SMB writes when a streamed SHA256 matches a local known_bad reputation hash.</p>
         </div>
 
         <div class="lg:col-span-2">
@@ -3992,6 +3994,7 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
         setMode("policy-zip", "monitor");
         setMode("policy-encrypted-zip", "monitor");
         setMode("policy-entropy-mode", "monitor");
+        document.getElementById("policy-reputation-known-bad-action").value = "alert";
         document.getElementById("policy-entropy-threshold").value = "7.9";
         document.getElementById("policy-entropy-minimum").value = "8192";
       }
@@ -4003,6 +4006,7 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
         setMode("policy-zip", "block");
         setMode("policy-encrypted-zip", "block");
         setMode("policy-entropy-mode", "monitor");
+        document.getElementById("policy-reputation-known-bad-action").value = "alert";
         document.getElementById("policy-entropy-threshold").value = "7.9";
         document.getElementById("policy-entropy-minimum").value = "8192";
       }
@@ -4014,6 +4018,7 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
         setMode("policy-zip", "block");
         setMode("policy-encrypted-zip", "block");
         setMode("policy-entropy-mode", "block");
+        document.getElementById("policy-reputation-known-bad-action").value = "block";
         document.getElementById("policy-entropy-threshold").value = "7.5";
         document.getElementById("policy-entropy-minimum").value = "2048";
       }

@@ -195,6 +195,7 @@ dependencies = [
  "anyhow",
  "axiom-config",
  "axiom-core",
+ "axiom-reputation",
  "libc",
  "md-5",
  "sha2",
