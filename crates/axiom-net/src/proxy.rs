@@ -154,6 +154,7 @@ pub async fn run_proxy_listener(
         listen_addr = %route.listen_addr(),
         target_addr = %route.target_addr(),
         vlan = ?route.client_vlan,
+        inline_reputation_lookup = reputation_lookup.is_some(),
         "SMB proxy listener started"
     );
     state.register_route(
@@ -424,8 +425,9 @@ async fn inspect_and_forward_frame(
             telemetry.observe_create_request(state, &context, create_request, frame.len());
         }
         for write_request in write_requests {
+            let file_path_for_write = telemetry.file_path_for_id(&write_request.file_id);
             if let Some(hash_progress) =
-                telemetry.observe_write_request(state, &context, write_request, &frame)
+                telemetry.observe_write_request(state, &context, write_request.clone(), &frame)
             {
                 if let Some(reputation_match) = known_bad_reputation_match_for_progress(
                     state,
@@ -436,6 +438,17 @@ async fn inspect_and_forward_frame(
                 {
                     known_bad_reputation_match = Some(reputation_match);
                 }
+            } else if let Some(reputation_match) = known_bad_reputation_match_for_write_payload(
+                state,
+                reputation_lookup,
+                &context,
+                file_path_for_write.as_deref(),
+                &write_request,
+                &frame,
+            )
+            .await
+            {
+                known_bad_reputation_match = Some(reputation_match);
             }
         }
         for read_request in read_requests {
@@ -609,6 +622,12 @@ async fn known_bad_reputation_match_for_progress(
     }
 
     if state.is_known_bad_reputation_hash(&progress.sha256) {
+        info!(
+            file_path = progress.file_path,
+            sha256 = progress.sha256,
+            bytes = progress.bytes,
+            "inline reputation matched local known bad feed"
+        );
         return Some(KnownBadReputationMatch {
             file_path: progress.file_path.clone(),
             sha256: progress.sha256.clone(),
@@ -624,13 +643,28 @@ async fn known_bad_reputation_match_for_progress(
     match lookup.lookup(&progress.sha256).await {
         Ok(ReputationVerdict::KnownBad) => {
             state.add_known_bad_reputation_hash(&progress.sha256);
+            info!(
+                file_path = progress.file_path,
+                sha256 = progress.sha256,
+                bytes = progress.bytes,
+                "inline reputation lookup returned known_bad"
+            );
             Some(KnownBadReputationMatch {
                 file_path: progress.file_path.clone(),
                 sha256: progress.sha256.clone(),
                 bytes: progress.bytes,
             })
         }
-        Ok(ReputationVerdict::KnownGood | ReputationVerdict::Unknown) => None,
+        Ok(verdict @ (ReputationVerdict::KnownGood | ReputationVerdict::Unknown)) => {
+            info!(
+                file_path = progress.file_path,
+                sha256 = progress.sha256,
+                bytes = progress.bytes,
+                ?verdict,
+                "inline reputation lookup completed without block"
+            );
+            None
+        }
         Err(error) => {
             warn!(
                 sha256 = progress.sha256,
@@ -641,6 +675,34 @@ async fn known_bad_reputation_match_for_progress(
             None
         }
     }
+}
+
+async fn known_bad_reputation_match_for_write_payload(
+    state: &RuntimeState,
+    reputation_lookup: Option<&Arc<ReputationLookupClient>>,
+    context: &InspectionContext<'_>,
+    file_path: Option<&str>,
+    request: &Smb2WriteRequest,
+    frame: &[u8],
+) -> Option<KnownBadReputationMatch> {
+    let payload = request
+        .data_range
+        .and_then(|(start, end)| frame.get(start..end))?;
+    if payload.is_empty() {
+        return None;
+    }
+
+    let sha256 = sha256_hex(payload);
+    let progress = FileHashProgress {
+        file_path: file_path
+            .or(context.file_path_hint)
+            .unwrap_or("<unmapped SMB write>")
+            .to_string(),
+        sha256,
+        bytes: payload.len() as u64,
+    };
+
+    known_bad_reputation_match_for_progress(state, reputation_lookup, &progress).await
 }
 
 #[derive(Debug, Default)]
@@ -1044,6 +1106,10 @@ fn hex_lower(bytes: &[u8]) -> String {
         output.push(HEX[(byte & 0x0f) as usize] as char);
     }
     output
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    hex_lower(&Sha256::digest(bytes))
 }
 
 fn file_extension(file_path: &str) -> Option<String> {
