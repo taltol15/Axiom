@@ -91,6 +91,17 @@ Upload the returned .axlic license file
 
 No customer server needs internet access for offline activation.
 
+Customer deployments should be installed with the official Axiom public
+verification key. The installer accepts it without exposing any private signing
+material:
+
+```bash
+AXIOM_LICENSE_PUBLIC_KEY_HEX="official_axiom_public_key_hex" ./axiom-lab-installer.sh
+```
+
+The installer writes that value to `[license].public_key_hex`. If the variable
+is omitted, Axiom falls back to its built-in development verification key.
+
 For lab issuance, generate an Ed25519 key pair on a trusted issuing workstation:
 
 ```bash
@@ -131,6 +142,19 @@ cargo run -p axiom-license --bin axiom-license-tool -- issue \
 Upload `customer.axlic` in Settings -> License Activation -> Upload license
 file. Production issuance should use the official Axiom signing key, with only
 the public verification key present in customer deployments.
+
+The customer installer does not install the license issuing tool by default.
+For an internal Axiom staff host or the company customer portal backend, install
+the issuer explicitly:
+
+```bash
+AXIOM_INSTALL_LICENSE_TOOL=1 ./axiom-lab-installer.sh
+# or, when running directly from a checked-out repository:
+AXIOM_INSTALL_LICENSE_TOOL=1 ./install.sh
+```
+
+The private key must still live outside git and customer systems, preferably as
+a protected secret or a `0600` file readable only by the license issuing service.
 
 ## Policies
 

@@ -7,6 +7,9 @@ CONFIG_PATH="${CONFIG_DIR}/axiom.toml"
 BINARY_NAME="axiom-daemon"
 BINARY_SOURCE="${PROJECT_ROOT}/target/release/${BINARY_NAME}"
 BINARY_PATH="/usr/local/bin/${BINARY_NAME}"
+LICENSE_TOOL_NAME="axiom-license-tool"
+LICENSE_TOOL_SOURCE="${PROJECT_ROOT}/target/release/${LICENSE_TOOL_NAME}"
+LICENSE_TOOL_PATH="/usr/local/bin/${LICENSE_TOOL_NAME}"
 SERVICE_PATH="/etc/systemd/system/axiom.service"
 RESTART_HELPER_PATH="/usr/local/sbin/axiom-restart-service"
 SUDOERS_PATH="/etc/sudoers.d/axiom-management"
@@ -21,6 +24,8 @@ DNS_DEFAULT_THREAT_FEED_URL="https://urlhaus.abuse.ch/downloads/hostfile/"
 MIN_RUST_VERSION="1.88.0"
 LOCAL_AGENT_MANAGEMENT_INTERFACE="lo"
 LOCAL_AGENT_MANAGEMENT_IP="127.0.0.1"
+AXIOM_LICENSE_PUBLIC_KEY_HEX="${AXIOM_LICENSE_PUBLIC_KEY_HEX:-}"
+AXIOM_INSTALL_LICENSE_TOOL="${AXIOM_INSTALL_LICENSE_TOOL:-0}"
 
 trap 'echo "Axiom installation failed. Review the error above and rerun install.sh." >&2' ERR
 
@@ -118,6 +123,26 @@ version_ge() {
   local current="$1"
   local required="$2"
   printf '%s\n%s\n' "${required}" "${current}" | sort -V -C
+}
+
+validate_release_options() {
+  case "${AXIOM_INSTALL_LICENSE_TOOL}" in
+    1 | true | yes | on)
+      AXIOM_INSTALL_LICENSE_TOOL="1"
+      ;;
+    0 | false | no | off | "")
+      AXIOM_INSTALL_LICENSE_TOOL="0"
+      ;;
+    *)
+      echo "AXIOM_INSTALL_LICENSE_TOOL must be 0 or 1." >&2
+      exit 1
+      ;;
+  esac
+
+  if [[ -n "${AXIOM_LICENSE_PUBLIC_KEY_HEX}" && ! "${AXIOM_LICENSE_PUBLIC_KEY_HEX}" =~ ^[0-9A-Fa-f]{64}$ ]]; then
+    echo "AXIOM_LICENSE_PUBLIC_KEY_HEX must be a 64-character hex encoded Ed25519 public key." >&2
+    exit 1
+  fi
 }
 
 current_rust_version() {
@@ -1217,7 +1242,7 @@ write_config() {
     echo "state_path = \"/var/lib/axiom/license-state.json\""
     echo "trial_days = 30"
     echo "warn_before_expiry_days = 14"
-    echo "public_key_hex = \"\""
+    echo "public_key_hex = \"$(toml_escape "${AXIOM_LICENSE_PUBLIC_KEY_HEX}")\""
     echo
     echo "[dns]"
     echo "enabled = ${DNS_ENABLED}"
@@ -1446,10 +1471,16 @@ build_and_install_binary() {
   (
     cd "${PROJECT_ROOT}"
     RUSTFLAGS="${axiom_rustflags}" cargo build --release -p axiom-daemon
+    if [[ "${AXIOM_INSTALL_LICENSE_TOOL}" == "1" ]]; then
+      RUSTFLAGS="${axiom_rustflags}" cargo build --release -p axiom-license --bin axiom-license-tool
+    fi
   )
 
   ${SUDO} install -m 0755 -o root -g root "${BINARY_SOURCE}" "${BINARY_PATH}"
   ${SUDO} setcap 'cap_net_bind_service,cap_net_raw+ep' "${BINARY_PATH}"
+  if [[ "${AXIOM_INSTALL_LICENSE_TOOL}" == "1" ]]; then
+    ${SUDO} install -m 0755 -o root -g root "${LICENSE_TOOL_SOURCE}" "${LICENSE_TOOL_PATH}"
+  fi
 }
 
 warn_if_smb_nat_rules_exist() {
@@ -1560,6 +1591,14 @@ print_summary() {
   echo "Binary: ${BINARY_PATH}"
   echo "Service: axiom.service"
   echo "Role: ${NODE_ROLE}"
+  if [[ -n "${AXIOM_LICENSE_PUBLIC_KEY_HEX}" ]]; then
+    echo "License verification key: configured from AXIOM_LICENSE_PUBLIC_KEY_HEX"
+  else
+    echo "License verification key: built-in default"
+  fi
+  if [[ "${AXIOM_INSTALL_LICENSE_TOOL}" == "1" ]]; then
+    echo "License issuer tool: ${LICENSE_TOOL_PATH}"
+  fi
   if [[ "${NODE_ROLE}" == "management" || "${NODE_ROLE}" == "standalone_lab" ]]; then
     if [[ "${MANAGEMENT_TLS_ENABLED}" == "true" ]]; then
       echo "Management UI: https://${MANAGEMENT_BIND_IP}:${MANAGEMENT_PORT}/"
@@ -1594,6 +1633,7 @@ print_summary() {
 main() {
   ensure_debian_family
   ensure_project_root
+  validate_release_options
   require_sudo
   install_missing_dependencies
   ensure_rust_toolchain
