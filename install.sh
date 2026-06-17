@@ -1244,6 +1244,7 @@ prepare_tls_certificate() {
     ${SUDO} chown root:"${SERVICE_GROUP}" "${MANAGEMENT_TLS_CERT_PATH}" "${MANAGEMENT_TLS_KEY_PATH}"
     ${SUDO} chmod 0644 "${MANAGEMENT_TLS_CERT_PATH}"
     ${SUDO} chmod 0640 "${MANAGEMENT_TLS_KEY_PATH}"
+    validate_tls_certificate_pair
     return
   fi
 
@@ -1264,6 +1265,39 @@ prepare_tls_certificate() {
   ${SUDO} chown root:"${SERVICE_GROUP}" "${MANAGEMENT_TLS_CERT_PATH}" "${MANAGEMENT_TLS_KEY_PATH}"
   ${SUDO} chmod 0644 "${MANAGEMENT_TLS_CERT_PATH}"
   ${SUDO} chmod 0640 "${MANAGEMENT_TLS_KEY_PATH}"
+  validate_tls_certificate_pair
+}
+
+validate_tls_certificate_pair() {
+  if [[ "${NODE_ROLE}" != "management" && "${NODE_ROLE}" != "standalone_lab" ]]; then
+    return
+  fi
+
+  if [[ "${MANAGEMENT_TLS_ENABLED}" != "true" ]]; then
+    return
+  fi
+
+  ${SUDO} openssl x509 -in "${MANAGEMENT_TLS_CERT_PATH}" -noout >/dev/null
+  ${SUDO} openssl pkey -in "${MANAGEMENT_TLS_KEY_PATH}" -noout >/dev/null
+
+  local cert_public_hash
+  local key_public_hash
+  cert_public_hash="$(
+    ${SUDO} openssl x509 -in "${MANAGEMENT_TLS_CERT_PATH}" -pubkey -noout \
+      | openssl pkey -pubin -outform DER 2>/dev/null \
+      | sha256sum \
+      | awk '{print $1}'
+  )"
+  key_public_hash="$(
+    ${SUDO} openssl pkey -in "${MANAGEMENT_TLS_KEY_PATH}" -pubout -outform DER 2>/dev/null \
+      | sha256sum \
+      | awk '{print $1}'
+  )"
+
+  if [[ -z "${cert_public_hash}" || "${cert_public_hash}" != "${key_public_hash}" ]]; then
+    echo "TLS certificate and private key do not match." >&2
+    exit 1
+  fi
 }
 
 write_service_restart_helper() {

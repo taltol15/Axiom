@@ -134,26 +134,46 @@ pub async fn run_management_server(
         .layer(middleware::from_fn(add_security_headers))
         .with_state(state);
 
-    info!(
-        interface = management.interface,
-        listen_addr = %management.listen_addr(),
-        "management GUI server started"
-    );
-
     if management.tls.enabled {
-        let tls_config =
-            RustlsConfig::from_pem_file(&management.tls.cert_path, &management.tls.key_path)
-                .await
-                .with_context(|| {
-                    format!(
-                        "failed loading management TLS cert '{}' and key '{}'",
-                        management.tls.cert_path, management.tls.key_path
-                    )
-                })?;
-        axum_server::from_tcp_rustls(listener.into_std()?, tls_config)
-            .serve(app.into_make_service())
-            .await?;
+        match load_management_tls_config(&management.tls.cert_path, &management.tls.key_path).await
+        {
+            Ok(tls_config) => {
+                info!(
+                    interface = management.interface,
+                    listen_addr = %management.listen_addr(),
+                    tls_enabled = true,
+                    cert_path = management.tls.cert_path,
+                    key_path = management.tls.key_path,
+                    "management GUI server started"
+                );
+                axum_server::from_tcp_rustls(listener.into_std()?, tls_config)
+                    .serve(app.into_make_service())
+                    .await?;
+            }
+            Err(error) => {
+                warn!(
+                    ?error,
+                    cert_path = management.tls.cert_path,
+                    key_path = management.tls.key_path,
+                    "management TLS could not be loaded; falling back to HTTP"
+                );
+                info!(
+                    interface = management.interface,
+                    listen_addr = %management.listen_addr(),
+                    tls_enabled = false,
+                    tls_fallback = true,
+                    "management GUI server started"
+                );
+                axum::serve(listener, app).await?;
+            }
+        }
     } else {
+        info!(
+            interface = management.interface,
+            listen_addr = %management.listen_addr(),
+            tls_enabled = false,
+            "management GUI server started"
+        );
         axum::serve(listener, app).await?;
     }
     Ok(())
@@ -468,45 +488,70 @@ async fn api_update_management_tls(
     }
 
     let restart_requested = request.restart_service.unwrap_or(true);
-    let response = {
-        let mut config = state.config.lock().expect("web config mutex poisoned");
-        let cert_path = normalized_tls_path(
-            request.cert_path,
-            &config.management.tls.cert_path,
-            DEFAULT_MANAGEMENT_TLS_CERT_PATH,
-        );
-        let key_path = normalized_tls_path(
-            request.key_path,
-            &config.management.tls.key_path,
-            DEFAULT_MANAGEMENT_TLS_KEY_PATH,
-        );
+    let current_config = {
+        state
+            .config
+            .lock()
+            .expect("web config mutex poisoned")
+            .clone()
+    };
+    let cert_path = normalized_tls_path(
+        request.cert_path,
+        &current_config.management.tls.cert_path,
+        DEFAULT_MANAGEMENT_TLS_CERT_PATH,
+    );
+    let key_path = normalized_tls_path(
+        request.key_path,
+        &current_config.management.tls.key_path,
+        DEFAULT_MANAGEMENT_TLS_KEY_PATH,
+    );
 
-        if request.enabled {
-            if !Path::new(&cert_path).is_file() {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(ManagementTlsResponse::from_config(
-                        &config,
-                        false,
-                        format!("certificate file was not found: {cert_path}"),
-                    )),
-                )
-                    .into_response();
-            }
-
-            if !Path::new(&key_path).is_file() {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(ManagementTlsResponse::from_config(
-                        &config,
-                        false,
-                        format!("private key file was not found: {key_path}"),
-                    )),
-                )
-                    .into_response();
-            }
+    if request.enabled {
+        if !Path::new(&cert_path).is_file() {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ManagementTlsResponse::from_config(
+                    &current_config,
+                    false,
+                    format!("certificate file was not found: {cert_path}"),
+                )),
+            )
+                .into_response();
         }
 
+        if !Path::new(&key_path).is_file() {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ManagementTlsResponse::from_config(
+                    &current_config,
+                    false,
+                    format!("private key file was not found: {key_path}"),
+                )),
+            )
+                .into_response();
+        }
+
+        if let Err(error) = load_management_tls_config(&cert_path, &key_path).await {
+            warn!(
+                ?error,
+                cert_path,
+                key_path,
+                "management TLS update rejected because certificate or key could not be loaded"
+            );
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ManagementTlsResponse::from_config(
+                    &current_config,
+                    false,
+                    "TLS certificate/private key could not be loaded; check file format and permissions for the axiom service user".to_string(),
+                )),
+            )
+                .into_response();
+        }
+    }
+
+    let response = {
+        let mut config = state.config.lock().expect("web config mutex poisoned");
         let mut candidate = config.clone();
         candidate.management.tls.enabled = request.enabled;
         candidate.management.tls.cert_path = cert_path;
@@ -1287,6 +1332,17 @@ fn normalized_tls_path(requested: Option<String>, current: &str, fallback: &str)
             (!current.is_empty()).then(|| current.to_string())
         })
         .unwrap_or_else(|| fallback.to_string())
+}
+
+async fn load_management_tls_config(
+    cert_path: &str,
+    key_path: &str,
+) -> anyhow::Result<RustlsConfig> {
+    RustlsConfig::from_pem_file(cert_path, key_path)
+        .await
+        .with_context(|| {
+            format!("failed loading management TLS cert '{cert_path}' and key '{key_path}'")
+        })
 }
 
 fn management_url(config: &AxiomConfig, https: bool) -> String {
