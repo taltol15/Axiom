@@ -17,6 +17,7 @@ axiom-reputation = { path = "../axiom-reputation" }
 axiom-web = { path = "../axiom-web" }
 axum.workspace = true
 reqwest.workspace = true
+rustls.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

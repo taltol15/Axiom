@@ -30,6 +30,7 @@ use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitEx
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> anyhow::Result<()> {
+    install_rustls_crypto_provider();
     init_tracing();
 
     let config_path = env::args()
@@ -136,6 +137,10 @@ async fn main() -> anyhow::Result<()> {
     while tasks.join_next().await.is_some() {}
     info!("Axiom daemon stopped");
     Ok(())
+}
+
+fn install_rustls_crypto_provider() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
 struct NodeControlState {

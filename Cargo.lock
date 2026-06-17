@@ -167,6 +167,7 @@ dependencies = [
  "axiom-web",
  "axum",
  "reqwest",
+ "rustls",
  "serde",
  "serde_json",
  "tokio",
