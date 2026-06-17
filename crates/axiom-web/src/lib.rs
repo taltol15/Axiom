@@ -21,6 +21,7 @@ use axiom_core::{
     DnsPolicyRuntimeSnapshot, InspectionContext, InspectionResult, PolicyRuntimeSnapshot,
     RuntimeState, StatusSnapshot, TrafficDirection,
 };
+use axiom_license::{LicenseStatus, LicenseUsage, evaluate_license, install_license_text};
 use axiom_net::bind_tcp_listener_to_interface;
 use axiom_reputation::{
     FileReputationReport, ReputationBulkImportRequest, ReputationCreateRequest, ReputationError,
@@ -104,6 +105,7 @@ pub async fn run_management_server(
             "/api/management/tls",
             get(api_management_tls).put(api_update_management_tls),
         )
+        .route("/api/license", get(api_license).put(api_install_license))
         .route(
             "/api/reputation",
             get(api_reputation).post(api_create_reputation),
@@ -625,6 +627,62 @@ async fn api_update_management_tls(
     Json(response).into_response()
 }
 
+async fn api_license(headers: HeaderMap, State(state): State<Arc<WebState>>) -> Response {
+    if !is_authorized(&headers, &state) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(ErrorResponse {
+                message: "authentication required",
+            }),
+        )
+            .into_response();
+    }
+
+    Json(build_license_status(&state)).into_response()
+}
+
+async fn api_install_license(
+    headers: HeaderMap,
+    State(state): State<Arc<WebState>>,
+    Json(request): Json<LicenseInstallRequest>,
+) -> Response {
+    if !is_authorized(&headers, &state) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(ApiErrorResponse::new("authentication required")),
+        )
+            .into_response();
+    }
+
+    let config = state
+        .config
+        .lock()
+        .expect("web config mutex poisoned")
+        .clone();
+    let client_identities = state
+        .client_identities
+        .lock()
+        .expect("client identity mutex poisoned")
+        .iter()
+        .map(|(address, entry)| (address.clone(), entry.hostname.clone()))
+        .collect();
+    let usage = build_license_usage(
+        &config,
+        &fleet_node_snapshots(&state),
+        &state.reputation,
+        &client_identities,
+    );
+
+    match install_license_text(&config.license, &request.license_text, usage) {
+        Ok(status) => Json(status).into_response(),
+        Err(error) => (
+            StatusCode::BAD_REQUEST,
+            Json(ApiErrorResponse::new(format!("license rejected: {error}"))),
+        )
+            .into_response(),
+    }
+}
+
 async fn api_enrollment_token(headers: HeaderMap, State(state): State<Arc<WebState>>) -> Response {
     if !is_authorized(&headers, &state) {
         return (
@@ -1041,10 +1099,13 @@ fn build_status_response(state: &WebState) -> StatusResponse {
     let fleet_nodes = fleet_node_snapshots(state);
     let client_identities =
         resolve_client_identities(state, &config.management.directory, &stats, &fleet_nodes);
+    let license =
+        build_license_status_for(&config, &fleet_nodes, &state.reputation, &client_identities);
     StatusResponse {
         process_id: std::process::id(),
         config_path: state.config_path.display().to_string(),
         node: NodeInfo::from_config(&config),
+        license,
         security: ManagementSecurityStatus::from_config(&config),
         management_interface: config.management.interface.clone(),
         management_bind_addr: config.management.listen_addr().to_string(),
@@ -1062,10 +1123,70 @@ fn build_status_response(state: &WebState) -> StatusResponse {
     }
 }
 
+fn build_license_status(state: &WebState) -> LicenseStatus {
+    let config = state.config.lock().expect("web config mutex poisoned");
+    let fleet_nodes = fleet_node_snapshots(state);
+    let client_identities = state
+        .client_identities
+        .lock()
+        .expect("client identity mutex poisoned")
+        .iter()
+        .map(|(address, entry)| (address.clone(), entry.hostname.clone()))
+        .collect();
+    build_license_status_for(&config, &fleet_nodes, &state.reputation, &client_identities)
+}
+
+fn build_license_status_for(
+    config: &AxiomConfig,
+    fleet_nodes: &[FleetNodeStatus],
+    reputation: &ReputationStore,
+    client_identities: &HashMap<String, String>,
+) -> LicenseStatus {
+    evaluate_license(
+        &config.license,
+        build_license_usage(config, fleet_nodes, reputation, client_identities),
+    )
+}
+
+fn build_license_usage(
+    config: &AxiomConfig,
+    fleet_nodes: &[FleetNodeStatus],
+    reputation: &ReputationStore,
+    client_identities: &HashMap<String, String>,
+) -> LicenseUsage {
+    let mut smb_nodes = u32::from(config.node.role.runs_smb_proxy());
+    let mut dns_nodes = u32::from(config.node.role.runs_dns() && config.dns.enabled);
+
+    for node in fleet_nodes {
+        match node.role {
+            NodeRole::SmbProxy => smb_nodes = smb_nodes.saturating_add(1),
+            NodeRole::Dns => dns_nodes = dns_nodes.saturating_add(1),
+            NodeRole::StandaloneLab => {
+                smb_nodes = smb_nodes.saturating_add(1);
+                dns_nodes = dns_nodes.saturating_add(1);
+            }
+            NodeRole::Management => {}
+        }
+    }
+
+    LicenseUsage {
+        management_nodes: u32::from(config.node.role.runs_management()),
+        smb_nodes,
+        dns_nodes,
+        protected_clients: client_identities.len() as u32,
+        reputation_entries: reputation.list().summary.total_entries as u32,
+    }
+}
+
 fn build_diagnostics_response(state: &WebState) -> DiagnosticsResponse {
     let config = state.config.lock().expect("web config mutex poisoned");
     let status = state.runtime.snapshot();
     let deployment_warnings = build_deployment_warnings(&config, &status);
+    let fleet_nodes = fleet_node_snapshots(state);
+    let client_identities =
+        resolve_client_identities(state, &config.management.directory, &status, &fleet_nodes);
+    let license =
+        build_license_status_for(&config, &fleet_nodes, &state.reputation, &client_identities);
     let mut command_outputs = vec![
         run_diagnostic_command("ss", &["-ltnp"]),
         run_diagnostic_command("ss", &["-lunp"]),
@@ -1105,6 +1226,7 @@ fn build_diagnostics_response(state: &WebState) -> DiagnosticsResponse {
             .unwrap_or_else(|error| format!("unavailable: {error}")),
         config_path: state.config_path.display().to_string(),
         node: NodeInfo::from_config(&config),
+        license,
         management_bind_addr: config.management.listen_addr().to_string(),
         proxy_listeners: config
             .proxy_listeners
@@ -1113,7 +1235,7 @@ fn build_diagnostics_response(state: &WebState) -> DiagnosticsResponse {
             .collect(),
         dns: DnsStatus::from(&config.dns),
         deployment_warnings,
-        fleet_nodes: fleet_node_snapshots(state),
+        fleet_nodes,
         status,
         command_outputs,
         proc_self_status: fs::read_to_string("/proc/self/status").ok(),
@@ -1870,6 +1992,7 @@ struct StatusResponse {
     process_id: u32,
     config_path: String,
     node: NodeInfo,
+    license: LicenseStatus,
     security: ManagementSecurityStatus,
     management_interface: String,
     management_bind_addr: String,
@@ -1888,6 +2011,7 @@ struct DiagnosticsResponse {
     executable_path: String,
     config_path: String,
     node: NodeInfo,
+    license: LicenseStatus,
     management_bind_addr: String,
     proxy_listeners: Vec<ProxyListenerStatus>,
     dns: DnsStatus,
@@ -2016,6 +2140,11 @@ struct ManagementTlsUpdateRequest {
     cert_path: Option<String>,
     key_path: Option<String>,
     restart_service: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LicenseInstallRequest {
+    license_text: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -2530,7 +2659,7 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
 
   <main class="mx-auto max-w-7xl px-6 py-8">
     <section id="view-overview" class="dashboard-view active">
-      <div class="grid gap-5 md:grid-cols-2 xl:grid-cols-4">
+      <div class="grid gap-5 md:grid-cols-2 xl:grid-cols-5">
         <article class="rounded-lg border border-zinc-800 bg-zinc-900 p-6">
           <p class="text-sm text-zinc-400">SMB Protected Traffic</p>
           <p id="overview-smb-traffic" class="mt-4 text-4xl font-semibold text-white">0 B</p>
@@ -2550,6 +2679,11 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
           <p class="text-sm text-zinc-400">Blocked DNS Domains</p>
           <p id="overview-blocked-dns" class="mt-4 text-4xl font-semibold text-red-300">0</p>
           <p id="overview-dns-policy-detail" class="mt-2 text-xs text-zinc-500">No DNS blocks recorded</p>
+        </article>
+        <article class="rounded-lg border border-zinc-800 bg-zinc-900 p-6">
+          <p class="text-sm text-zinc-400">License</p>
+          <p id="overview-license-state" class="mt-4 text-3xl font-semibold text-emerald-200">Loading</p>
+          <p id="overview-license-detail" class="mt-2 text-xs text-zinc-500">Checking entitlement</p>
         </article>
       </div>
 
@@ -3080,6 +3214,32 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
             </div>
             <p id="enrollment-token-state" class="mt-3 text-xs text-zinc-500">Token not loaded</p>
           </div>
+          <div class="rounded-md border border-zinc-800 bg-zinc-950/50 p-4 lg:col-span-2">
+            <div class="flex flex-col gap-2 md:flex-row md:items-start md:justify-between">
+              <div>
+                <p class="text-sm font-semibold text-white">Offline Licensing</p>
+                <p id="license-status" class="mt-2 text-sm text-zinc-500">Loading license state</p>
+                <p id="license-customer" class="mt-1 text-xs text-zinc-500">—</p>
+              </div>
+              <span id="license-state-badge" class="w-fit rounded-full border border-zinc-700 px-2.5 py-1 text-xs font-semibold uppercase text-zinc-300">loading</span>
+            </div>
+            <div class="mt-4 grid gap-4 lg:grid-cols-2">
+              <label class="block">
+                <span class="text-xs font-semibold uppercase tracking-wide text-zinc-500">Activation request</span>
+                <textarea id="license-activation-request" readonly rows="7" spellcheck="false" class="mt-2 w-full rounded-md border border-zinc-700 bg-zinc-950 px-3 py-2 font-mono text-xs text-white"></textarea>
+              </label>
+              <label class="block">
+                <span class="text-xs font-semibold uppercase tracking-wide text-zinc-500">Install signed license</span>
+                <textarea id="license-install-text" rows="7" spellcheck="false" placeholder="Paste signed Axiom license JSON or base64 package" class="mt-2 w-full rounded-md border border-zinc-700 bg-zinc-950 px-3 py-2 font-mono text-xs text-white"></textarea>
+              </label>
+            </div>
+            <div class="mt-4 flex flex-wrap gap-2">
+              <button id="copy-license-request" class="rounded-md border border-zinc-700 px-3 py-2 text-sm text-zinc-200 transition hover:border-emerald-300 hover:text-emerald-200">Copy activation request</button>
+              <button id="install-license" class="rounded-md bg-emerald-400 px-3 py-2 text-sm font-semibold text-zinc-950 transition hover:bg-emerald-300">Install license</button>
+            </div>
+            <p id="license-usage" class="mt-3 text-xs text-zinc-500">Usage not loaded</p>
+            <p id="license-install-state" class="mt-1 text-xs text-zinc-500">No license operation running</p>
+          </div>
           <div class="rounded-md border border-zinc-800 bg-zinc-950/50 p-4">
             <p class="text-sm font-semibold text-white">Directory Integration</p>
             <p id="directory-status" class="mt-2 text-sm text-zinc-500">Loading directory status</p>
@@ -3153,6 +3313,50 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
 
     function text(value) {
       return value === null || value === undefined || value === "" ? "—" : String(value);
+    }
+
+    function licenseBadgeClass(state) {
+      if (state === "licensed" || state === "trial") return "border-emerald-400/40 bg-emerald-500/10 text-emerald-100";
+      if (state === "expiring_soon") return "border-amber-400/40 bg-amber-500/10 text-amber-100";
+      if (state === "limit_exceeded" || state === "expired" || state === "invalid") return "border-red-400/40 bg-red-500/10 text-red-100";
+      return "border-zinc-700 bg-zinc-950 text-zinc-300";
+    }
+
+    function updateLicenseUi(license) {
+      if (!license) return;
+      const state = license.state || "missing";
+      const badgeClass = licenseBadgeClass(state);
+      const title = state.replaceAll("_", " ");
+      const usage = license.usage || {};
+      const limits = license.limits || {};
+      const days = license.days_remaining === null || license.days_remaining === undefined
+        ? "offline request ready"
+        : `${license.days_remaining} days remaining`;
+      const customer = license.customer_name
+        ? `${license.customer_name} · ${text(license.edition)} · ${text(license.license_id)}`
+        : `${text(license.edition)} · ${days}`;
+      const usageText =
+        `${usage.smb_nodes || 0}/${text(limits.max_smb_nodes)} SMB nodes · ` +
+        `${usage.dns_nodes || 0}/${text(limits.max_dns_nodes)} DNS nodes · ` +
+        `${usage.protected_clients || 0}/${text(limits.max_protected_clients)} clients · ` +
+        `${usage.reputation_entries || 0}/${text(limits.max_reputation_entries)} reputation entries`;
+
+      document.getElementById("overview-license-state").textContent = title;
+      document.getElementById("overview-license-state").className =
+        `mt-4 text-3xl font-semibold ${license.valid ? "text-emerald-700" : state === "expiring_soon" ? "text-amber-700" : "text-red-700"}`;
+      document.getElementById("overview-license-detail").textContent = license.message || customer;
+      document.getElementById("license-status").textContent = license.message || "License status unavailable";
+      document.getElementById("license-customer").textContent = customer;
+      document.getElementById("license-usage").textContent = usageText;
+
+      const badge = document.getElementById("license-state-badge");
+      badge.className = `w-fit rounded-full border px-2.5 py-1 text-xs font-semibold uppercase ${badgeClass}`;
+      badge.textContent = title;
+
+      const activation = document.getElementById("license-activation-request");
+      if (activation && document.activeElement !== activation) {
+        activation.value = license.activation_request_b64 || "";
+      }
     }
 
     function endpointIp(value) {
@@ -3444,6 +3648,7 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
       clientIdentities = data.client_identities || {};
       const fleetNodes = data.fleet_nodes || [];
       const stats = aggregateStats(data.stats, fleetNodes);
+      updateLicenseUi(data.license);
       renderFleetNodes(data.node || {}, fleetNodes);
       const forwardedBytes = Number(stats.bytes_client_to_server || 0) + Number(stats.bytes_server_to_client || 0);
       const streamBytes = Number(stats.stream_bytes_client_to_server || 0) + Number(stats.stream_bytes_server_to_client || 0);
@@ -3964,6 +4169,47 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
       await refresh();
     }
 
+    async function copyLicenseRequest() {
+      const value = document.getElementById("license-activation-request").value;
+      if (!value) {
+        document.getElementById("license-install-state").textContent = "Activation request is not ready yet";
+        return;
+      }
+
+      try {
+        await navigator.clipboard.writeText(value);
+        document.getElementById("license-install-state").textContent = `Activation request copied · ${new Date().toLocaleTimeString()}`;
+      } catch (_) {
+        document.getElementById("license-activation-request").select();
+        document.getElementById("license-install-state").textContent = "Activation request selected";
+      }
+    }
+
+    async function installLicense() {
+      const licenseText = document.getElementById("license-install-text").value.trim();
+      if (!licenseText) {
+        document.getElementById("license-install-state").textContent = "Paste a signed license package first";
+        return;
+      }
+
+      document.getElementById("license-install-state").textContent = "Installing license";
+      const response = await fetch("/api/license", {
+        method: "PUT",
+        headers: authHeaders({ "Content-Type": "application/json" }),
+        body: JSON.stringify({ license_text: licenseText })
+      });
+      const payload = await response.json().catch(() => ({ message: "license install failed" }));
+      if (!response.ok) {
+        document.getElementById("license-install-state").textContent = payload.message || "License install failed";
+        return;
+      }
+
+      document.getElementById("license-install-text").value = "";
+      updateLicenseUi(payload);
+      document.getElementById("license-install-state").textContent = `License installed · ${new Date().toLocaleTimeString()}`;
+      await refresh();
+    }
+
     function readDnsPolicyPayload() {
       const localRecords = linesToArray("dns-local-records").map((line) => {
         const [name, recordType, value, ttl] = line.split("|").map((part) => (part || "").trim());
@@ -4289,6 +4535,8 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
     document.getElementById("save-settings").addEventListener("click", saveLocalSettings);
     document.getElementById("copy-enrollment-token").addEventListener("click", copyEnrollmentToken);
     document.getElementById("rotate-enrollment-token").addEventListener("click", rotateEnrollmentToken);
+    document.getElementById("copy-license-request").addEventListener("click", copyLicenseRequest);
+    document.getElementById("install-license").addEventListener("click", installLicense);
     document.getElementById("enable-https").addEventListener("click", () => saveTlsSettings(true));
     document.getElementById("disable-https").addEventListener("click", () => saveTlsSettings(false));
     document.getElementById("rep-add-button").addEventListener("click", addReputationEntry);

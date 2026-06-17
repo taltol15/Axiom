@@ -1211,6 +1211,13 @@ write_config() {
       fi
     fi
     echo
+    echo "[license]"
+    echo "enabled = true"
+    echo "license_path = \"/etc/axiom/license.json\""
+    echo "state_path = \"/var/lib/axiom/license-state.json\""
+    echo "trial_days = 30"
+    echo "warn_before_expiry_days = 14"
+    echo
     echo "[dns]"
     echo "enabled = ${DNS_ENABLED}"
     if [[ "${DNS_ENABLED}" == "true" ]]; then

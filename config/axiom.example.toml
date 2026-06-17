@@ -25,6 +25,13 @@ enabled = false
 enabled = false
 client_reverse_dns = true
 
+[license]
+enabled = true
+license_path = "/etc/axiom/license.json"
+state_path = "/var/lib/axiom/license-state.json"
+trial_days = 30
+warn_before_expiry_days = 14
+
 [dns]
 enabled = true
 interface = "ens256"

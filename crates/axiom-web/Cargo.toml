@@ -12,6 +12,7 @@ axiom-config = { path = "../axiom-config" }
 axiom-control = { path = "../axiom-control" }
 axiom-core = { path = "../axiom-core" }
 axiom-net = { path = "../axiom-net" }
+axiom-license = { path = "../axiom-license" }
 axiom-reputation = { path = "../axiom-reputation" }
 axum.workspace = true
 axum-server.workspace = true

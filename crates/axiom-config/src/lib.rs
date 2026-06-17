@@ -5,6 +5,7 @@ use std::{
     path::Path,
 };
 
+use axiom_license::LicenseConfig;
 use axiom_reputation::KnownBadAction;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -18,6 +19,8 @@ pub struct AxiomConfig {
     pub dns: DnsConfig,
     #[serde(default)]
     pub policy: PolicyConfig,
+    #[serde(default)]
+    pub license: LicenseConfig,
     #[serde(default)]
     pub proxy_listeners: Vec<ProxyNicConfig>,
 }
@@ -39,6 +42,9 @@ impl AxiomConfig {
         self.node.validate()?;
         self.management.validate()?;
         self.policy.validate()?;
+        self.license
+            .validate()
+            .map_err(|error| ConfigError::Invalid(error.to_string()))?;
 
         self.dns.validate()?;
 
