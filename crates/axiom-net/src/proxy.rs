@@ -3,6 +3,7 @@ use std::{
     io,
     net::SocketAddr,
     sync::{Arc, Mutex as StdMutex},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::Context;
@@ -15,7 +16,7 @@ use axiom_core::{
     extract_smb2_create_requests, extract_smb2_create_responses, extract_smb2_read_requests,
     extract_smb2_read_responses, extract_smb2_write_requests,
 };
-use axiom_reputation::KnownBadAction;
+use axiom_reputation::{KnownBadAction, ReputationLookupResponse, ReputationVerdict};
 use md5::Md5;
 use sha2::{Digest, Sha256};
 use tokio::{
@@ -32,11 +33,109 @@ use crate::listener::{bind_tcp_listener_to_interface, connect_tcp_via_interface}
 
 const MAX_SMB_TCP_FRAME_LEN: usize = 16 * 1024 * 1024 + 4;
 const STATUS_ACCESS_DENIED: u32 = 0xC000_0022;
+const DEFAULT_INLINE_REPUTATION_LOOKUP_MAX_BYTES: u64 = 1024 * 1024;
+const INLINE_REPUTATION_CACHE_TTL_SECONDS: u64 = 60;
+
+#[derive(Debug, Clone)]
+pub struct ReputationLookupConfig {
+    pub management_url: String,
+    pub enrollment_token: String,
+    pub allow_invalid_tls: bool,
+    pub max_inline_lookup_bytes: u64,
+}
+
+#[derive(Debug)]
+struct ReputationLookupClient {
+    client: reqwest::Client,
+    management_url: String,
+    enrollment_token: String,
+    max_inline_lookup_bytes: u64,
+    cache: AsyncMutex<HashMap<String, CachedInlineReputation>>,
+}
+
+#[derive(Debug, Clone)]
+struct CachedInlineReputation {
+    verdict: ReputationVerdict,
+    expires_at_unix_timestamp_seconds: u64,
+}
+
+impl ReputationLookupClient {
+    fn new(config: ReputationLookupConfig) -> anyhow::Result<Self> {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(3))
+            .user_agent("AxiomSmbInlineReputation/0.1")
+            .danger_accept_invalid_certs(config.allow_invalid_tls)
+            .build()
+            .context("failed building SMB inline reputation client")?;
+
+        Ok(Self {
+            client,
+            management_url: config.management_url.trim_end_matches('/').to_string(),
+            enrollment_token: config.enrollment_token,
+            max_inline_lookup_bytes: config
+                .max_inline_lookup_bytes
+                .max(DEFAULT_INLINE_REPUTATION_LOOKUP_MAX_BYTES),
+            cache: AsyncMutex::new(HashMap::new()),
+        })
+    }
+
+    fn should_lookup(&self, bytes: u64) -> bool {
+        bytes > 0 && bytes <= self.max_inline_lookup_bytes
+    }
+
+    async fn lookup(&self, sha256: &str) -> anyhow::Result<ReputationVerdict> {
+        let now = unix_timestamp_seconds();
+        if let Some(entry) = self.cache.lock().await.get(sha256).cloned()
+            && entry.expires_at_unix_timestamp_seconds > now
+        {
+            return Ok(entry.verdict);
+        }
+
+        let response = self
+            .client
+            .get(format!(
+                "{}/api/reputation/lookup/{}",
+                self.management_url, sha256
+            ))
+            .bearer_auth(&self.enrollment_token)
+            .send()
+            .await
+            .context("inline reputation lookup request failed")?;
+
+        if !response.status().is_success() {
+            return Err(anyhow::anyhow!(
+                "management returned HTTP {} for inline reputation lookup",
+                response.status()
+            ));
+        }
+
+        let payload: ReputationLookupResponse = response
+            .json()
+            .await
+            .context("failed decoding inline reputation lookup response")?;
+        if payload.verdict == ReputationVerdict::KnownBad {
+            self.cache.lock().await.insert(
+                sha256.to_string(),
+                CachedInlineReputation {
+                    verdict: payload.verdict,
+                    expires_at_unix_timestamp_seconds: now + INLINE_REPUTATION_CACHE_TTL_SECONDS,
+                },
+            );
+        }
+
+        Ok(payload.verdict)
+    }
+}
 
 pub async fn run_proxy_listener(
     route: ProxyListenerConfig,
     state: Arc<RuntimeState>,
+    reputation_lookup_config: Option<ReputationLookupConfig>,
 ) -> anyhow::Result<()> {
+    let reputation_lookup = reputation_lookup_config
+        .map(ReputationLookupClient::new)
+        .transpose()?
+        .map(Arc::new);
     let listener =
         bind_tcp_listener_to_interface(route.interface(), route.listen_addr(), route.backlog)
             .await
@@ -93,10 +192,17 @@ pub async fn run_proxy_listener(
         );
         let route = Arc::new(route.clone());
         let task_state = Arc::clone(&state);
+        let task_reputation_lookup = reputation_lookup.clone();
 
         tokio::spawn(async move {
-            if let Err(error) =
-                handle_connection(client_stream, peer_addr, Arc::clone(&route), task_state).await
+            if let Err(error) = handle_connection(
+                client_stream,
+                peer_addr,
+                Arc::clone(&route),
+                task_state,
+                task_reputation_lookup,
+            )
+            .await
             {
                 warn!(
                     route = route.name,
@@ -116,6 +222,7 @@ async fn handle_connection(
     peer_addr: SocketAddr,
     route: Arc<ProxyListenerConfig>,
     state: Arc<RuntimeState>,
+    reputation_lookup: Option<Arc<ReputationLookupClient>>,
 ) -> anyhow::Result<()> {
     let target_addr = route.target_addr();
     let server_stream = connect_tcp_via_interface(route.interface(), target_addr)
@@ -135,9 +242,16 @@ async fn handle_connection(
         "SMB proxy connection established"
     );
 
-    relay_bidirectional(client_stream, server_stream, peer_addr, route, state)
-        .await
-        .map_err(Into::into)
+    relay_bidirectional(
+        client_stream,
+        server_stream,
+        peer_addr,
+        route,
+        state,
+        reputation_lookup,
+    )
+    .await
+    .map_err(Into::into)
 }
 
 async fn relay_bidirectional(
@@ -146,6 +260,7 @@ async fn relay_bidirectional(
     peer_addr: SocketAddr,
     route: Arc<ProxyListenerConfig>,
     state: Arc<RuntimeState>,
+    reputation_lookup: Option<Arc<ReputationLookupClient>>,
 ) -> io::Result<()> {
     let target_addr = route.target_addr();
     let (client_reader, client_writer) = client_stream.into_split();
@@ -164,6 +279,7 @@ async fn relay_bidirectional(
         client_reader,
         Arc::clone(&server_writer),
         Some(Arc::clone(&client_writer)),
+        reputation_lookup,
     );
 
     let server_to_client = relay_smb_frame_direction(
@@ -175,6 +291,7 @@ async fn relay_bidirectional(
         TrafficDirection::ServerToClient,
         server_reader,
         client_writer,
+        None,
         None,
     );
 
@@ -191,6 +308,7 @@ async fn relay_smb_frame_direction(
     mut reader: OwnedReadHalf,
     writer: Arc<AsyncMutex<OwnedWriteHalf>>,
     block_response_writer: Option<Arc<AsyncMutex<OwnedWriteHalf>>>,
+    reputation_lookup: Option<Arc<ReputationLookupClient>>,
 ) -> io::Result<()> {
     let mut buffer = vec![0_u8; 128 * 1024];
     let mut framer = SmbTcpFramer::default();
@@ -226,6 +344,7 @@ async fn relay_smb_frame_direction(
                 direction,
                 &writer,
                 block_response_writer.as_ref(),
+                reputation_lookup.as_ref(),
                 &mut inspection_window,
                 frame,
             )
@@ -243,6 +362,7 @@ async fn inspect_and_forward_frame(
     direction: TrafficDirection,
     writer: &Arc<AsyncMutex<OwnedWriteHalf>>,
     block_response_writer: Option<&Arc<AsyncMutex<OwnedWriteHalf>>>,
+    reputation_lookup: Option<&Arc<ReputationLookupClient>>,
     inspection_window: &mut InspectionWindow,
     frame: Vec<u8>,
 ) -> io::Result<()> {
@@ -304,10 +424,18 @@ async fn inspect_and_forward_frame(
             telemetry.observe_create_request(state, &context, create_request, frame.len());
         }
         for write_request in write_requests {
-            if let Some(reputation_match) =
+            if let Some(hash_progress) =
                 telemetry.observe_write_request(state, &context, write_request, &frame)
             {
-                known_bad_reputation_match = Some(reputation_match);
+                if let Some(reputation_match) = known_bad_reputation_match_for_progress(
+                    state,
+                    reputation_lookup,
+                    &hash_progress,
+                )
+                .await
+                {
+                    known_bad_reputation_match = Some(reputation_match);
+                }
             }
         }
         for read_request in read_requests {
@@ -463,6 +591,56 @@ async fn inspect_and_forward_frame(
 
 fn record_blocked_event(state: &RuntimeState, event: ThreatEvent) {
     state.record_blocked_threat(event);
+}
+
+async fn known_bad_reputation_match_for_progress(
+    state: &RuntimeState,
+    reputation_lookup: Option<&Arc<ReputationLookupClient>>,
+    progress: &FileHashProgress,
+) -> Option<KnownBadReputationMatch> {
+    let reputation_policy = state.policy_config().reputation;
+    if !reputation_policy.enabled
+        || !matches!(
+            reputation_policy.known_bad_action,
+            KnownBadAction::Block | KnownBadAction::Quarantine
+        )
+    {
+        return None;
+    }
+
+    if state.is_known_bad_reputation_hash(&progress.sha256) {
+        return Some(KnownBadReputationMatch {
+            file_path: progress.file_path.clone(),
+            sha256: progress.sha256.clone(),
+            bytes: progress.bytes,
+        });
+    }
+
+    let lookup = reputation_lookup?;
+    if !lookup.should_lookup(progress.bytes) {
+        return None;
+    }
+
+    match lookup.lookup(&progress.sha256).await {
+        Ok(ReputationVerdict::KnownBad) => {
+            state.add_known_bad_reputation_hash(&progress.sha256);
+            Some(KnownBadReputationMatch {
+                file_path: progress.file_path.clone(),
+                sha256: progress.sha256.clone(),
+                bytes: progress.bytes,
+            })
+        }
+        Ok(ReputationVerdict::KnownGood | ReputationVerdict::Unknown) => None,
+        Err(error) => {
+            warn!(
+                sha256 = progress.sha256,
+                bytes = progress.bytes,
+                ?error,
+                "inline reputation lookup failed; failing open"
+            );
+            None
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -648,7 +826,7 @@ impl ConnectionTelemetry {
         context: &InspectionContext<'_>,
         request: Smb2WriteRequest,
         frame: &[u8],
-    ) -> Option<KnownBadReputationMatch> {
+    ) -> Option<FileHashProgress> {
         let file_path = self
             .open_file_paths
             .lock()
@@ -672,14 +850,8 @@ impl ConnectionTelemetry {
                     context.direction,
                     payload,
                 );
-                if let Some(progress) = progress
-                    && state.is_known_bad_reputation_hash(&progress.sha256)
-                {
-                    return Some(KnownBadReputationMatch {
-                        file_path,
-                        sha256: progress.sha256,
-                        bytes: progress.bytes,
-                    });
+                if let Some(progress) = progress {
+                    return Some(progress);
                 }
             }
         } else {
@@ -786,6 +958,7 @@ struct KnownBadReputationMatch {
 
 #[derive(Debug, Clone)]
 struct FileHashProgress {
+    file_path: String,
     sha256: String,
     bytes: u64,
 }
@@ -827,6 +1000,7 @@ impl FileHashState {
 
     fn progress(&self) -> FileHashProgress {
         FileHashProgress {
+            file_path: self.file_path.clone(),
             sha256: hex_lower(&self.sha256.clone().finalize()),
             bytes: self.bytes,
         }
@@ -902,8 +1076,8 @@ fn guess_mime_type(extension: &str) -> String {
 }
 
 fn unix_timestamp_seconds() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
         .unwrap_or_else(|_| std::time::Duration::from_secs(0))
         .as_secs()
 }

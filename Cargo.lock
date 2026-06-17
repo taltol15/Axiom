@@ -198,6 +198,8 @@ dependencies = [
  "axiom-reputation",
  "libc",
  "md-5",
+ "reqwest",
+ "serde",
  "sha2",
  "socket2",
  "tokio",

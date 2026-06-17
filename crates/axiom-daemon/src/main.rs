@@ -64,10 +64,17 @@ async fn main() -> anyhow::Result<()> {
     }
 
     if config.node.role.runs_smb_proxy() {
+        let reputation_lookup_config = smb_reputation_lookup_config(&config);
         for proxy_listener in config.proxy_listeners.clone() {
             let proxy_runtime = Arc::clone(&runtime);
+            let proxy_reputation_lookup_config = reputation_lookup_config.clone();
             tasks.spawn(async move {
-                axiom_net::run_proxy_listener(proxy_listener, proxy_runtime).await
+                axiom_net::run_proxy_listener(
+                    proxy_listener,
+                    proxy_runtime,
+                    proxy_reputation_lookup_config,
+                )
+                .await
             });
         }
     }
@@ -434,6 +441,25 @@ async fn bootstrap_node_runtime_config(
     );
 
     Ok(())
+}
+
+fn smb_reputation_lookup_config(config: &AxiomConfig) -> Option<axiom_net::ReputationLookupConfig> {
+    if !config.node.role.runs_agent() {
+        return None;
+    }
+
+    let management_url = config.node.management_url.as_deref()?.trim();
+    let enrollment_token = config.node.enrollment_token.as_deref()?.trim();
+    if management_url.is_empty() || enrollment_token.is_empty() {
+        return None;
+    }
+
+    Some(axiom_net::ReputationLookupConfig {
+        management_url: management_url.to_string(),
+        enrollment_token: enrollment_token.to_string(),
+        allow_invalid_tls: config.node.allow_invalid_management_tls,
+        max_inline_lookup_bytes: 1024 * 1024,
+    })
 }
 
 #[derive(Debug, Clone)]

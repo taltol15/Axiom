@@ -13,6 +13,8 @@ axiom-core = { path = "../axiom-core" }
 axiom-reputation = { path = "../axiom-reputation" }
 libc.workspace = true
 md-5.workspace = true
+reqwest.workspace = true
+serde.workspace = true
 sha2.workspace = true
 socket2.workspace = true
 tokio.workspace = true
