@@ -810,15 +810,98 @@ configure_agent_management_stub() {
 }
 
 configure_agent_registration() {
-  NODE_MANAGEMENT_URL="$(prompt_nonempty "Management server URL, for example http://10.0.0.5:8443")"
-  NODE_ENROLLMENT_TOKEN="$(prompt_nonempty "Enrollment token from the Axiom management server")"
-  NODE_ALLOW_INVALID_MANAGEMENT_TLS="false"
+  NODE_ENROLLMENT_VALIDATED="false"
 
-  if [[ "${NODE_MANAGEMENT_URL}" == https://* ]]; then
-    if prompt_yes_no "Allow this node to trust a self-signed Management HTTPS certificate" "no"; then
-      NODE_ALLOW_INVALID_MANAGEMENT_TLS="true"
+  while true; do
+    NODE_MANAGEMENT_URL="$(prompt_nonempty "Management server URL, for example http://10.0.0.5:8443")"
+    NODE_ENROLLMENT_TOKEN="$(prompt_nonempty "Enrollment token from the Axiom management server")"
+    NODE_ALLOW_INVALID_MANAGEMENT_TLS="false"
+
+    if [[ "${NODE_MANAGEMENT_URL}" == https://* ]]; then
+      if prompt_yes_no "Allow this node to trust a self-signed Management HTTPS certificate" "no"; then
+        NODE_ALLOW_INVALID_MANAGEMENT_TLS="true"
+      fi
     fi
+
+    if validate_agent_enrollment; then
+      NODE_ENROLLMENT_VALIDATED="true"
+      return
+    fi
+
+    if prompt_yes_no "Continue without successful Management enrollment validation" "no"; then
+      return
+    fi
+
+    echo "Retrying Management enrollment settings."
+  done
+}
+
+validate_agent_enrollment() {
+  local normalized_management_url
+  local response_path
+  local curl_error_path
+  local curl_args=()
+  local http_code
+  local response_preview
+
+  normalized_management_url="${NODE_MANAGEMENT_URL%/}"
+  NODE_MANAGEMENT_URL="${normalized_management_url}"
+
+  if [[ ! "${NODE_MANAGEMENT_URL}" =~ ^https?:// ]]; then
+    ui_error "Management URL must start with http:// or https://"
+    return 1
   fi
+
+  if [[ ! "${NODE_ENROLLMENT_TOKEN}" =~ ^[A-Fa-f0-9]{32,128}$ ]]; then
+    ui_error "Enrollment token does not look like an Axiom token. Copy it from Management UI -> Settings -> Enrollment Token."
+    return 1
+  fi
+
+  response_path="$(mktemp)"
+  curl_error_path="$(mktemp)"
+
+  if [[ "${NODE_ALLOW_INVALID_MANAGEMENT_TLS}" == "true" ]]; then
+    curl_args+=("-k")
+  fi
+
+  curl_args+=(
+    -sS
+    --connect-timeout 4
+    --max-time 10
+    -o "${response_path}"
+    -w "%{http_code}"
+    -H "Authorization: Bearer ${NODE_ENROLLMENT_TOKEN}"
+    "${NODE_MANAGEMENT_URL}/api/nodes/runtime-config"
+  )
+
+  if ! http_code="$(curl "${curl_args[@]}" 2>"${curl_error_path}")"; then
+    response_preview="$(head -c 220 "${curl_error_path}" 2>/dev/null || true)"
+    rm -f "${response_path}" "${curl_error_path}"
+    ui_error "Could not reach Management server at ${NODE_MANAGEMENT_URL}: ${response_preview}"
+    return 1
+  fi
+
+  response_preview="$(head -c 220 "${response_path}" 2>/dev/null || true)"
+  rm -f "${response_path}" "${curl_error_path}"
+
+  case "${http_code}" in
+    200)
+      echo "Management enrollment token validated successfully."
+      return 0
+      ;;
+    401)
+      ui_error "Management rejected the enrollment token with HTTP 401. Copy the exact token from Management UI -> Settings."
+      return 1
+      ;;
+    000)
+      ui_error "Management server did not respond at ${NODE_MANAGEMENT_URL}."
+      return 1
+      ;;
+    *)
+      ui_error "Management enrollment validation failed with HTTP ${http_code}: ${response_preview}"
+      return 1
+      ;;
+  esac
 }
 
 select_node_control_interface() {
@@ -1484,6 +1567,11 @@ print_summary() {
   else
     echo "Management server: ${NODE_MANAGEMENT_URL}"
     echo "Node ID: ${NODE_ID}"
+    if [[ "${NODE_ENROLLMENT_VALIDATED:-false}" == "true" ]]; then
+      echo "Enrollment validation: passed"
+    else
+      echo "Enrollment validation: not verified"
+    fi
     if [[ "${NODE_CONTROL_ENABLED}" == "true" ]]; then
       echo "Node control API: http://${NODE_CONTROL_BIND_IP}:${NODE_CONTROL_PORT}/ (encrypted policy payloads)"
     fi
