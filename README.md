@@ -100,7 +100,7 @@ AXIOM_LICENSE_PUBLIC_KEY_HEX="official_axiom_public_key_hex" ./axiom-lab-install
 ```
 
 The installer writes that value to `[license].public_key_hex`. If the variable
-is omitted, Axiom falls back to its built-in development verification key.
+is omitted, Axiom uses its bundled public verification key.
 
 For lab issuance, generate an Ed25519 key pair on a trusted issuing workstation:
 

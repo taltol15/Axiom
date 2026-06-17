@@ -31,8 +31,8 @@ license_path = "/etc/axiom/license.json"
 state_path = "/var/lib/axiom/license-state.json"
 trial_days = 30
 warn_before_expiry_days = 14
-# Empty uses the built-in development key. Production installers should set the
-# official Axiom public verification key through AXIOM_LICENSE_PUBLIC_KEY_HEX.
+# Empty uses the bundled Axiom public verification key. Override with
+# AXIOM_LICENSE_PUBLIC_KEY_HEX only when rotating signing keys.
 public_key_hex = ""
 
 [dns]

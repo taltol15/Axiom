@@ -15,7 +15,7 @@ pub const DEFAULT_LICENSE_STATE_PATH: &str = "/var/lib/axiom/license-state.json"
 const DEFAULT_TRIAL_DAYS: u64 = 30;
 const DEFAULT_WARN_BEFORE_EXPIRY_DAYS: u64 = 14;
 const AXIOM_LICENSE_PUBLIC_KEY_HEX: &str =
-    "022f8987061b465a698c27a6b72a2c35419399335718b2a6ed0709df63b7327b";
+    "90b5ae047ed7381eac08894b338471b540a13386cc61a6e60dbde6915eb11750";
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct LicenseConfig {
