@@ -171,6 +171,14 @@ pub struct ActivationRequest {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ActivationFile {
+    pub format: String,
+    pub product: String,
+    pub generated_by: String,
+    pub activation_request: ActivationRequest,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
 struct TrialState {
     first_seen_unix_timestamp_seconds: u64,
     last_seen_unix_timestamp_seconds: u64,
@@ -283,7 +291,7 @@ pub fn default_public_key_hex() -> &'static str {
 pub fn decode_activation_request_text(value: &str) -> Result<ActivationRequest, LicenseError> {
     let trimmed = value.trim();
     if trimmed.starts_with('{') {
-        return serde_json::from_str(trimmed).map_err(LicenseError::Parse);
+        return parse_activation_request_json(trimmed);
     }
 
     let decoded = BASE64
@@ -291,7 +299,7 @@ pub fn decode_activation_request_text(value: &str) -> Result<ActivationRequest, 
         .map_err(|_| LicenseError::InvalidSignatureEncoding)?;
     let decoded_text =
         String::from_utf8(decoded).map_err(|_| LicenseError::InvalidSignatureEncoding)?;
-    serde_json::from_str(&decoded_text).map_err(LicenseError::Parse)
+    parse_activation_request_json(&decoded_text)
 }
 
 pub fn generate_signing_key_hex() -> Result<(String, String), LicenseError> {
@@ -629,6 +637,14 @@ fn normalize_license_text(value: &str) -> Result<String, LicenseError> {
     serde_json::to_string_pretty(&envelope).map_err(LicenseError::Parse)
 }
 
+fn parse_activation_request_json(value: &str) -> Result<ActivationRequest, LicenseError> {
+    serde_json::from_str::<ActivationRequest>(value)
+        .or_else(|_| {
+            serde_json::from_str::<ActivationFile>(value).map(|file| file.activation_request)
+        })
+        .map_err(LicenseError::Parse)
+}
+
 fn license_public_key_hex(config: &LicenseConfig) -> &str {
     config
         .public_key_hex
@@ -901,5 +917,34 @@ mod tests {
         assert_eq!(status.license_id.as_deref(), Some("LIC-TEST-001"));
 
         let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn decodes_customer_activation_file_wrapper() {
+        let request = ActivationRequest {
+            product: "Axiom".to_string(),
+            generated_at_unix_timestamp_seconds: 1_234,
+            machine_fingerprint: "abc123".to_string(),
+            hostname: "axiom-mgmt".to_string(),
+            usage: LicenseUsage {
+                management_nodes: 1,
+                smb_nodes: 2,
+                dns_nodes: 1,
+                protected_clients: 50,
+                reputation_entries: 10,
+            },
+            license_path: "/etc/axiom/license.json".to_string(),
+        };
+        let file = ActivationFile {
+            format: "axiom_activation_request_v1".to_string(),
+            product: "Axiom".to_string(),
+            generated_by: "Axiom Management Server".to_string(),
+            activation_request: request.clone(),
+        };
+
+        let decoded =
+            decode_activation_request_text(&serde_json::to_string_pretty(&file).unwrap()).unwrap();
+        assert_eq!(decoded.machine_fingerprint, request.machine_fingerprint);
+        assert_eq!(decoded.hostname, request.hostname);
     }
 }

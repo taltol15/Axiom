@@ -198,7 +198,7 @@ fn print_usage() {
 Usage:
   axiom-license-tool generate-key
   axiom-license-tool public-key --private-key-file /secure/axiom-license.key
-  axiom-license-tool issue --request activation.txt --customer \"Customer\" --private-key-file /secure/axiom-license.key [options]
+  axiom-license-tool issue --request customer.axact --customer \"Customer\" --private-key-file /secure/axiom-license.key --output customer.axlic [options]
 
 Issue options:
   --edition enterprise
@@ -214,6 +214,6 @@ Issue options:
   --notes \"Approved production license\"
   --unbound
   --base64
-  --output license.json"
+  --output customer.axlic"
     );
 }

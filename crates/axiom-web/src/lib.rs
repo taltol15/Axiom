@@ -2723,6 +2723,7 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
     .font-mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; }
     .font-medium { font-weight: 500; }
     .font-semibold { font-weight: 650; }
+    .cursor-pointer { cursor: pointer; }
     .text-left { text-align: left; }
     .text-right { text-align: right; }
     .text-xs { font-size: 0.75rem; line-height: 1rem; }
@@ -3566,28 +3567,49 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
           <div class="rounded-md border border-zinc-800 bg-zinc-950/50 p-4 lg:col-span-2">
             <div class="flex flex-col gap-2 md:flex-row md:items-start md:justify-between">
               <div>
-                <p class="text-sm font-semibold text-white">Offline Licensing</p>
+                <p class="text-sm font-semibold text-white">License Activation</p>
                 <p id="license-status" class="mt-2 text-sm text-zinc-500">Loading license state</p>
                 <p id="license-customer" class="mt-1 text-xs text-zinc-500">—</p>
               </div>
               <span id="license-state-badge" class="w-fit rounded-full border border-zinc-700 px-2.5 py-1 text-xs font-semibold uppercase text-zinc-300">loading</span>
             </div>
+
             <div class="mt-4 grid gap-4 lg:grid-cols-2">
-              <label class="block">
-                <span class="text-xs font-semibold uppercase tracking-wide text-zinc-500">Activation request</span>
-                <textarea id="license-activation-request" readonly rows="7" spellcheck="false" class="mt-2 w-full rounded-md border border-zinc-700 bg-zinc-950 px-3 py-2 font-mono text-xs text-white"></textarea>
-              </label>
-              <label class="block">
-                <span class="text-xs font-semibold uppercase tracking-wide text-zinc-500">Install signed license</span>
-                <textarea id="license-install-text" rows="7" spellcheck="false" placeholder="Paste signed Axiom license JSON or base64 package" class="mt-2 w-full rounded-md border border-zinc-700 bg-zinc-950 px-3 py-2 font-mono text-xs text-white"></textarea>
-              </label>
+              <div class="rounded-md border border-zinc-800 bg-zinc-950/50 p-4">
+                <p class="text-xs font-semibold uppercase tracking-wide text-zinc-500">Step 1</p>
+                <h3 class="mt-2 text-lg font-semibold text-white">Download activation file</h3>
+                <p class="mt-2 text-sm text-zinc-500">Send this file to Axiom support or upload it to the customer portal. No internet access is required on this server.</p>
+                <button id="download-activation-file" class="mt-4 rounded-md bg-emerald-400 px-3 py-2 text-sm font-semibold text-zinc-950 transition hover:bg-emerald-300">Download activation file</button>
+              </div>
+              <div class="rounded-md border border-zinc-800 bg-zinc-950/50 p-4">
+                <p class="text-xs font-semibold uppercase tracking-wide text-zinc-500">Step 2</p>
+                <h3 class="mt-2 text-lg font-semibold text-white">Upload license file</h3>
+                <p class="mt-2 text-sm text-zinc-500">Upload the signed <span class="font-mono">.axlic</span> file returned by Axiom. The license is verified locally before it is installed.</p>
+                <input id="license-file-input" type="file" accept=".axlic,.json,.b64,text/plain,application/json" class="mt-4 w-full rounded-md border border-zinc-700 bg-zinc-950 px-3 py-2 text-sm text-white">
+                <button id="install-license-file" class="mt-3 rounded-md bg-emerald-400 px-3 py-2 text-sm font-semibold text-zinc-950 transition hover:bg-emerald-300">Upload license file</button>
+              </div>
             </div>
-            <div class="mt-4 flex flex-wrap gap-2">
-              <button id="copy-license-request" class="rounded-md border border-zinc-700 px-3 py-2 text-sm text-zinc-200 transition hover:border-emerald-300 hover:text-emerald-200">Copy activation request</button>
-              <button id="install-license" class="rounded-md bg-emerald-400 px-3 py-2 text-sm font-semibold text-zinc-950 transition hover:bg-emerald-300">Install license</button>
-            </div>
+
             <p id="license-usage" class="mt-3 text-xs text-zinc-500">Usage not loaded</p>
             <p id="license-install-state" class="mt-1 text-xs text-zinc-500">No license operation running</p>
+
+            <details class="mt-4 rounded-md border border-zinc-800 bg-zinc-950/50 p-4">
+              <summary class="cursor-pointer text-sm font-semibold text-zinc-300">Advanced support data</summary>
+              <div class="mt-4 grid gap-4 lg:grid-cols-2">
+                <label class="block">
+                  <span class="text-xs font-semibold uppercase tracking-wide text-zinc-500">Activation request</span>
+                  <textarea id="license-activation-request" readonly rows="7" spellcheck="false" class="mt-2 w-full rounded-md border border-zinc-700 bg-zinc-950 px-3 py-2 font-mono text-xs text-white"></textarea>
+                </label>
+                <label class="block">
+                  <span class="text-xs font-semibold uppercase tracking-wide text-zinc-500">Paste signed license</span>
+                  <textarea id="license-install-text" rows="7" spellcheck="false" placeholder="Paste signed Axiom license JSON or base64 package" class="mt-2 w-full rounded-md border border-zinc-700 bg-zinc-950 px-3 py-2 font-mono text-xs text-white"></textarea>
+                </label>
+              </div>
+              <div class="mt-4 flex flex-wrap gap-2">
+                <button id="copy-license-request" class="rounded-md border border-zinc-700 px-3 py-2 text-sm text-zinc-200 transition hover:border-emerald-300 hover:text-emerald-200">Copy activation request</button>
+                <button id="install-license" class="rounded-md border border-emerald-400/40 px-3 py-2 text-sm font-semibold text-emerald-100 transition hover:border-emerald-300 hover:bg-emerald-400/10">Install pasted license</button>
+              </div>
+            </details>
           </div>
           <div class="rounded-md border border-zinc-800 bg-zinc-950/50 p-4">
             <p class="text-sm font-semibold text-white">Directory Integration</p>
@@ -3644,6 +3666,7 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
     const modes = ["disabled", "monitor", "block"];
     let clientIdentities = {};
     let reputationEntries = [];
+    let latestLicenseStatus = null;
 
     function authHeaders(extra = {}) {
       return token ? { ...extra, Authorization: `Bearer ${token}` } : extra;
@@ -3671,8 +3694,19 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
       return "border-zinc-700 bg-zinc-950 text-zinc-300";
     }
 
+    function activationFilePayload(license) {
+      if (!license?.activation_request) return null;
+      return {
+        format: "axiom_activation_request_v1",
+        product: "Axiom",
+        generated_by: "Axiom Management Server",
+        activation_request: license.activation_request
+      };
+    }
+
     function updateLicenseUi(license) {
       if (!license) return;
+      latestLicenseStatus = license;
       const state = license.state || "missing";
       const badgeClass = licenseBadgeClass(state);
       const title = state.replaceAll("_", " ");
@@ -3704,7 +3738,10 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
 
       const activation = document.getElementById("license-activation-request");
       if (activation && document.activeElement !== activation) {
-        activation.value = license.activation_request_b64 || "";
+        const activationFile = activationFilePayload(license);
+        activation.value = activationFile
+          ? JSON.stringify(activationFile, null, 2)
+          : (license.activation_request_b64 || "");
       }
     }
 
@@ -4534,10 +4571,44 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
       }
     }
 
-    async function installLicense() {
-      const licenseText = document.getElementById("license-install-text").value.trim();
+    function safeFilePart(value) {
+      return text(value)
+        .toLowerCase()
+        .replace(/[^a-z0-9._-]+/g, "-")
+        .replace(/^-+|-+$/g, "")
+        .slice(0, 48) || "axiom";
+    }
+
+    function downloadTextFile(filename, contents, mimeType) {
+      const blob = new Blob([contents], { type: mimeType || "application/octet-stream" });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = filename;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      URL.revokeObjectURL(url);
+    }
+
+    function downloadActivationFile() {
+      const activationFile = activationFilePayload(latestLicenseStatus);
+      if (!activationFile) {
+        document.getElementById("license-install-state").textContent = "Activation file is not ready yet";
+        return;
+      }
+
+      const request = activationFile.activation_request || {};
+      const fingerprint = safeFilePart(request.machine_fingerprint || "unknown").slice(0, 12);
+      const hostname = safeFilePart(request.hostname || "management");
+      const filename = `axiom-${hostname}-${fingerprint}.axact`;
+      downloadTextFile(filename, JSON.stringify(activationFile, null, 2), "application/vnd.axiom.activation+json");
+      document.getElementById("license-install-state").textContent = `Activation file downloaded · ${new Date().toLocaleTimeString()}`;
+    }
+
+    async function submitLicenseText(licenseText, successMessage) {
       if (!licenseText) {
-        document.getElementById("license-install-state").textContent = "Paste a signed license package first";
+        document.getElementById("license-install-state").textContent = "Choose or paste a signed license package first";
         return;
       }
 
@@ -4553,10 +4624,28 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
         return;
       }
 
-      document.getElementById("license-install-text").value = "";
       updateLicenseUi(payload);
-      document.getElementById("license-install-state").textContent = `License installed · ${new Date().toLocaleTimeString()}`;
+      document.getElementById("license-install-state").textContent = successMessage || `License installed · ${new Date().toLocaleTimeString()}`;
       await refresh();
+    }
+
+    async function installPastedLicense() {
+      const licenseText = document.getElementById("license-install-text").value.trim();
+      await submitLicenseText(licenseText, `Pasted license installed · ${new Date().toLocaleTimeString()}`);
+      document.getElementById("license-install-text").value = "";
+    }
+
+    async function installLicenseFile() {
+      const input = document.getElementById("license-file-input");
+      const file = input.files && input.files[0];
+      if (!file) {
+        document.getElementById("license-install-state").textContent = "Choose an .axlic license file first";
+        return;
+      }
+
+      const licenseText = await file.text();
+      await submitLicenseText(licenseText.trim(), `License file ${file.name} installed · ${new Date().toLocaleTimeString()}`);
+      input.value = "";
     }
 
     function readDnsPolicyPayload() {
@@ -4896,8 +4985,10 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
     document.getElementById("save-settings").addEventListener("click", saveLocalSettings);
     document.getElementById("copy-enrollment-token").addEventListener("click", copyEnrollmentToken);
     document.getElementById("rotate-enrollment-token").addEventListener("click", rotateEnrollmentToken);
+    document.getElementById("download-activation-file").addEventListener("click", downloadActivationFile);
+    document.getElementById("install-license-file").addEventListener("click", installLicenseFile);
     document.getElementById("copy-license-request").addEventListener("click", copyLicenseRequest);
-    document.getElementById("install-license").addEventListener("click", installLicense);
+    document.getElementById("install-license").addEventListener("click", installPastedLicense);
     document.getElementById("enable-https").addEventListener("click", () => saveTlsSettings(true));
     document.getElementById("disable-https").addEventListener("click", () => saveTlsSettings(false));
     document.getElementById("settings-theme").addEventListener("change", (event) => applyTheme(event.target.value));

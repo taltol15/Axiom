@@ -80,10 +80,16 @@ hostnames where PTR records exist.
 
 ## Offline Licensing
 
-Axiom starts with a local offline trial when no license is installed. The
-management UI exposes the activation request under Settings, and an admin can
-install a signed license package there without giving the server internet
-access.
+Axiom starts with a local offline trial when no license is installed. In the
+management UI, admins use a simple offline file exchange:
+
+```text
+Settings -> License Activation -> Download activation file
+Send the .axact file to Axiom
+Upload the returned .axlic license file
+```
+
+No customer server needs internet access for offline activation.
 
 For lab issuance, generate an Ed25519 key pair on a trusted issuing workstation:
 
@@ -105,12 +111,13 @@ Restart management after changing the public key:
 sudo systemctl restart axiom
 ```
 
-Then copy the Activation Request from the management UI and issue a license:
+Then download the `.axact` activation file from the management UI and issue a
+signed `.axlic` license:
 
 ```bash
 export AXIOM_LICENSE_PRIVATE_KEY_HEX="generated_private_key_hex"
 cargo run -p axiom-license --bin axiom-license-tool -- issue \
-  --request activation-request.txt \
+  --request customer.axact \
   --customer "Customer Lab" \
   --edition enterprise \
   --days 365 \
@@ -118,12 +125,12 @@ cargo run -p axiom-license --bin axiom-license-tool -- issue \
   --max-dns-nodes 5 \
   --max-protected-clients 5000 \
   --max-reputation-entries 100000 \
-  --output license.json
+  --output customer.axlic
 ```
 
-Paste `license.json` into Settings -> Offline Licensing -> Install signed
-license. Production issuance should use the official Axiom signing key, with
-only the public verification key present in customer deployments.
+Upload `customer.axlic` in Settings -> License Activation -> Upload license
+file. Production issuance should use the official Axiom signing key, with only
+the public verification key present in customer deployments.
 
 ## Policies
 
