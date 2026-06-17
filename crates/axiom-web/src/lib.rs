@@ -211,7 +211,7 @@ async fn login_page(headers: HeaderMap, State(state): State<Arc<WebState>>) -> R
         return Redirect::temporary("/dashboard").into_response();
     }
 
-    Html(LOGIN_HTML).into_response()
+    html_no_cache(LOGIN_HTML)
 }
 
 async fn dashboard_page(headers: HeaderMap, State(state): State<Arc<WebState>>) -> Response {
@@ -219,7 +219,19 @@ async fn dashboard_page(headers: HeaderMap, State(state): State<Arc<WebState>>) 
         return Redirect::temporary("/login").into_response();
     }
 
-    Html(DASHBOARD_HTML).into_response()
+    html_no_cache(DASHBOARD_HTML)
+}
+
+fn html_no_cache(html: &'static str) -> Response {
+    let mut response = Html(html).into_response();
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("no-store, no-cache, must-revalidate, max-age=0"),
+    );
+    headers.insert(header::PRAGMA, HeaderValue::from_static("no-cache"));
+    headers.insert(header::EXPIRES, HeaderValue::from_static("0"));
+    response
 }
 
 async fn api_status(headers: HeaderMap, State(state): State<Arc<WebState>>) -> Response {
