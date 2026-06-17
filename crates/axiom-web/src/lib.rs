@@ -369,7 +369,11 @@ async fn api_create_reputation(
 
     let actor = admin_actor(&state);
     match state.reputation.create(request, &actor) {
-        Ok(entry) => Json(entry).into_response(),
+        Ok(entry) => {
+            let push_results = push_reputation_hashes_to_smb_nodes(state.as_ref()).await;
+            warn_failed_node_pushes("reputation create", &push_results);
+            Json(entry).into_response()
+        }
         Err(error) => reputation_error_response(error),
     }
 }
@@ -390,7 +394,11 @@ async fn api_update_reputation(
 
     let actor = admin_actor(&state);
     match state.reputation.update(id, request, &actor) {
-        Ok(entry) => Json(entry).into_response(),
+        Ok(entry) => {
+            let push_results = push_reputation_hashes_to_smb_nodes(state.as_ref()).await;
+            warn_failed_node_pushes("reputation update", &push_results);
+            Json(entry).into_response()
+        }
         Err(error) => reputation_error_response(error),
     }
 }
@@ -410,7 +418,11 @@ async fn api_delete_reputation(
 
     let actor = admin_actor(&state);
     match state.reputation.delete(id, &actor) {
-        Ok(entry) => Json(entry).into_response(),
+        Ok(entry) => {
+            let push_results = push_reputation_hashes_to_smb_nodes(state.as_ref()).await;
+            warn_failed_node_pushes("reputation delete", &push_results);
+            Json(entry).into_response()
+        }
         Err(error) => reputation_error_response(error),
     }
 }
@@ -429,7 +441,10 @@ async fn api_import_reputation(
     }
 
     let actor = admin_actor(&state);
-    Json(state.reputation.bulk_import(request, &actor)).into_response()
+    let response = state.reputation.bulk_import(request, &actor);
+    let push_results = push_reputation_hashes_to_smb_nodes(state.as_ref()).await;
+    warn_failed_node_pushes("reputation import", &push_results);
+    Json(response).into_response()
 }
 
 async fn api_report_file_reputation(
@@ -738,7 +753,13 @@ async fn api_update_policies(
     }
 
     let runtime_policy = state.runtime.update_policy(policy.clone());
-    let node_push_results = push_policy_bundle_to_nodes(state.as_ref(), Some(policy), None).await;
+    let node_push_results = push_policy_bundle_to_nodes(
+        state.as_ref(),
+        Some(policy),
+        None,
+        Some(state.reputation.known_bad_sha256s()),
+    )
+    .await;
 
     Json(PolicyUpdateResponse {
         message: "policy updated and applied to the running engine",
@@ -808,7 +829,8 @@ async fn api_update_dns_policy(
     }
 
     let dns_policy_runtime = state.runtime.update_dns_policy(policy.clone());
-    let node_push_results = push_policy_bundle_to_nodes(state.as_ref(), None, Some(policy)).await;
+    let node_push_results =
+        push_policy_bundle_to_nodes(state.as_ref(), None, Some(policy), None).await;
 
     Json(DnsPolicyUpdateResponse {
         message: "DNS policy updated and applied to the running resolver",
@@ -1563,16 +1585,41 @@ fn fleet_node_snapshots(state: &WebState) -> Vec<FleetNodeStatus> {
     nodes
 }
 
+async fn push_reputation_hashes_to_smb_nodes(state: &WebState) -> Vec<NodePushResult> {
+    push_policy_bundle_to_nodes(
+        state,
+        None,
+        None,
+        Some(state.reputation.known_bad_sha256s()),
+    )
+    .await
+}
+
+fn warn_failed_node_pushes(context: &str, results: &[NodePushResult]) {
+    for result in results.iter().filter(|result| !result.accepted) {
+        warn!(
+            context,
+            node_id = result.node_id,
+            role = result.role.as_str(),
+            control_url = result.control_url,
+            message = result.message,
+            "failed pushing update to node"
+        );
+    }
+}
+
 async fn push_policy_bundle_to_nodes(
     state: &WebState,
     policy: Option<PolicyConfig>,
     dns_policy: Option<DnsPolicyConfig>,
+    known_bad_reputation_hashes: Option<Vec<String>>,
 ) -> Vec<NodePushResult> {
     let target_nodes: Vec<_> = fleet_node_snapshots(state)
         .into_iter()
         .filter(|node| {
             (policy.is_some() && node.role == NodeRole::SmbProxy)
                 || (dns_policy.is_some() && node.role == NodeRole::Dns)
+                || (known_bad_reputation_hashes.is_some() && node.role == NodeRole::SmbProxy)
         })
         .collect();
 
@@ -1626,6 +1673,7 @@ async fn push_policy_bundle_to_nodes(
                 node,
                 policy.clone(),
                 dns_policy.clone(),
+                known_bad_reputation_hashes.clone(),
             )
             .await,
         );
@@ -1640,6 +1688,7 @@ async fn push_policy_bundle_to_node(
     node: FleetNodeStatus,
     policy: Option<PolicyConfig>,
     dns_policy: Option<DnsPolicyConfig>,
+    known_bad_reputation_hashes: Option<Vec<String>>,
 ) -> NodePushResult {
     let node_id = node.node_id.clone();
     let role = node.role;
@@ -1668,6 +1717,7 @@ async fn push_policy_bundle_to_node(
         issued_unix_timestamp_seconds: unix_timestamp_seconds(),
         policy,
         dns_policy,
+        known_bad_reputation_hashes,
     };
 
     let envelope = match encrypt_payload(&node_id, shared_secret, &command) {

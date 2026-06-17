@@ -233,6 +233,12 @@ async fn api_apply_control_policy(
         state.runtime.update_dns_policy(dns_policy);
     }
 
+    if let Some(known_bad_hashes) = command.known_bad_reputation_hashes {
+        state
+            .runtime
+            .update_known_bad_reputation_hashes(known_bad_hashes);
+    }
+
     let response = ControlApplyResponse {
         accepted: true,
         message: format!("policy push applied on {}", state.role.as_str()),

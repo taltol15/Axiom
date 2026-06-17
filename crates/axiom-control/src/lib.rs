@@ -20,6 +20,8 @@ pub struct ControlPolicyBundle {
     pub issued_unix_timestamp_seconds: u64,
     pub policy: Option<PolicyConfig>,
     pub dns_policy: Option<DnsPolicyConfig>,
+    #[serde(default)]
+    pub known_bad_reputation_hashes: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -95,6 +97,7 @@ mod tests {
             issued_unix_timestamp_seconds: 42,
             policy: None,
             dns_policy: None,
+            known_bad_reputation_hashes: Some(vec!["a".repeat(64)]),
         };
 
         let envelope = encrypt_payload("dns-node-1", "shared-secret", &bundle).unwrap();
@@ -102,6 +105,10 @@ mod tests {
 
         assert_eq!(decoded.command_id, "cmd-1");
         assert_eq!(decoded.issued_unix_timestamp_seconds, 42);
+        assert_eq!(
+            decoded.known_bad_reputation_hashes,
+            Some(vec!["a".repeat(64)])
+        );
     }
 
     #[test]
@@ -111,6 +118,7 @@ mod tests {
             issued_unix_timestamp_seconds: 43,
             policy: None,
             dns_policy: None,
+            known_bad_reputation_hashes: None,
         };
 
         let envelope = encrypt_payload("smb-node-1", "shared-secret", &bundle).unwrap();
