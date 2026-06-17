@@ -24,7 +24,7 @@ use axiom_core::{
 use axiom_net::bind_tcp_listener_to_interface;
 use axiom_reputation::{
     FileReputationReport, ReputationBulkImportRequest, ReputationCreateRequest, ReputationError,
-    ReputationLookupResponse, ReputationStore, ReputationUpdateRequest,
+    ReputationLookupResponse, ReputationStore, ReputationUpdateRequest, ReputationVerdict,
 };
 use axum::{
     Json, Router,
@@ -461,6 +461,11 @@ async fn api_report_file_reputation(
     }
 
     let verdict = state.reputation.record_file_report(report);
+    if verdict == ReputationVerdict::KnownBad {
+        let push_results = push_reputation_hashes_to_smb_nodes(state.as_ref()).await;
+        warn_failed_node_pushes("known bad file report", &push_results);
+    }
+
     Json(ReputationLookupResponse {
         verdict,
         entry: None,

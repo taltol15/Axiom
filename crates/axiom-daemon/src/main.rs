@@ -43,6 +43,16 @@ async fn main() -> anyhow::Result<()> {
         StreamPolicy::from_config(config.policy.clone()),
         config.dns.policy.clone(),
     ));
+
+    if config.node.role.runs_agent()
+        && let Err(error) = bootstrap_node_runtime_config(&config, &runtime).await
+    {
+        warn!(
+            ?error,
+            "failed bootstrapping runtime config from management before listeners start; failing open"
+        );
+    }
+
     let mut tasks = JoinSet::new();
 
     if config.node.role.runs_management() {
@@ -390,6 +400,40 @@ async fn run_node_agent(config: AxiomConfig, runtime: Arc<RuntimeState>) -> anyh
             warn!(?error, "failed posting node report to management server");
         }
     }
+}
+
+async fn bootstrap_node_runtime_config(
+    config: &AxiomConfig,
+    runtime: &Arc<RuntimeState>,
+) -> anyhow::Result<()> {
+    let management_url = config
+        .node
+        .management_url
+        .as_deref()
+        .context("node.management_url is required for agent roles")?
+        .trim_end_matches('/')
+        .to_string();
+    let enrollment_token = config
+        .node
+        .enrollment_token
+        .as_deref()
+        .context("node.enrollment_token is required for agent roles")?;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(6))
+        .user_agent("AxiomNodeBootstrap/0.1")
+        .danger_accept_invalid_certs(config.node.allow_invalid_management_tls)
+        .build()
+        .context("failed building node bootstrap HTTP client")?;
+
+    pull_runtime_config(&client, &management_url, enrollment_token, runtime).await?;
+    info!(
+        node_id = config.node.node_id,
+        role = config.node.role.as_str(),
+        loaded = runtime.known_bad_reputation_hash_count(),
+        "bootstrapped runtime config from management"
+    );
+
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
