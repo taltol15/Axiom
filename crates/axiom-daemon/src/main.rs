@@ -237,11 +237,20 @@ async fn api_apply_control_policy(
         state
             .runtime
             .update_known_bad_reputation_hashes(known_bad_hashes);
+        info!(
+            node_id = state.node_id,
+            loaded = state.runtime.known_bad_reputation_hash_count(),
+            "applied pushed known bad reputation feed"
+        );
     }
 
     let response = ControlApplyResponse {
         accepted: true,
-        message: format!("policy push applied on {}", state.role.as_str()),
+        message: format!(
+            "policy push applied on {}; known_bad_hashes_loaded={}",
+            state.role.as_str(),
+            state.runtime.known_bad_reputation_hash_count()
+        ),
         applied_unix_timestamp_seconds: unix_timestamp_seconds(),
         policy_generation: state.runtime.policy_runtime_snapshot().generation,
         dns_policy_generation: state.runtime.dns_policy_runtime_snapshot().generation,
@@ -443,6 +452,13 @@ async fn process_completed_file_reputation(
         }
 
         let action = if verdict == ReputationVerdict::KnownBad {
+            if runtime.add_known_bad_reputation_hash(&transfer.sha256) {
+                info!(
+                    sha256 = transfer.sha256,
+                    loaded = runtime.known_bad_reputation_hash_count(),
+                    "learned known bad reputation hash from management lookup"
+                );
+            }
             policy.known_bad_action
         } else {
             KnownBadAction::Allow
@@ -599,6 +615,10 @@ async fn pull_runtime_config(
         let hashes = serde_json::from_value(hashes_value.clone())
             .context("failed decoding known bad reputation hashes from management")?;
         runtime.update_known_bad_reputation_hashes(hashes);
+        info!(
+            loaded = runtime.known_bad_reputation_hash_count(),
+            "pulled known bad reputation feed from management"
+        );
     }
 
     Ok(())

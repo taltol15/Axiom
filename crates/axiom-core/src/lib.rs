@@ -262,12 +262,31 @@ impl AppState {
             .expect("known bad reputation hashes lock poisoned") = normalized_hashes;
     }
 
+    pub fn add_known_bad_reputation_hash(&self, hash: &str) -> bool {
+        let normalized = hash.trim().to_ascii_lowercase();
+        if normalized.len() != 64 || !normalized.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return false;
+        }
+
+        self.known_bad_reputation_hashes
+            .write()
+            .expect("known bad reputation hashes lock poisoned")
+            .insert(normalized)
+    }
+
     pub fn is_known_bad_reputation_hash(&self, sha256: &str) -> bool {
         let normalized = sha256.trim().to_ascii_lowercase();
         self.known_bad_reputation_hashes
             .read()
             .expect("known bad reputation hashes lock poisoned")
             .contains(&normalized)
+    }
+
+    pub fn known_bad_reputation_hash_count(&self) -> usize {
+        self.known_bad_reputation_hashes
+            .read()
+            .expect("known bad reputation hashes lock poisoned")
+            .len()
     }
 
     pub fn record_file_observed(
@@ -729,6 +748,7 @@ impl AppState {
                 .counters
                 .unknown_reputation_events
                 .load(Ordering::Relaxed),
+            known_bad_reputation_hashes_loaded: self.known_bad_reputation_hash_count(),
             dns_queries: self.counters.dns_queries.load(Ordering::Relaxed),
             dns_udp_queries: self.counters.dns_udp_queries.load(Ordering::Relaxed),
             dns_tcp_queries: self.counters.dns_tcp_queries.load(Ordering::Relaxed),
@@ -1071,6 +1091,7 @@ pub struct StatusSnapshot {
     pub known_good_reputation_events: u64,
     pub known_bad_reputation_events: u64,
     pub unknown_reputation_events: u64,
+    pub known_bad_reputation_hashes_loaded: usize,
     pub dns_queries: u64,
     pub dns_udp_queries: u64,
     pub dns_tcp_queries: u64,

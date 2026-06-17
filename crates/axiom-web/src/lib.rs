@@ -1445,6 +1445,13 @@ fn unix_timestamp_seconds() -> u64 {
         .as_secs()
 }
 
+fn unix_timestamp_nanos() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_else(|_| Duration::from_secs(0))
+        .as_nanos()
+}
+
 fn run_diagnostic_command(command: &str, args: &[&str]) -> CommandOutput {
     match Command::new(command).args(args).output() {
         Ok(output) => CommandOutput {
@@ -1710,7 +1717,7 @@ async fn push_policy_bundle_to_node(
     let command = ControlPolicyBundle {
         command_id: format!(
             "{}-{}-{}",
-            unix_timestamp_seconds(),
+            unix_timestamp_nanos(),
             std::process::id(),
             node_id
         ),
@@ -3239,6 +3246,7 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
         "bytes_client_to_server", "bytes_server_to_client", "smb_write_requests",
         "smb_write_bytes", "server_side_copy_requests", "completed_file_hashes",
         "known_good_reputation_events", "known_bad_reputation_events", "unknown_reputation_events",
+        "known_bad_reputation_hashes_loaded",
         "dns_queries", "dns_udp_queries",
         "dns_tcp_queries", "dns_blocked_queries", "dns_monitored_queries", "dns_cache_hits",
         "dns_upstream_errors", "monitored_threats", "blocked_threats"
@@ -3289,6 +3297,7 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
         const healthy = age <= 20;
         const wireBytes = Number(stats.stream_bytes_client_to_server || 0) + Number(stats.stream_bytes_server_to_client || 0);
         const dnsQueries = Number(stats.dns_queries || 0);
+        const knownBadLoaded = Number(stats.known_bad_reputation_hashes_loaded || 0);
         const trafficTitle = node.role === "dns" ? `${dnsQueries} DNS queries` : formatBytes(wireBytes);
         const services = [
           (node.proxy_listeners || []).length ? `${(node.proxy_listeners || []).length} SMB routes` : null,
@@ -3313,7 +3322,7 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
             </td>
             <td class="whitespace-nowrap px-6 py-4 text-sm text-red-200">
               <p>${text(stats.blocked_threats || 0)} SMB blocks</p>
-              <p class="mt-1 text-xs text-zinc-500">${text(stats.dns_blocked_queries || 0)} DNS blocks</p>
+              <p class="mt-1 text-xs text-zinc-500">${text(stats.dns_blocked_queries || 0)} DNS blocks · ${knownBadLoaded} known-bad hashes</p>
             </td>
             <td class="px-6 py-4 text-sm text-zinc-300">${text(services)}</td>
           </tr>
