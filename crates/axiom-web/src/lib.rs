@@ -288,6 +288,13 @@ async fn api_node_report(
             .into_response();
     }
 
+    let last_control_push = state
+        .fleet_nodes
+        .lock()
+        .expect("fleet nodes mutex poisoned")
+        .get(&node_id)
+        .and_then(|node| node.last_control_push.clone());
+
     let status = FleetNodeStatus {
         node_id: node_id.clone(),
         display_name: report.display_name,
@@ -300,6 +307,7 @@ async fn api_node_report(
         proxy_listeners: report.proxy_listeners,
         dns: report.dns,
         stats: report.stats,
+        last_control_push,
     };
 
     state
@@ -1778,16 +1786,22 @@ async fn push_policy_bundle_to_nodes(
         config.node.enrollment_token.clone()
     };
     let Some(shared_secret) = shared_secret.filter(|token| !token.trim().is_empty()) else {
-        return target_nodes
+        let results: Vec<_> = target_nodes
             .into_iter()
-            .map(|node| NodePushResult {
-                node_id: node.node_id,
-                role: node.role,
-                control_url: node.control_url,
-                accepted: false,
-                message: "management enrollment token is not configured".to_string(),
+            .map(|node| {
+                node_push_failure(
+                    node.node_id,
+                    node.role,
+                    node.control_url,
+                    None,
+                    "management enrollment token is not configured",
+                )
             })
             .collect();
+        for result in &results {
+            record_node_push_result(state, result);
+        }
+        return results;
     };
 
     let client = match reqwest::Client::builder()
@@ -1797,35 +1811,105 @@ async fn push_policy_bundle_to_nodes(
     {
         Ok(client) => client,
         Err(error) => {
-            return target_nodes
+            let results: Vec<_> = target_nodes
                 .into_iter()
-                .map(|node| NodePushResult {
-                    node_id: node.node_id,
-                    role: node.role,
-                    control_url: node.control_url,
-                    accepted: false,
-                    message: format!("failed building control client: {error}"),
+                .map(|node| {
+                    node_push_failure(
+                        node.node_id,
+                        node.role,
+                        node.control_url,
+                        None,
+                        format!("failed building control client: {error}"),
+                    )
                 })
                 .collect();
+            for result in &results {
+                record_node_push_result(state, result);
+            }
+            return results;
         }
     };
 
     let mut results = Vec::with_capacity(target_nodes.len());
     for node in target_nodes {
-        results.push(
-            push_policy_bundle_to_node(
-                &client,
-                &shared_secret,
-                node,
-                policy.clone(),
-                dns_policy.clone(),
-                known_bad_reputation_hashes.clone(),
-            )
-            .await,
-        );
+        let result = push_policy_bundle_to_node(
+            &client,
+            &shared_secret,
+            node,
+            policy.clone(),
+            dns_policy.clone(),
+            known_bad_reputation_hashes.clone(),
+        )
+        .await;
+        record_node_push_result(state, &result);
+        results.push(result);
     }
 
     results
+}
+
+fn node_push_failure(
+    node_id: String,
+    role: NodeRole,
+    control_url: Option<String>,
+    command_id: Option<String>,
+    message: impl Into<String>,
+) -> NodePushResult {
+    NodePushResult {
+        node_id,
+        role,
+        control_url,
+        accepted: false,
+        message: message.into(),
+        command_id,
+        pushed_unix_timestamp_seconds: unix_timestamp_seconds(),
+        applied_unix_timestamp_seconds: None,
+        policy_generation: None,
+        dns_policy_generation: None,
+        known_bad_reputation_hash_count: None,
+    }
+}
+
+fn node_push_success(
+    node_id: String,
+    role: NodeRole,
+    control_url: Option<String>,
+    command_id: String,
+    pushed_unix_timestamp_seconds: u64,
+    response: ControlApplyResponse,
+) -> NodePushResult {
+    NodePushResult {
+        node_id,
+        role,
+        control_url,
+        accepted: response.accepted,
+        message: response.message,
+        command_id: Some(command_id),
+        pushed_unix_timestamp_seconds,
+        applied_unix_timestamp_seconds: Some(response.applied_unix_timestamp_seconds),
+        policy_generation: Some(response.policy_generation),
+        dns_policy_generation: Some(response.dns_policy_generation),
+        known_bad_reputation_hash_count: Some(response.known_bad_reputation_hash_count),
+    }
+}
+
+fn record_node_push_result(state: &WebState, result: &NodePushResult) {
+    let mut fleet_nodes = state
+        .fleet_nodes
+        .lock()
+        .expect("fleet nodes mutex poisoned");
+    if let Some(node) = fleet_nodes.get_mut(&result.node_id) {
+        node.last_control_push = Some(NodeControlPushStatus {
+            command_id: result.command_id.clone(),
+            accepted: result.accepted,
+            message: result.message.clone(),
+            pushed_unix_timestamp_seconds: result.pushed_unix_timestamp_seconds,
+            applied_unix_timestamp_seconds: result.applied_unix_timestamp_seconds,
+            policy_generation: result.policy_generation,
+            dns_policy_generation: result.dns_policy_generation,
+            known_bad_reputation_hash_count: result.known_bad_reputation_hash_count,
+        });
+    }
 }
 
 async fn push_policy_bundle_to_node(
@@ -1844,23 +1928,25 @@ async fn push_policy_bundle_to_node(
         .map(str::trim)
         .filter(|value| !value.is_empty())
     else {
-        return NodePushResult {
+        return node_push_failure(
             node_id,
             role,
             control_url,
-            accepted: false,
-            message: "node did not publish a control URL yet".to_string(),
-        };
+            None,
+            "node did not publish a control URL yet",
+        );
     };
 
+    let command_id = format!(
+        "{}-{}-{}",
+        unix_timestamp_nanos(),
+        std::process::id(),
+        node_id
+    );
+    let pushed_unix_timestamp_seconds = unix_timestamp_seconds();
     let command = ControlPolicyBundle {
-        command_id: format!(
-            "{}-{}-{}",
-            unix_timestamp_nanos(),
-            std::process::id(),
-            node_id
-        ),
-        issued_unix_timestamp_seconds: unix_timestamp_seconds(),
+        command_id: command_id.clone(),
+        issued_unix_timestamp_seconds: pushed_unix_timestamp_seconds,
         policy,
         dns_policy,
         known_bad_reputation_hashes,
@@ -1869,13 +1955,13 @@ async fn push_policy_bundle_to_node(
     let envelope = match encrypt_payload(&node_id, shared_secret, &command) {
         Ok(envelope) => envelope,
         Err(error) => {
-            return NodePushResult {
+            return node_push_failure(
                 node_id,
                 role,
                 control_url,
-                accepted: false,
-                message: format!("failed encrypting policy bundle: {error}"),
-            };
+                Some(command_id),
+                format!("failed encrypting policy bundle: {error}"),
+            );
         }
     };
 
@@ -1892,64 +1978,65 @@ async fn push_policy_bundle_to_node(
     {
         Ok(response) => response,
         Err(error) => {
-            return NodePushResult {
+            return node_push_failure(
                 node_id,
                 role,
                 control_url,
-                accepted: false,
-                message: format!("control push request failed: {error}"),
-            };
+                Some(command_id),
+                format!("control push request failed: {error}"),
+            );
         }
     };
 
     if !response.status().is_success() {
-        return NodePushResult {
+        return node_push_failure(
             node_id,
             role,
             control_url,
-            accepted: false,
-            message: format!("node returned HTTP {}", response.status()),
-        };
+            Some(command_id),
+            format!("node returned HTTP {}", response.status()),
+        );
     }
 
     let response_envelope: EncryptedEnvelope = match response.json().await {
         Ok(envelope) => envelope,
         Err(error) => {
-            return NodePushResult {
+            return node_push_failure(
                 node_id,
                 role,
                 control_url,
-                accepted: false,
-                message: format!("failed decoding encrypted node response: {error}"),
-            };
+                Some(command_id),
+                format!("failed decoding encrypted node response: {error}"),
+            );
         }
     };
 
     if response_envelope.node_id != node_id {
-        return NodePushResult {
+        return node_push_failure(
             node_id,
             role,
             control_url,
-            accepted: false,
-            message: "node response identity mismatch".to_string(),
-        };
+            Some(command_id),
+            "node response identity mismatch",
+        );
     }
 
     match decrypt_payload::<ControlApplyResponse>(shared_secret, &response_envelope) {
-        Ok(response) => NodePushResult {
+        Ok(response) => node_push_success(
             node_id,
             role,
             control_url,
-            accepted: response.accepted,
-            message: response.message,
-        },
-        Err(error) => NodePushResult {
+            command_id,
+            pushed_unix_timestamp_seconds,
+            response,
+        ),
+        Err(error) => node_push_failure(
             node_id,
             role,
             control_url,
-            accepted: false,
-            message: format!("failed decrypting node response: {error}"),
-        },
+            Some(command_id),
+            format!("failed decrypting node response: {error}"),
+        ),
     }
 }
 
@@ -2117,6 +2204,7 @@ struct FleetNodeStatus {
     proxy_listeners: Vec<ProxyListenerStatus>,
     dns: DnsStatus,
     stats: serde_json::Value,
+    last_control_push: Option<NodeControlPushStatus>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2342,6 +2430,24 @@ struct NodePushResult {
     control_url: Option<String>,
     accepted: bool,
     message: String,
+    command_id: Option<String>,
+    pushed_unix_timestamp_seconds: u64,
+    applied_unix_timestamp_seconds: Option<u64>,
+    policy_generation: Option<u64>,
+    dns_policy_generation: Option<u64>,
+    known_bad_reputation_hash_count: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct NodeControlPushStatus {
+    command_id: Option<String>,
+    accepted: bool,
+    message: String,
+    pushed_unix_timestamp_seconds: u64,
+    applied_unix_timestamp_seconds: Option<u64>,
+    policy_generation: Option<u64>,
+    dns_policy_generation: Option<u64>,
+    known_bad_reputation_hash_count: Option<usize>,
 }
 
 #[derive(Debug, Serialize)]
@@ -3906,6 +4012,18 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
         const dnsQueries = Number(stats.dns_queries || 0);
         const knownBadLoaded = Number(stats.known_bad_reputation_hashes_loaded || 0);
         const trafficTitle = node.role === "dns" ? `${dnsQueries} DNS queries` : formatBytes(wireBytes);
+        const push = node.last_control_push || null;
+        const pushOk = !push || Boolean(push.accepted);
+        const pushDetail = push
+          ? `${push.accepted ? "last push ok" : "last push failed"} · ${formatTime(push.pushed_unix_timestamp_seconds)}`
+          : "no policy push recorded";
+        const pushGenerations = push
+          ? [
+              push.policy_generation ? `SMB gen ${push.policy_generation}` : null,
+              push.dns_policy_generation ? `DNS gen ${push.dns_policy_generation}` : null,
+              push.known_bad_reputation_hash_count !== null && push.known_bad_reputation_hash_count !== undefined ? `${push.known_bad_reputation_hash_count} known-bad hashes` : null
+            ].filter(Boolean).join(" · ")
+          : "";
         const services = [
           (node.proxy_listeners || []).length ? `${(node.proxy_listeners || []).length} SMB routes` : null,
           node.dns?.enabled ? `DNS ${text(node.dns.listen_udp_addr)}` : null,
@@ -3922,6 +4040,8 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
             <td class="whitespace-nowrap px-6 py-4 text-sm">
               <span class="rounded-full border px-2.5 py-1 text-xs font-semibold uppercase ${healthy ? "border-emerald-400/40 bg-emerald-500/10 text-emerald-100" : "border-amber-400/40 bg-amber-500/10 text-amber-100"}">${healthy ? "online" : "stale"}</span>
               <p class="mt-2 text-xs text-zinc-500">${age}s ago · v${text(node.version)}</p>
+              <p class="mt-2 text-xs ${pushOk ? "text-emerald-300" : "text-red-300"}">${text(pushDetail)}</p>
+              ${pushGenerations ? `<p class="mt-1 text-xs text-zinc-500">${text(pushGenerations)}</p>` : ""}
             </td>
             <td class="whitespace-nowrap px-6 py-4 text-sm text-sky-200">
               <p>${trafficTitle}</p>

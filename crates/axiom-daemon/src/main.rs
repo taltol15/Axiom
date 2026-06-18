@@ -233,6 +233,7 @@ async fn api_apply_control_policy(
             applied_unix_timestamp_seconds: unix_timestamp_seconds(),
             policy_generation: state.runtime.policy_runtime_snapshot().generation,
             dns_policy_generation: state.runtime.dns_policy_runtime_snapshot().generation,
+            known_bad_reputation_hash_count: state.runtime.known_bad_reputation_hash_count(),
         };
         return encrypted_control_response(&state, response);
     }
@@ -276,6 +277,7 @@ async fn api_apply_control_policy(
         applied_unix_timestamp_seconds: unix_timestamp_seconds(),
         policy_generation: state.runtime.policy_runtime_snapshot().generation,
         dns_policy_generation: state.runtime.dns_policy_runtime_snapshot().generation,
+        known_bad_reputation_hash_count: state.runtime.known_bad_reputation_hash_count(),
     };
 
     info!(

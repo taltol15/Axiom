@@ -31,6 +31,8 @@ pub struct ControlApplyResponse {
     pub applied_unix_timestamp_seconds: u64,
     pub policy_generation: u64,
     pub dns_policy_generation: u64,
+    #[serde(default)]
+    pub known_bad_reputation_hash_count: usize,
 }
 
 pub fn encrypt_payload<T: Serialize>(
