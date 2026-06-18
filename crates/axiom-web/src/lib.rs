@@ -2625,6 +2625,23 @@ const LOGIN_HTML: &str = r##"<!doctype html>
       width: 100%;
     }
     button:hover { background: #6ee7b7; }
+    .axiom-brand {
+      align-items: center;
+      display: inline-flex;
+      gap: 0.75rem;
+    }
+    .axiom-brand svg {
+      flex: 0 0 auto;
+      height: 3rem;
+      width: 3rem;
+    }
+    .axiom-wordmark {
+      color: #fff;
+      font-size: clamp(2.6rem, 7vw, 4.75rem);
+      font-weight: 800;
+      line-height: 1;
+    }
+    .axiom-wordmark span { color: #34f5c5; display: inline; }
     .max-w-3xl { max-width: 48rem; }
     .max-w-md { max-width: 28rem; }
     .w-full { width: 100%; }
@@ -2659,7 +2676,28 @@ const LOGIN_HTML: &str = r##"<!doctype html>
           <span class="h-2 w-2 rounded-full bg-emerald-300"></span>
           Inline SMB protection
         </div>
-        <h1 class="text-5xl font-semibold tracking-normal text-white md:text-7xl">Axiom</h1>
+        <h1 class="axiom-brand" aria-label="Axiom">
+          <svg viewBox="0 0 48 48" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Axiom logomark">
+            <defs>
+              <linearGradient id="axiom-login-grad" x1="6" y1="4" x2="42" y2="44" gradientUnits="userSpaceOnUse">
+                <stop stop-color="#34F5C5" />
+                <stop offset="0.5" stop-color="#2FE3FF" />
+                <stop offset="1" stop-color="#5B8CFF" />
+              </linearGradient>
+              <linearGradient id="axiom-login-grad-soft" x1="6" y1="4" x2="42" y2="44" gradientUnits="userSpaceOnUse">
+                <stop stop-color="#2FE3FF" stop-opacity="0.25" />
+                <stop offset="1" stop-color="#5B8CFF" stop-opacity="0.05" />
+              </linearGradient>
+            </defs>
+            <path d="M24 2.5 41.6 12.75v20.5L24 43.5 6.4 33.25v-20.5z" fill="url(#axiom-login-grad-soft)" stroke="url(#axiom-login-grad)" stroke-width="2" stroke-linejoin="round" />
+            <path d="M16 33 24 14l8 19" stroke="url(#axiom-login-grad)" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round" />
+            <path d="M19.2 26.5h9.6" stroke="url(#axiom-login-grad)" stroke-width="2.6" stroke-linecap="round" />
+            <circle cx="24" cy="13.4" r="2.5" fill="#05070d" stroke="url(#axiom-login-grad)" stroke-width="2" />
+            <circle cx="15.6" cy="33.4" r="2.2" fill="#05070d" stroke="url(#axiom-login-grad)" stroke-width="2" />
+            <circle cx="32.4" cy="33.4" r="2.2" fill="#05070d" stroke="url(#axiom-login-grad)" stroke-width="2" />
+          </svg>
+          <span class="axiom-wordmark">AXIOM<span>.</span></span>
+        </h1>
         <p class="mt-6 max-w-2xl text-lg leading-8 text-zinc-300">Real-time SMB reverse proxy visibility for segmented enterprise file-server networks.</p>
       </div>
     </section>
@@ -3063,6 +3101,38 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
       color: #ecfdf5 !important;
     }
 
+    .axiom-brand {
+      align-items: center;
+      color: #fff;
+      display: inline-flex;
+      gap: 0.75rem;
+      min-width: 0;
+    }
+
+    .axiom-brand svg {
+      flex: 0 0 auto;
+      height: 2.4rem;
+      width: 2.4rem;
+    }
+
+    .axiom-wordmark {
+      color: #fff;
+      font-size: 1.55rem;
+      font-weight: 800;
+      line-height: 1;
+    }
+
+    .axiom-wordmark span {
+      color: var(--accent);
+      display: inline;
+    }
+
+    .axiom-console-label {
+      color: #94a3b8;
+      font-size: 0.875rem;
+      margin-top: 0.35rem;
+    }
+
     .rounded-lg {
       border-radius: 8px !important;
     }
@@ -3107,8 +3177,29 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
   <header class="border-b border-zinc-800 bg-zinc-950/95">
     <div class="mx-auto flex max-w-7xl items-center justify-between gap-6 px-6 py-5">
       <div>
-        <p class="text-sm font-medium uppercase tracking-[0.28em] text-emerald-300">Axiom</p>
-        <h1 class="mt-1 text-2xl font-semibold text-white">Axiom Dashboard</h1>
+        <div class="axiom-brand" aria-label="Axiom">
+          <svg viewBox="0 0 48 48" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Axiom logomark">
+            <defs>
+              <linearGradient id="axiom-dashboard-grad" x1="6" y1="4" x2="42" y2="44" gradientUnits="userSpaceOnUse">
+                <stop stop-color="#34F5C5" />
+                <stop offset="0.5" stop-color="#2FE3FF" />
+                <stop offset="1" stop-color="#5B8CFF" />
+              </linearGradient>
+              <linearGradient id="axiom-dashboard-grad-soft" x1="6" y1="4" x2="42" y2="44" gradientUnits="userSpaceOnUse">
+                <stop stop-color="#2FE3FF" stop-opacity="0.25" />
+                <stop offset="1" stop-color="#5B8CFF" stop-opacity="0.05" />
+              </linearGradient>
+            </defs>
+            <path d="M24 2.5 41.6 12.75v20.5L24 43.5 6.4 33.25v-20.5z" fill="url(#axiom-dashboard-grad-soft)" stroke="url(#axiom-dashboard-grad)" stroke-width="2" stroke-linejoin="round" />
+            <path d="M16 33 24 14l8 19" stroke="url(#axiom-dashboard-grad)" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round" />
+            <path d="M19.2 26.5h9.6" stroke="url(#axiom-dashboard-grad)" stroke-width="2.6" stroke-linecap="round" />
+            <circle cx="24" cy="13.4" r="2.5" fill="#05070d" stroke="url(#axiom-dashboard-grad)" stroke-width="2" />
+            <circle cx="15.6" cy="33.4" r="2.2" fill="#05070d" stroke="url(#axiom-dashboard-grad)" stroke-width="2" />
+            <circle cx="32.4" cy="33.4" r="2.2" fill="#05070d" stroke="url(#axiom-dashboard-grad)" stroke-width="2" />
+          </svg>
+          <span class="axiom-wordmark">AXIOM<span>.</span></span>
+        </div>
+        <p class="axiom-console-label">Management Console</p>
       </div>
       <button id="logout" class="rounded-md border border-zinc-700 px-4 py-2 text-sm text-zinc-200 transition hover:border-red-400 hover:text-red-200">Log out</button>
     </div>
