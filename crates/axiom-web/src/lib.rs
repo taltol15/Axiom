@@ -100,6 +100,9 @@ pub async fn run_management_server(
         .route("/login", get(login_page))
         .route("/api/status", get(api_status))
         .route("/api/diagnostics", get(api_diagnostics))
+        .route("/api/smoke-tests", post(api_smoke_tests))
+        .route("/api/backup/export", get(api_backup_export))
+        .route("/api/backup/restore", post(api_backup_restore))
         .route("/api/nodes/report", post(api_node_report))
         .route("/api/nodes/runtime-config", get(api_node_runtime_config))
         .route(
@@ -261,6 +264,274 @@ async fn api_diagnostics(headers: HeaderMap, State(state): State<Arc<WebState>>)
     }
 
     Json(build_diagnostics_response(&state)).into_response()
+}
+
+async fn api_smoke_tests(headers: HeaderMap, State(state): State<Arc<WebState>>) -> Response {
+    if !is_authorized(&headers, &state) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(ErrorResponse {
+                message: "authentication required",
+            }),
+        )
+            .into_response();
+    }
+
+    Json(build_smoke_test_response(&state)).into_response()
+}
+
+async fn api_backup_export(headers: HeaderMap, State(state): State<Arc<WebState>>) -> Response {
+    if !is_authorized(&headers, &state) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(ErrorResponse {
+                message: "authentication required",
+            }),
+        )
+            .into_response();
+    }
+
+    let backup = build_backup_bundle(&state);
+    let filename = format!(
+        "axiom-backup-{}-{}.json",
+        safe_filename_part(&backup.node.display_name),
+        backup.generated_at_unix_timestamp_seconds
+    );
+
+    match serde_json::to_string_pretty(&backup) {
+        Ok(contents) => (
+            StatusCode::OK,
+            [
+                (
+                    header::CONTENT_TYPE,
+                    HeaderValue::from_static("application/json"),
+                ),
+                (
+                    header::CONTENT_DISPOSITION,
+                    HeaderValue::from_str(&format!("attachment; filename=\"{filename}\""))
+                        .unwrap_or_else(|_| HeaderValue::from_static("attachment")),
+                ),
+            ],
+            contents,
+        )
+            .into_response(),
+        Err(error) => {
+            warn!(?error, "failed serializing backup bundle");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    message: "failed creating backup bundle",
+                }),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn api_backup_restore(
+    headers: HeaderMap,
+    State(state): State<Arc<WebState>>,
+    Json(request): Json<BackupRestoreRequest>,
+) -> Response {
+    if !is_authorized(&headers, &state) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(ApiErrorResponse::new("authentication required")),
+        )
+            .into_response();
+    }
+
+    let mut restored_config = false;
+    let mut restored_policies = false;
+    let mut restored_reputation = 0usize;
+    let mut skipped_reputation = 0usize;
+    let mut restored_license = false;
+    let mut warnings = Vec::new();
+
+    let mut policy_for_push = None;
+    let mut dns_policy_for_push = None;
+
+    if request.restore_config || request.restore_policies {
+        let mut config = state.config.lock().expect("web config mutex poisoned");
+        let mut next_config = if request.restore_config {
+            let Some(config_toml) = request.backup.config_toml.as_deref() else {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(ApiErrorResponse::new(
+                        "backup does not contain a restorable config_toml",
+                    )),
+                )
+                    .into_response();
+            };
+
+            match toml::from_str::<AxiomConfig>(config_toml) {
+                Ok(config) => config,
+                Err(error) => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(ApiErrorResponse::new(format!(
+                            "backup config is not valid TOML: {error}"
+                        ))),
+                    )
+                        .into_response();
+                }
+            }
+        } else {
+            config.clone()
+        };
+
+        if request.restore_policies {
+            if let Some(policy) = request.backup.policy.clone() {
+                next_config.policy = policy;
+            }
+            if let Some(dns_policy) = request.backup.dns_policy.clone() {
+                next_config.dns.policy = dns_policy;
+            }
+        }
+
+        if let Err(error) = next_config.validate() {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ApiErrorResponse::new(format!(
+                    "restored configuration is invalid: {error}"
+                ))),
+            )
+                .into_response();
+        }
+
+        if let Err(error) = persist_config(&state.config_path, &next_config) {
+            warn!(?error, "failed persisting restored config");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiErrorResponse::new(
+                    "failed saving restored configuration",
+                )),
+            )
+                .into_response();
+        }
+
+        restored_config = request.restore_config;
+        restored_policies = request.restore_policies;
+        if request.restore_config {
+            warnings.push(String::from(
+                "Full config was restored; restart Axiom for listener, NIC, role, and TLS changes.",
+            ));
+        }
+
+        policy_for_push = Some(next_config.policy.clone());
+        dns_policy_for_push = Some(next_config.dns.policy.clone());
+        *config = next_config;
+    }
+
+    if request.restore_reputation {
+        let existing_by_sha256: HashMap<String, u64> = state
+            .reputation
+            .list()
+            .entries
+            .into_iter()
+            .map(|entry| (entry.sha256, entry.id))
+            .collect();
+
+        for entry in &request.backup.reputation_entries {
+            let result = if let Some(id) = existing_by_sha256.get(&entry.sha256) {
+                state.reputation.update(
+                    *id,
+                    ReputationUpdateRequest {
+                        sha256: Some(entry.sha256.clone()),
+                        md5: Some(entry.md5.clone().unwrap_or_default()),
+                        verdict: Some(entry.verdict),
+                        source: Some(entry.source.clone()),
+                        notes: Some(entry.notes.clone()),
+                    },
+                    "backup-restore",
+                )
+            } else {
+                state.reputation.create(
+                    ReputationCreateRequest {
+                        sha256: entry.sha256.clone(),
+                        md5: entry.md5.clone(),
+                        verdict: entry.verdict,
+                        source: Some(entry.source.clone()),
+                        notes: Some(entry.notes.clone()),
+                    },
+                    "backup-restore",
+                )
+            };
+
+            match result {
+                Ok(_) => restored_reputation += 1,
+                Err(error) => {
+                    skipped_reputation += 1;
+                    warnings.push(format!(
+                        "reputation entry {} was skipped: {error}",
+                        entry.sha256
+                    ));
+                }
+            }
+        }
+    }
+
+    if request.restore_license {
+        if let Some(license_text) = request.backup.license_file_text.as_deref() {
+            let status = {
+                let config = state.config.lock().expect("web config mutex poisoned");
+                let fleet_nodes = fleet_node_snapshots(&state);
+                let client_identities = state
+                    .client_identities
+                    .lock()
+                    .expect("client identity mutex poisoned")
+                    .iter()
+                    .map(|(address, entry)| (address.clone(), entry.hostname.clone()))
+                    .collect();
+                let usage = build_license_usage(
+                    &config,
+                    &fleet_nodes,
+                    &state.reputation,
+                    &client_identities,
+                );
+                install_license_text(&config.license, license_text, usage)
+            };
+
+            match status {
+                Ok(_) => restored_license = true,
+                Err(error) => warnings.push(format!("license restore failed: {error}")),
+            }
+        } else {
+            warnings.push("backup does not contain a license file to restore".to_string());
+        }
+    }
+
+    if let Some(policy) = policy_for_push.clone() {
+        state.runtime.update_policy(policy);
+    }
+    if let Some(dns_policy) = dns_policy_for_push.clone() {
+        state.runtime.update_dns_policy(dns_policy);
+    }
+
+    let node_push_results = if restored_config || restored_policies || request.restore_reputation {
+        push_policy_bundle_to_nodes(
+            state.as_ref(),
+            policy_for_push,
+            dns_policy_for_push,
+            Some(state.reputation.known_bad_sha256s()),
+        )
+        .await
+    } else {
+        Vec::new()
+    };
+
+    Json(BackupRestoreResponse {
+        message: "backup restore completed",
+        restored_config,
+        restored_policies,
+        restored_reputation,
+        skipped_reputation,
+        restored_license,
+        restart_required: restored_config,
+        warnings,
+        node_push_results,
+    })
+    .into_response()
 }
 
 async fn api_node_report(
@@ -953,6 +1224,16 @@ async fn api_policy_self_test(headers: HeaderMap, State(state): State<Arc<WebSta
             .into_response();
     }
 
+    Json(PolicySelfTestResponse {
+        message: "policy self-test completed",
+        process_id: std::process::id(),
+        policy_runtime: state.runtime.policy_runtime_snapshot(),
+        results: run_policy_self_tests(state.as_ref()),
+    })
+    .into_response()
+}
+
+fn run_policy_self_tests(state: &WebState) -> Vec<PolicySelfTestResult> {
     let context = InspectionContext {
         route_name: "policy-self-test",
         interface: "local",
@@ -985,21 +1266,13 @@ async fn api_policy_self_test(headers: HeaderMap, State(state): State<Arc<WebSta
         ),
     ];
 
-    let results = tests
+    tests
         .into_iter()
         .map(|(name, payload)| {
             let outcome = state.runtime.inspect_chunk(&context, &payload);
             PolicySelfTestResult::from_outcome(name, outcome)
         })
-        .collect();
-
-    Json(PolicySelfTestResponse {
-        message: "policy self-test completed",
-        process_id: std::process::id(),
-        policy_runtime: state.runtime.policy_runtime_snapshot(),
-        results,
-    })
-    .into_response()
+        .collect()
 }
 
 async fn api_login(
@@ -1142,6 +1415,7 @@ fn build_status_response(state: &WebState) -> StatusResponse {
         process_id: std::process::id(),
         config_path: state.config_path.display().to_string(),
         node: NodeInfo::from_config(&config),
+        release_identity: ReleaseIdentity::from_config(&config, &state.config_path),
         license,
         security: ManagementSecurityStatus::from_config(&config),
         management_interface: config.management.interface.clone(),
@@ -1263,6 +1537,7 @@ fn build_diagnostics_response(state: &WebState) -> DiagnosticsResponse {
             .unwrap_or_else(|error| format!("unavailable: {error}")),
         config_path: state.config_path.display().to_string(),
         node: NodeInfo::from_config(&config),
+        release_identity: ReleaseIdentity::from_config(&config, &state.config_path),
         license,
         management_bind_addr: config.management.listen_addr().to_string(),
         proxy_listeners: config
@@ -1276,6 +1551,256 @@ fn build_diagnostics_response(state: &WebState) -> DiagnosticsResponse {
         status,
         command_outputs,
         proc_self_status: fs::read_to_string("/proc/self/status").ok(),
+    }
+}
+
+fn build_smoke_test_response(state: &WebState) -> SmokeTestResponse {
+    let config = state.config.lock().expect("web config mutex poisoned");
+    let status = state.runtime.snapshot();
+    let fleet_nodes = fleet_node_snapshots(state);
+    let client_identities =
+        resolve_client_identities(state, &config.management.directory, &status, &fleet_nodes);
+    let license =
+        build_license_status_for(&config, &fleet_nodes, &state.reputation, &client_identities);
+    let now = unix_timestamp_seconds();
+    let mut checks = Vec::new();
+
+    checks.push(smoke_check(
+        if license.valid { "pass" } else { "fail" },
+        "License entitlement",
+        license.message,
+        if license.valid {
+            "No action needed."
+        } else {
+            "Install a signed .axlic license from Settings."
+        },
+    ));
+
+    checks.push(smoke_check(
+        if config.management.tls.enabled {
+            "pass"
+        } else {
+            "warn"
+        },
+        "Management HTTPS",
+        if config.management.tls.enabled {
+            format!("HTTPS configured at {}", current_management_url(&config))
+        } else {
+            format!("HTTP mode active at {}", current_management_url(&config))
+        },
+        if config.management.tls.enabled {
+            "No action needed."
+        } else {
+            "Enable HTTPS before customer production rollout."
+        },
+    ));
+
+    let stale_nodes = fleet_nodes
+        .iter()
+        .filter(|node| now.saturating_sub(node.last_seen_unix_timestamp_seconds) > 45)
+        .count();
+    checks.push(smoke_check(
+        if fleet_nodes.is_empty() {
+            "warn"
+        } else if stale_nodes == 0 {
+            "pass"
+        } else {
+            "warn"
+        },
+        "Node heartbeat",
+        if fleet_nodes.is_empty() {
+            "No remote DNS or SMB nodes are currently reporting.".to_string()
+        } else {
+            format!(
+                "{} reporting nodes · {stale_nodes} stale",
+                fleet_nodes.len()
+            )
+        },
+        if fleet_nodes.is_empty() || stale_nodes > 0 {
+            "Open Nodes and verify enrollment, token, and service health."
+        } else {
+            "No action needed."
+        },
+    ));
+
+    let push_failures = fleet_nodes
+        .iter()
+        .filter(|node| {
+            node.last_control_push
+                .as_ref()
+                .is_some_and(|push| !push.accepted)
+        })
+        .count();
+    let missing_push = fleet_nodes
+        .iter()
+        .filter(|node| node.last_control_push.is_none())
+        .count();
+    checks.push(smoke_check(
+        if push_failures > 0 {
+            "fail"
+        } else if missing_push > 0 {
+            "warn"
+        } else {
+            "pass"
+        },
+        "Policy push acknowledgement",
+        if fleet_nodes.is_empty() {
+            "No remote nodes to push to yet.".to_string()
+        } else {
+            format!("{push_failures} failed pushes · {missing_push} nodes without a recorded push")
+        },
+        if push_failures > 0 || missing_push > 0 {
+            "Save SMB/DNS policies once and confirm every node acknowledges the update."
+        } else {
+            "No action needed."
+        },
+    ));
+
+    let smb_nodes = fleet_nodes
+        .iter()
+        .filter(|node| node.role == NodeRole::SmbProxy || node.role == NodeRole::StandaloneLab)
+        .count();
+    let local_smb_routes = config.proxy_listeners.len();
+    checks.push(smoke_check(
+        if smb_nodes > 0 || local_smb_routes > 0 {
+            "pass"
+        } else {
+            "warn"
+        },
+        "SMB protected path",
+        format!("{local_smb_routes} local SMB routes · {smb_nodes} remote SMB-capable nodes"),
+        if smb_nodes > 0 || local_smb_routes > 0 {
+            "Confirm clients use Axiom IPs and cannot bypass TCP/445 to file servers."
+        } else {
+            "Enroll an SMB node or configure a local SMB proxy route."
+        },
+    ));
+
+    let dns_nodes = fleet_nodes
+        .iter()
+        .filter(|node| node.role == NodeRole::Dns || node.role == NodeRole::StandaloneLab)
+        .count();
+    checks.push(smoke_check(
+        if config.dns.enabled || dns_nodes > 0 {
+            "pass"
+        } else {
+            "warn"
+        },
+        "DNS security path",
+        if config.dns.enabled {
+            format!(
+                "Local DNS enabled with {} upstreams",
+                config.dns.upstreams.len()
+            )
+        } else {
+            format!("{dns_nodes} remote DNS-capable nodes")
+        },
+        if config.dns.enabled || dns_nodes > 0 {
+            "Verify clients/DCs forward DNS to Axiom and upstream loops are avoided."
+        } else {
+            "Enroll a DNS node when this deployment includes DNS security."
+        },
+    ));
+
+    let policy_results = run_policy_self_tests(state);
+    let blocking_results = policy_results
+        .iter()
+        .filter(|result| result.outcome == "block")
+        .count();
+    let monitoring_results = policy_results
+        .iter()
+        .filter(|result| result.outcome == "monitor")
+        .count();
+    checks.push(smoke_check(
+        if blocking_results > 0 || monitoring_results > 0 {
+            "pass"
+        } else {
+            "fail"
+        },
+        "SMB policy engine",
+        format!("{blocking_results} blocking fixtures · {monitoring_results} monitored fixtures"),
+        if blocking_results > 0 || monitoring_results > 0 {
+            "No action needed."
+        } else {
+            "Set at least one SMB rule to monitor/block and rerun smoke tests."
+        },
+    ));
+
+    let known_bad_hashes = state.reputation.known_bad_sha256s().len();
+    checks.push(smoke_check(
+        if known_bad_hashes > 0 { "pass" } else { "warn" },
+        "Reputation feed",
+        format!("{known_bad_hashes} known_bad hashes available for SMB nodes"),
+        if known_bad_hashes > 0 {
+            "No action needed."
+        } else {
+            "Add a known_bad test hash in Reputation Center."
+        },
+    ));
+
+    let fail_count = checks.iter().filter(|check| check.status == "fail").count();
+    let warn_count = checks.iter().filter(|check| check.status == "warn").count();
+    let pass_count = checks.iter().filter(|check| check.status == "pass").count();
+
+    SmokeTestResponse {
+        message: if fail_count > 0 {
+            "smoke tests completed with blocking issues"
+        } else if warn_count > 0 {
+            "smoke tests completed with warnings"
+        } else {
+            "smoke tests passed"
+        },
+        generated_at_unix_timestamp_seconds: now,
+        pass_count,
+        warn_count,
+        fail_count,
+        checks,
+        policy_results,
+    }
+}
+
+fn smoke_check(
+    status: &'static str,
+    name: &'static str,
+    detail: String,
+    action: &'static str,
+) -> SmokeTestCheck {
+    SmokeTestCheck {
+        status,
+        name,
+        detail,
+        action,
+    }
+}
+
+fn build_backup_bundle(state: &WebState) -> AxiomBackupBundle {
+    let config = state.config.lock().expect("web config mutex poisoned");
+    let config_toml = toml::to_string_pretty(&*config).ok();
+    let fleet_nodes = fleet_node_snapshots(state);
+    let client_identities = state
+        .client_identities
+        .lock()
+        .expect("client identity mutex poisoned")
+        .iter()
+        .map(|(address, entry)| (address.clone(), entry.hostname.clone()))
+        .collect();
+    let license_status =
+        build_license_status_for(&config, &fleet_nodes, &state.reputation, &client_identities);
+    let license_file_text = fs::read_to_string(&config.license.license_path).ok();
+    let reputation = state.reputation.list();
+
+    AxiomBackupBundle {
+        format: "axiom_backup_v1".to_string(),
+        product: "Axiom".to_string(),
+        generated_at_unix_timestamp_seconds: unix_timestamp_seconds(),
+        release_identity: ReleaseIdentity::from_config(&config, &state.config_path),
+        node: NodeInfo::from_config(&config),
+        config_toml,
+        policy: Some(config.policy.clone()),
+        dns_policy: Some(config.dns.policy.clone()),
+        reputation_entries: reputation.entries,
+        license_status,
+        license_file_text,
     }
 }
 
@@ -1475,6 +2000,24 @@ fn token_preview(token: Option<&str>) -> String {
         return token.to_string();
     }
     format!("{}...{}", &token[..6], &token[token.len() - 6..])
+}
+
+fn safe_filename_part(value: &str) -> String {
+    let mut output = String::new();
+    for character in value.chars().flat_map(char::to_lowercase) {
+        if character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-') {
+            output.push(character);
+        } else if !output.ends_with('-') {
+            output.push('-');
+        }
+    }
+
+    let output = output.trim_matches('-').to_string();
+    if output.is_empty() {
+        "axiom".to_string()
+    } else {
+        output.chars().take(48).collect()
+    }
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -2108,6 +2651,7 @@ struct StatusResponse {
     process_id: u32,
     config_path: String,
     node: NodeInfo,
+    release_identity: ReleaseIdentity,
     license: LicenseStatus,
     security: ManagementSecurityStatus,
     management_interface: String,
@@ -2127,6 +2671,7 @@ struct DiagnosticsResponse {
     executable_path: String,
     config_path: String,
     node: NodeInfo,
+    release_identity: ReleaseIdentity,
     license: LicenseStatus,
     management_bind_addr: String,
     proxy_listeners: Vec<ProxyListenerStatus>,
@@ -2138,13 +2683,26 @@ struct DiagnosticsResponse {
     proc_self_status: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct NodeInfo {
     node_id: String,
     display_name: String,
     role: NodeRole,
     management_url: Option<String>,
     heartbeat_interval_seconds: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ReleaseIdentity {
+    product: String,
+    version: String,
+    commit: String,
+    build_time: String,
+    build_profile: String,
+    rust_target: String,
+    binary_modified_unix_timestamp_seconds: Option<u64>,
+    config_modified_unix_timestamp_seconds: Option<u64>,
+    management_url: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -2206,6 +2764,46 @@ impl NodeInfo {
             heartbeat_interval_seconds: config.node.heartbeat_interval_seconds,
         }
     }
+}
+
+impl ReleaseIdentity {
+    fn from_config(config: &AxiomConfig, config_path: &Path) -> Self {
+        Self {
+            product: "Axiom".to_string(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            commit: option_env!("AXIOM_BUILD_COMMIT")
+                .or(option_env!("GIT_COMMIT"))
+                .or(option_env!("VERGEN_GIT_SHA"))
+                .unwrap_or("unknown")
+                .to_string(),
+            build_time: option_env!("AXIOM_BUILD_TIME")
+                .or(option_env!("VERGEN_BUILD_TIMESTAMP"))
+                .unwrap_or("local-build")
+                .to_string(),
+            build_profile: (if cfg!(debug_assertions) {
+                "debug"
+            } else {
+                "release"
+            })
+            .to_string(),
+            rust_target: std::env::consts::ARCH.to_string(),
+            binary_modified_unix_timestamp_seconds: std::env::current_exe()
+                .ok()
+                .and_then(|path| file_modified_unix_timestamp_seconds(&path)),
+            config_modified_unix_timestamp_seconds: file_modified_unix_timestamp_seconds(
+                config_path,
+            ),
+            management_url: current_management_url(config),
+        }
+    }
+}
+
+fn file_modified_unix_timestamp_seconds(path: &Path) -> Option<u64> {
+    fs::metadata(path)
+        .ok()
+        .and_then(|metadata| metadata.modified().ok())
+        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_secs())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2490,6 +3088,25 @@ struct PolicySelfTestResponse {
 }
 
 #[derive(Debug, Serialize)]
+struct SmokeTestResponse {
+    message: &'static str,
+    generated_at_unix_timestamp_seconds: u64,
+    pass_count: usize,
+    warn_count: usize,
+    fail_count: usize,
+    checks: Vec<SmokeTestCheck>,
+    policy_results: Vec<PolicySelfTestResult>,
+}
+
+#[derive(Debug, Serialize)]
+struct SmokeTestCheck {
+    status: &'static str,
+    name: &'static str,
+    detail: String,
+    action: &'static str,
+}
+
+#[derive(Debug, Serialize)]
 struct PolicySelfTestResult {
     name: &'static str,
     outcome: &'static str,
@@ -2520,6 +3137,51 @@ impl PolicySelfTestResult {
             },
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AxiomBackupBundle {
+    format: String,
+    product: String,
+    generated_at_unix_timestamp_seconds: u64,
+    release_identity: ReleaseIdentity,
+    node: NodeInfo,
+    config_toml: Option<String>,
+    policy: Option<PolicyConfig>,
+    dns_policy: Option<DnsPolicyConfig>,
+    reputation_entries: Vec<ReputationEntry>,
+    license_status: LicenseStatus,
+    license_file_text: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BackupRestoreRequest {
+    backup: AxiomBackupBundle,
+    #[serde(default)]
+    restore_config: bool,
+    #[serde(default = "default_true")]
+    restore_policies: bool,
+    #[serde(default = "default_true")]
+    restore_reputation: bool,
+    #[serde(default)]
+    restore_license: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Debug, Serialize)]
+struct BackupRestoreResponse {
+    message: &'static str,
+    restored_config: bool,
+    restored_policies: bool,
+    restored_reputation: usize,
+    skipped_reputation: usize,
+    restored_license: bool,
+    restart_required: bool,
+    warnings: Vec<String>,
+    node_push_results: Vec<NodePushResult>,
 }
 
 #[derive(Debug, Serialize)]
@@ -3363,6 +4025,21 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
         </article>
       </div>
 
+      <section class="mt-8 rounded-lg border border-zinc-800 bg-zinc-900">
+        <div class="flex flex-col gap-4 border-b border-zinc-800 px-6 py-5 lg:flex-row lg:items-center lg:justify-between">
+          <div>
+            <p class="text-sm font-semibold uppercase tracking-wider text-emerald-300">First Run</p>
+            <h2 class="mt-2 text-xl font-semibold text-white">Deployment Wizard</h2>
+            <p id="first-run-summary" class="mt-1 text-sm text-zinc-400">Checking deployment readiness</p>
+          </div>
+          <div class="flex flex-wrap items-center gap-3">
+            <span id="first-run-progress" class="rounded-full border border-zinc-700 bg-zinc-950 px-3 py-1.5 text-sm font-semibold text-zinc-200">0/0 complete</span>
+            <button id="first-run-smoke-test" class="rounded-md border border-emerald-400/40 px-3 py-2 text-sm font-semibold text-emerald-100 transition hover:border-emerald-300 hover:bg-emerald-400/10">Run smoke tests</button>
+          </div>
+        </div>
+        <div id="first-run-steps" class="grid gap-3 p-6 md:grid-cols-2 xl:grid-cols-3"></div>
+      </section>
+
       <section class="mt-8 rounded-lg border border-emerald-500/20 bg-emerald-500/5 px-6 py-5">
         <div class="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
           <div>
@@ -3447,6 +4124,63 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
       </section>
 
       <section class="mt-8 rounded-lg border border-zinc-800 bg-zinc-900">
+        <div class="flex flex-col gap-4 border-b border-zinc-800 px-6 py-5 lg:flex-row lg:items-center lg:justify-between">
+          <div>
+            <p class="text-sm font-semibold uppercase tracking-wider text-sky-300">Release Identity</p>
+            <h2 class="mt-2 text-xl font-semibold text-white">Installed build</h2>
+            <p id="release-summary" class="mt-1 text-sm text-zinc-400">Waiting for build metadata</p>
+          </div>
+          <span id="release-build-badge" class="w-fit rounded-full border border-zinc-700 bg-zinc-950 px-3 py-1.5 text-xs font-semibold uppercase text-zinc-300">unknown</span>
+        </div>
+        <div class="grid gap-4 p-6 md:grid-cols-2 xl:grid-cols-4">
+          <article class="rounded-lg border border-zinc-800 bg-zinc-950/60 p-4">
+            <p class="text-xs font-semibold uppercase tracking-wider text-zinc-500">Version</p>
+            <p id="release-version" class="mt-2 text-lg font-semibold text-white">—</p>
+          </article>
+          <article class="rounded-lg border border-zinc-800 bg-zinc-950/60 p-4">
+            <p class="text-xs font-semibold uppercase tracking-wider text-zinc-500">Commit</p>
+            <p id="release-commit" class="mt-2 break-all text-sm font-semibold text-emerald-200">—</p>
+          </article>
+          <article class="rounded-lg border border-zinc-800 bg-zinc-950/60 p-4">
+            <p class="text-xs font-semibold uppercase tracking-wider text-zinc-500">Binary</p>
+            <p id="release-binary-time" class="mt-2 text-sm font-semibold text-zinc-200">—</p>
+          </article>
+          <article class="rounded-lg border border-zinc-800 bg-zinc-950/60 p-4">
+            <p class="text-xs font-semibold uppercase tracking-wider text-zinc-500">Config</p>
+            <p id="release-config-time" class="mt-2 text-sm font-semibold text-zinc-200">—</p>
+          </article>
+        </div>
+      </section>
+
+      <section class="mt-8 rounded-lg border border-zinc-800 bg-zinc-900">
+        <div class="flex flex-col gap-4 border-b border-zinc-800 px-6 py-5 lg:flex-row lg:items-center lg:justify-between">
+          <div>
+            <p class="text-sm font-semibold uppercase tracking-wider text-emerald-300">Built-in Smoke Tests</p>
+            <h2 class="mt-2 text-xl font-semibold text-white">Operational validation</h2>
+            <p id="smoke-test-state" class="mt-1 text-sm text-zinc-400">Run tests after install, policy changes, or node onboarding.</p>
+          </div>
+          <button id="run-smoke-tests" class="rounded-md bg-emerald-400 px-4 py-2 text-sm font-semibold text-zinc-950 transition hover:bg-emerald-300">Run smoke tests</button>
+        </div>
+        <div class="grid gap-6 p-6 lg:grid-cols-[0.85fr_1.15fr]">
+          <div class="rounded-lg border border-zinc-800 bg-zinc-950/60 p-5">
+            <p class="text-xs font-semibold uppercase tracking-wider text-zinc-500">Latest result</p>
+            <p id="smoke-test-summary" class="mt-3 text-3xl font-semibold text-white">Not run</p>
+            <p id="smoke-test-detail" class="mt-2 text-sm text-zinc-400">Tests are executed locally on the management server and use live runtime state.</p>
+          </div>
+          <div id="smoke-test-results" class="grid gap-3"></div>
+        </div>
+      </section>
+
+      <section class="mt-8 rounded-lg border border-zinc-800 bg-zinc-900">
+        <div class="border-b border-zinc-800 px-6 py-5">
+          <p class="text-sm font-semibold uppercase tracking-wider text-amber-300">Policy Confidence</p>
+          <h2 class="mt-2 text-xl font-semibold text-white">What is actually enforced</h2>
+          <p class="mt-1 text-sm text-zinc-400">A live confidence view based on active generations, node acknowledgements, reputation feed size, and recent telemetry.</p>
+        </div>
+        <div id="policy-confidence-list" class="grid gap-4 p-6 md:grid-cols-2 xl:grid-cols-4"></div>
+      </section>
+
+      <section class="mt-8 rounded-lg border border-zinc-800 bg-zinc-900">
         <div class="flex flex-col gap-4 border-b border-zinc-800 px-6 py-5 lg:flex-row lg:items-end lg:justify-between">
           <div>
             <p class="text-sm font-semibold uppercase tracking-wider text-emerald-300">Production Gate</p>
@@ -3490,6 +4224,40 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
       <section class="mt-8 rounded-lg border border-zinc-800 bg-zinc-900">
         <div class="flex flex-col gap-4 border-b border-zinc-800 px-6 py-5 lg:flex-row lg:items-center lg:justify-between">
           <div>
+            <p class="text-sm font-semibold uppercase tracking-wider text-purple-300">Backup / Restore</p>
+            <h2 class="mt-2 text-xl font-semibold text-white">Configuration safety net</h2>
+            <p id="backup-state" class="mt-1 text-sm text-zinc-400">Export a full operational snapshot before major changes.</p>
+          </div>
+          <button id="export-backup" class="rounded-md bg-emerald-400 px-4 py-2 text-sm font-semibold text-zinc-950 transition hover:bg-emerald-300">Export backup</button>
+        </div>
+        <div class="grid gap-6 p-6 lg:grid-cols-[0.9fr_1.1fr]">
+          <div class="rounded-lg border border-zinc-800 bg-zinc-950/60 p-5">
+            <h3 class="text-sm font-semibold uppercase tracking-wider text-zinc-400">Backup contents</h3>
+            <ul class="mt-4 grid gap-2 text-sm text-zinc-300">
+              <li>Management config TOML and listener mappings</li>
+              <li>SMB policy, DNS policy, and reputation database entries</li>
+              <li>Installed license package when available</li>
+              <li>Release identity and node identity for audit traceability</li>
+            </ul>
+            <p class="mt-4 text-xs text-zinc-500">Restore validates TOML and pushes policy/reputation changes to reporting nodes.</p>
+          </div>
+          <div class="rounded-lg border border-zinc-800 bg-zinc-950/60 p-5">
+            <h3 class="text-sm font-semibold uppercase tracking-wider text-zinc-400">Restore options</h3>
+            <input id="restore-backup-file" type="file" accept="application/json,.json" class="mt-4 w-full rounded-md border border-zinc-700 bg-zinc-950 px-3 py-2 text-sm text-zinc-200" />
+            <div class="mt-4 grid gap-3 text-sm text-zinc-300 md:grid-cols-2">
+              <label class="flex items-center gap-2"><input id="restore-backup-config" type="checkbox" class="h-4 w-4 rounded border-zinc-600 bg-zinc-950" />Full config</label>
+              <label class="flex items-center gap-2"><input id="restore-backup-policies" type="checkbox" checked class="h-4 w-4 rounded border-zinc-600 bg-zinc-950" />Policies</label>
+              <label class="flex items-center gap-2"><input id="restore-backup-reputation" type="checkbox" checked class="h-4 w-4 rounded border-zinc-600 bg-zinc-950" />Reputation</label>
+              <label class="flex items-center gap-2"><input id="restore-backup-license" type="checkbox" class="h-4 w-4 rounded border-zinc-600 bg-zinc-950" />License</label>
+            </div>
+            <button id="restore-backup" class="mt-4 rounded-md border border-purple-400/40 px-4 py-2 text-sm font-semibold text-purple-100 transition hover:border-purple-300 hover:bg-purple-400/10">Restore backup</button>
+          </div>
+        </div>
+      </section>
+
+      <section class="mt-8 rounded-lg border border-zinc-800 bg-zinc-900">
+        <div class="flex flex-col gap-4 border-b border-zinc-800 px-6 py-5 lg:flex-row lg:items-center lg:justify-between">
+          <div>
             <p class="text-sm font-semibold uppercase tracking-wider text-sky-300">Support Bundle</p>
             <h2 class="mt-2 text-xl font-semibold text-white">Export Diagnostics</h2>
             <p id="diagnostics-state" class="mt-1 text-sm text-zinc-400">Diagnostics not loaded</p>
@@ -3517,7 +4285,42 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
     </section>
 
     <section id="view-nodes" class="dashboard-view">
-      <section class="rounded-lg border border-zinc-800 bg-zinc-900">
+      <section class="mt-8 rounded-lg border border-zinc-800 bg-zinc-900">
+        <div class="flex flex-col gap-2 border-b border-zinc-800 px-6 py-5 md:flex-row md:items-end md:justify-between">
+          <div>
+            <p class="text-sm font-semibold uppercase tracking-wider text-emerald-300">Node Onboarding</p>
+            <h2 class="mt-2 text-xl font-semibold text-white">Add DNS or SMB nodes</h2>
+            <p id="node-onboarding-state" class="mt-1 text-sm text-zinc-400">Loading enrollment context</p>
+          </div>
+          <button id="refresh-onboarding-token" class="rounded-md border border-zinc-700 px-4 py-2 text-sm text-zinc-200 transition hover:border-emerald-300 hover:text-emerald-200">Refresh token</button>
+        </div>
+        <div class="grid gap-5 p-6 lg:grid-cols-2">
+          <article class="rounded-lg border border-zinc-800 bg-zinc-950/50 p-5">
+            <div class="flex items-start justify-between gap-4">
+              <div>
+                <h3 class="text-lg font-semibold text-white">SMB proxy node</h3>
+                <p class="mt-1 text-sm text-zinc-400">Use this for a server that protects SMB traffic and forwards to file servers.</p>
+              </div>
+              <span class="rounded-full border border-emerald-400/40 bg-emerald-500/10 px-2.5 py-1 text-xs font-semibold text-emerald-100">TCP 445</span>
+            </div>
+            <pre id="onboarding-smb-command" class="mt-4 max-h-64 overflow-auto whitespace-pre-wrap rounded-md border border-zinc-800 bg-zinc-950 px-4 py-3 text-xs leading-5 text-zinc-300"></pre>
+            <button id="copy-smb-onboarding" class="mt-4 rounded-md border border-emerald-400/40 px-3 py-2 text-sm font-semibold text-emerald-100 transition hover:border-emerald-300 hover:bg-emerald-400/10">Copy SMB instructions</button>
+          </article>
+          <article class="rounded-lg border border-zinc-800 bg-zinc-950/50 p-5">
+            <div class="flex items-start justify-between gap-4">
+              <div>
+                <h3 class="text-lg font-semibold text-white">DNS security node</h3>
+                <p class="mt-1 text-sm text-zinc-400">Use this for a resolver that filters DNS and forwards to upstream resolvers.</p>
+              </div>
+              <span class="rounded-full border border-sky-400/40 bg-sky-500/10 px-2.5 py-1 text-xs font-semibold text-sky-100">UDP/TCP 53</span>
+            </div>
+            <pre id="onboarding-dns-command" class="mt-4 max-h-64 overflow-auto whitespace-pre-wrap rounded-md border border-zinc-800 bg-zinc-950 px-4 py-3 text-xs leading-5 text-zinc-300"></pre>
+            <button id="copy-dns-onboarding" class="mt-4 rounded-md border border-sky-400/40 px-3 py-2 text-sm font-semibold text-sky-100 transition hover:border-sky-300 hover:bg-sky-400/10">Copy DNS instructions</button>
+          </article>
+        </div>
+      </section>
+
+      <section class="mt-8 rounded-lg border border-zinc-800 bg-zinc-900">
         <div class="flex flex-col gap-2 border-b border-zinc-800 px-6 py-5 md:flex-row md:items-end md:justify-between">
           <div>
             <h2 class="text-xl font-semibold text-white">Axiom Nodes</h2>
@@ -4086,6 +4889,8 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
     let reputationEntries = [];
     let latestLicenseStatus = null;
     let latestDiagnosticsBundle = null;
+    let latestSmokeTest = null;
+    let enrollmentContext = { token: "", managementUrl: "" };
 
     function authHeaders(extra = {}) {
       return token ? { ...extra, Authorization: `Bearer ${token}` } : extra;
@@ -4481,6 +5286,321 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
         : `<div class="rounded-lg border border-emerald-400/30 bg-emerald-500/10 p-4 text-sm text-emerald-100">All readiness checks passed. Keep the smoke-test evidence and proceed to packaging/customer documentation.</div>`;
     }
 
+    function renderFirstRunWizard(data, stats, fleetNodes, dns) {
+      const readiness = collectReadinessChecks(data, stats, fleetNodes, dns);
+      const byTitle = (title) => readiness.find((check) => check.title === title);
+      const smokeStatus = latestSmokeTest
+        ? (latestSmokeTest.fail_count ? "fail" : latestSmokeTest.warn_count ? "warn" : "pass")
+        : "warn";
+      const smokeDetail = latestSmokeTest
+        ? `${latestSmokeTest.pass_count || 0} passed · ${latestSmokeTest.warn_count || 0} warnings · ${latestSmokeTest.fail_count || 0} failed`
+        : "Smoke tests have not been run in this browser session.";
+
+      const steps = [
+        byTitle("License entitlement"),
+        byTitle("Management portal HTTPS"),
+        byTitle("Node enrollment and heartbeat"),
+        byTitle("Policy push acknowledgement"),
+        byTitle("SMB protection path"),
+        byTitle("DNS security path"),
+        byTitle("Reputation feed on SMB nodes"),
+        readinessCheck(smokeStatus, "Built-in smoke tests", smokeDetail, latestSmokeTest ? "Review Support > Built-in Smoke Tests for evidence." : "Run smoke tests from this wizard or Support.")
+      ].filter(Boolean);
+
+      const passCount = steps.filter((step) => step.status === "pass").length;
+      const failCount = steps.filter((step) => step.status === "fail").length;
+      const warnCount = steps.filter((step) => step.status === "warn").length;
+      const summary = failCount
+        ? "Deployment needs attention before production."
+        : warnCount
+          ? "Deployment is usable, with items to review."
+          : "Deployment is ready for controlled production validation.";
+
+      document.getElementById("first-run-summary").textContent = summary;
+      document.getElementById("first-run-progress").textContent = `${passCount}/${steps.length} complete`;
+      document.getElementById("first-run-steps").innerHTML = steps.map((step, index) => {
+        const tone = readinessTone(step.status);
+        return `
+          <article class="rounded-lg border ${tone.row} p-4">
+            <div class="flex items-start justify-between gap-3">
+              <div>
+                <p class="text-xs font-semibold uppercase tracking-wider ${tone.text}">Step ${index + 1}</p>
+                <p class="mt-2 text-sm font-semibold text-white">${html(step.title)}</p>
+              </div>
+              <span class="rounded-full border px-2.5 py-1 text-xs font-semibold uppercase ${tone.badge}">${tone.label}</span>
+            </div>
+            <p class="mt-3 text-sm text-zinc-400">${html(step.detail)}</p>
+            <p class="mt-2 text-xs ${tone.text}">${html(step.action)}</p>
+          </article>
+        `;
+      }).join("");
+    }
+
+    function renderReleaseIdentity(identity, node) {
+      const profile = identity?.build_profile || "unknown";
+      const version = identity?.version || "unknown";
+      const commit = identity?.commit || "unknown";
+      const buildTime = identity?.build_time || "local-build";
+      const target = identity?.rust_target || "unknown-target";
+      document.getElementById("release-summary").textContent =
+        `${text(identity?.product || "Axiom")} management build on ${text(node?.display_name || node?.node_id)} · ${text(identity?.management_url)}`;
+      document.getElementById("release-version").textContent = version;
+      document.getElementById("release-commit").textContent = commit === "unknown" ? "unknown" : commit.slice(0, 12);
+      document.getElementById("release-binary-time").textContent =
+        `${formatTime(identity?.binary_modified_unix_timestamp_seconds)} · ${target}`;
+      document.getElementById("release-config-time").textContent =
+        formatTime(identity?.config_modified_unix_timestamp_seconds);
+      const badge = document.getElementById("release-build-badge");
+      badge.textContent = `${profile} · ${buildTime}`;
+      badge.className = `w-fit rounded-full border px-3 py-1.5 text-xs font-semibold uppercase ${profile === "release" ? "border-emerald-400/40 bg-emerald-500/10 text-emerald-100" : "border-amber-400/40 bg-amber-500/10 text-amber-100"}`;
+    }
+
+    function confidenceCard(title, status, detail, value) {
+      const tone = readinessTone(status);
+      return `
+        <article class="rounded-lg border ${tone.row} p-5">
+          <div class="flex items-start justify-between gap-3">
+            <p class="text-sm font-semibold text-white">${html(title)}</p>
+            <span class="rounded-full border px-2.5 py-1 text-xs font-semibold uppercase ${tone.badge}">${tone.label}</span>
+          </div>
+          <p class="mt-4 text-3xl font-semibold ${tone.text}">${html(value)}</p>
+          <p class="mt-2 text-sm text-zinc-400">${html(detail)}</p>
+        </article>
+      `;
+    }
+
+    function renderPolicyConfidence(data, stats, fleetNodes, dns) {
+      const pushFailures = fleetNodes.filter((node) => node.last_control_push && !node.last_control_push.accepted).length;
+      const pushedNodes = fleetNodes.filter((node) => node.last_control_push && node.last_control_push.accepted).length;
+      const smbRuntime = stats.policy_runtime || {};
+      const dnsRuntime = stats.dns_policy_runtime || {};
+      const smbBlocking = (smbRuntime.blocking_rules || []).length;
+      const dnsEnabled = Boolean(dns?.enabled) || fleetNodes.some((node) => node.role === "dns");
+      const knownBadLoaded = Number(stats.known_bad_reputation_hashes_loaded || 0);
+      const wireBytes = Number(stats.stream_bytes_client_to_server || 0) + Number(stats.stream_bytes_server_to_client || 0);
+
+      document.getElementById("policy-confidence-list").innerHTML = [
+        confidenceCard(
+          "SMB policy runtime",
+          smbRuntime.generation ? (smbBlocking > 0 ? "pass" : "warn") : "fail",
+          `${smbBlocking} blocking rules · ${(smbRuntime.monitoring_rules || []).length} monitor rules`,
+          smbRuntime.generation ? `Gen ${smbRuntime.generation}` : "No gen"
+        ),
+        confidenceCard(
+          "DNS policy runtime",
+          dnsEnabled ? "pass" : "warn",
+          dnsEnabled ? `${stats.dns_blocked_queries || 0} blocked DNS queries · ${(dns.upstreams || []).length} upstreams` : "DNS can stay disabled for SMB-only deployments.",
+          dnsRuntime.generation ? `Gen ${dnsRuntime.generation}` : (dnsEnabled ? "Active" : "Off")
+        ),
+        confidenceCard(
+          "Node push acknowledgements",
+          pushFailures ? "fail" : fleetNodes.length && pushedNodes === fleetNodes.length ? "pass" : "warn",
+          fleetNodes.length ? `${pushedNodes}/${fleetNodes.length} nodes acknowledged latest push` : "No remote nodes are reporting yet.",
+          pushFailures ? `${pushFailures} failed` : `${pushedNodes}/${fleetNodes.length || 0}`
+        ),
+        confidenceCard(
+          "Runtime evidence",
+          wireBytes > 0 || knownBadLoaded > 0 ? "pass" : "warn",
+          `${formatBytes(wireBytes)} wire traffic · ${knownBadLoaded} known-bad hashes loaded`,
+          wireBytes > 0 ? formatBytes(wireBytes) : `${knownBadLoaded} hashes`
+        )
+      ].join("");
+    }
+
+    function renderSmokeTests(payload) {
+      latestSmokeTest = payload;
+      const status = payload.fail_count ? "fail" : payload.warn_count ? "warn" : "pass";
+      const tone = readinessTone(status);
+      document.getElementById("smoke-test-state").textContent =
+        `${payload.message || "Smoke tests completed"} · ${formatTime(payload.generated_at_unix_timestamp_seconds)}`;
+      document.getElementById("smoke-test-summary").textContent =
+        `${payload.pass_count || 0}/${(payload.checks || []).length} passed`;
+      document.getElementById("smoke-test-summary").className = `mt-3 text-3xl font-semibold ${tone.text}`;
+      document.getElementById("smoke-test-detail").textContent =
+        `${payload.warn_count || 0} warnings · ${payload.fail_count || 0} failures · ${(payload.policy_results || []).length} SMB policy fixtures`;
+      document.getElementById("smoke-test-results").innerHTML = (payload.checks || []).map((check) => {
+        const checkTone = readinessTone(check.status);
+        return `
+          <article class="rounded-lg border ${checkTone.row} p-4">
+            <div class="flex items-start justify-between gap-3">
+              <div>
+                <p class="text-sm font-semibold text-white">${html(check.name)}</p>
+                <p class="mt-1 text-sm text-zinc-400">${html(check.detail)}</p>
+              </div>
+              <span class="rounded-full border px-2.5 py-1 text-xs font-semibold uppercase ${checkTone.badge}">${checkTone.label}</span>
+            </div>
+            <p class="mt-3 text-xs ${checkTone.text}">${html(check.action)}</p>
+          </article>
+        `;
+      }).join("");
+    }
+
+    async function runSmokeTests() {
+      const buttons = ["first-run-smoke-test", "run-smoke-tests"].map((id) => document.getElementById(id)).filter(Boolean);
+      buttons.forEach((button) => setButtonBusy(button, true, "Running"));
+      document.getElementById("smoke-test-state").textContent = "Running smoke tests";
+      try {
+        const response = await fetch("/api/smoke-tests", {
+          method: "POST",
+          headers: authHeaders()
+        });
+        const payload = await response.json().catch(() => ({ message: "smoke tests failed" }));
+        if (!response.ok) {
+          document.getElementById("smoke-test-state").textContent = payload.message || "Smoke tests failed";
+          showToast("Smoke tests failed", payload.message || "Smoke test request failed.", "error");
+          return;
+        }
+
+        renderSmokeTests(payload);
+        showToast(
+          payload.fail_count ? "Smoke tests found issues" : "Smoke tests completed",
+          `${payload.pass_count || 0} passed · ${payload.warn_count || 0} warnings · ${payload.fail_count || 0} failures`,
+          payload.fail_count ? "warning" : "success"
+        );
+        await refresh();
+      } catch (error) {
+        const message = `Smoke tests failed: ${error.message || error}`;
+        document.getElementById("smoke-test-state").textContent = message;
+        showToast("Smoke tests failed", message, "error");
+      } finally {
+        buttons.forEach((button) => setButtonBusy(button, false));
+      }
+    }
+
+    function renderOnboardingCommands() {
+      const tokenText = enrollmentContext.token || "<paste enrollment token>";
+      const managementUrl = enrollmentContext.managementUrl || "<management URL>";
+      const tokenState = enrollmentContext.token
+        ? `Token ready · management ${managementUrl}`
+        : "No enrollment token is configured yet. Create or rotate one under Settings.";
+      document.getElementById("node-onboarding-state").textContent = tokenState;
+
+      const common = `# Fresh Ubuntu/Debian node
+sudo apt-get update
+sudo apt-get install -y git curl
+git clone https://github.com/taltol15/Axiom.git
+cd Axiom
+sudo ./install.sh`;
+
+      document.getElementById("onboarding-smb-command").textContent = `${common}
+
+Installer choices:
+Role: smb_proxy
+Management server: ${managementUrl}
+Enrollment token: ${tokenText}
+
+Network requirements:
+Clients -> SMB node: TCP 445
+Management -> SMB node: TCP 9443
+SMB node -> file server: TCP 445`;
+
+      document.getElementById("onboarding-dns-command").textContent = `${common}
+
+Installer choices:
+Role: dns
+Management server: ${managementUrl}
+Enrollment token: ${tokenText}
+
+Network requirements:
+Clients/DC -> DNS node: UDP/TCP 53
+Management -> DNS node: TCP 9443
+DNS node -> upstream resolvers: UDP/TCP 53`;
+    }
+
+    async function copyOnboardingInstructions(kind) {
+      const element = document.getElementById(kind === "dns" ? "onboarding-dns-command" : "onboarding-smb-command");
+      const label = kind === "dns" ? "DNS node" : "SMB node";
+      try {
+        await navigator.clipboard.writeText(element.textContent || "");
+        showToast(`${label} onboarding copied`, "Paste these instructions on the fresh node.", "success");
+      } catch (_) {
+        showToast(`${label} onboarding ready`, "Copy the command block manually.", "warning");
+      }
+    }
+
+    async function exportBackup() {
+      const button = document.getElementById("export-backup");
+      setButtonBusy(button, true, "Exporting");
+      document.getElementById("backup-state").textContent = "Exporting backup bundle";
+      try {
+        const response = await fetch("/api/backup/export", { headers: authHeaders() });
+        if (!response.ok) {
+          const payload = await response.json().catch(() => ({ message: "backup export failed" }));
+          document.getElementById("backup-state").textContent = payload.message || "Backup export failed";
+          showToast("Backup export failed", payload.message || "Backup export failed.", "error");
+          return;
+        }
+
+        const disposition = response.headers.get("content-disposition") || "";
+        const filenameMatch = disposition.match(/filename="?([^";]+)"?/i);
+        const filename = filenameMatch ? filenameMatch[1] : `axiom-backup-${new Date().toISOString().replace(/[:.]/g, "-")}.json`;
+        const contents = await response.text();
+        downloadTextFile(filename, contents, "application/json");
+        document.getElementById("backup-state").textContent = `Backup exported · ${new Date().toLocaleTimeString()}`;
+        showToast("Backup exported", filename, "success");
+      } catch (error) {
+        const message = `Backup export failed: ${error.message || error}`;
+        document.getElementById("backup-state").textContent = message;
+        showToast("Backup export failed", message, "error");
+      } finally {
+        setButtonBusy(button, false);
+      }
+    }
+
+    async function restoreBackup() {
+      const input = document.getElementById("restore-backup-file");
+      const file = input.files && input.files[0];
+      if (!file) {
+        document.getElementById("backup-state").textContent = "Choose an Axiom backup JSON file first";
+        return;
+      }
+
+      const button = document.getElementById("restore-backup");
+      setButtonBusy(button, true, "Restoring");
+      beginPushProgress("Restoring backup", lastFleetNodes);
+      document.getElementById("backup-state").textContent = `Reading ${file.name}`;
+      try {
+        const backup = JSON.parse(await file.text());
+        setPushProgress(35, "Sending backup restore request");
+        const response = await fetch("/api/backup/restore", {
+          method: "POST",
+          headers: authHeaders({ "Content-Type": "application/json" }),
+          body: JSON.stringify({
+            backup,
+            restore_config: document.getElementById("restore-backup-config").checked,
+            restore_policies: document.getElementById("restore-backup-policies").checked,
+            restore_reputation: document.getElementById("restore-backup-reputation").checked,
+            restore_license: document.getElementById("restore-backup-license").checked
+          })
+        });
+        const payload = await response.json().catch(() => ({ message: "backup restore failed" }));
+        if (!response.ok) {
+          document.getElementById("backup-state").textContent = payload.message || "Backup restore failed";
+          failPushProgress(payload.message || "Backup restore failed");
+          return;
+        }
+
+        const warnings = (payload.warnings || []).length ? ` · ${payload.warnings.length} warnings` : "";
+        document.getElementById("backup-state").textContent =
+          `Restore completed · ${payload.restored_reputation || 0} reputation entries${warnings}`;
+        completePushProgress(payload.node_push_results, "Backup restored locally");
+        if (payload.restart_required) {
+          showToast("Restart required", "Full config restore changed local settings. Restart Axiom when ready.", "warning");
+        }
+        await loadPolicies();
+        await loadDnsPolicy();
+        await loadReputationCenter();
+        await refresh();
+      } catch (error) {
+        const message = `Backup restore failed: ${error.message || error}`;
+        document.getElementById("backup-state").textContent = message;
+        failPushProgress(message);
+      } finally {
+        setButtonBusy(button, false);
+        input.value = "";
+      }
+    }
+
     function renderList(containerId, rows, emptyText) {
       const container = document.getElementById(containerId);
       if (!rows.length) {
@@ -4778,6 +5898,9 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
       document.getElementById("dns-upstreams").textContent = dns.enabled ? (dns.upstreams || []).join(", ") : "—";
       document.getElementById("dns-policy").textContent = dns.enabled ? `block response: ${dns.block_response}` : "—";
       renderReleaseReadiness(data, stats, fleetNodes, dns);
+      renderFirstRunWizard(data, stats, fleetNodes, dns);
+      renderReleaseIdentity(data.release_identity || {}, data.node || {});
+      renderPolicyConfidence(data, stats, fleetNodes, dns);
       renderDnsSummary(dns, dnsEvents, stats);
 
       const dnsEventsBody = document.getElementById("dns-events-body");
@@ -5271,6 +6394,11 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
       document.getElementById("enrollment-token-preview").textContent = payload.token_preview || "not configured";
       document.getElementById("enrollment-token-state").textContent =
         `${payload.reporting_nodes || 0} reporting nodes · management ${payload.management_url}`;
+      enrollmentContext = {
+        token: payload.token || "",
+        managementUrl: payload.management_url || ""
+      };
+      renderOnboardingCommands();
     }
 
     async function copyEnrollmentToken() {
@@ -5309,6 +6437,11 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
       document.getElementById("enrollment-token-value").value = payload.token || "";
       document.getElementById("enrollment-token-preview").textContent = payload.token_preview || "rotated";
       document.getElementById("enrollment-token-state").textContent = `Token rotated · management ${payload.management_url}`;
+      enrollmentContext = {
+        token: payload.token || "",
+        managementUrl: payload.management_url || ""
+      };
+      renderOnboardingCommands();
       showToast("Enrollment token rotated", "Existing nodes must be re-enrolled with the new token.", "warning");
       await refresh();
     }
@@ -5824,11 +6957,18 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
     document.getElementById("save-policies").addEventListener("click", savePolicies);
     document.getElementById("save-dns-policy").addEventListener("click", saveDnsPolicy);
     document.getElementById("run-policy-self-test").addEventListener("click", runPolicySelfTest);
+    document.getElementById("first-run-smoke-test").addEventListener("click", runSmokeTests);
+    document.getElementById("run-smoke-tests").addEventListener("click", runSmokeTests);
     document.getElementById("load-diagnostics").addEventListener("click", () => loadDiagnostics());
     document.getElementById("export-support-bundle").addEventListener("click", exportSupportBundle);
+    document.getElementById("export-backup").addEventListener("click", exportBackup);
+    document.getElementById("restore-backup").addEventListener("click", restoreBackup);
     document.getElementById("save-settings").addEventListener("click", saveLocalSettings);
     document.getElementById("copy-enrollment-token").addEventListener("click", copyEnrollmentToken);
     document.getElementById("rotate-enrollment-token").addEventListener("click", rotateEnrollmentToken);
+    document.getElementById("refresh-onboarding-token").addEventListener("click", loadEnrollmentToken);
+    document.getElementById("copy-smb-onboarding").addEventListener("click", () => copyOnboardingInstructions("smb"));
+    document.getElementById("copy-dns-onboarding").addEventListener("click", () => copyOnboardingInstructions("dns"));
     document.getElementById("download-activation-file").addEventListener("click", downloadActivationFile);
     document.getElementById("install-license-file").addEventListener("click", installLicenseFile);
     document.getElementById("copy-license-request").addEventListener("click", copyLicenseRequest);
