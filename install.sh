@@ -26,6 +26,8 @@ LOCAL_AGENT_MANAGEMENT_INTERFACE="lo"
 LOCAL_AGENT_MANAGEMENT_IP="127.0.0.1"
 AXIOM_LICENSE_PUBLIC_KEY_HEX="${AXIOM_LICENSE_PUBLIC_KEY_HEX:-}"
 AXIOM_INSTALL_LICENSE_TOOL="${AXIOM_INSTALL_LICENSE_TOOL:-0}"
+INSTALL_MODE="install"
+PURGE_DATA_ON_UNINSTALL="false"
 
 trap 'echo "Axiom installation failed. Review the error above and rerun install.sh." >&2' ERR
 
@@ -34,6 +36,62 @@ if [[ "${EUID}" -eq 0 ]]; then
 else
   SUDO="sudo"
 fi
+
+print_usage() {
+  cat <<EOF
+Usage: ./install.sh [options]
+
+Options:
+  --install       Run the interactive installer. This is the default.
+  --repair        Rebuild and reinstall the binary, service, and helpers while preserving /etc/axiom/axiom.toml.
+  --uninstall     Stop and remove the Axiom service and binaries. Configuration, data, and logs are kept.
+  --purge         With --uninstall, also remove /etc/axiom, /var/lib/axiom, and /var/log/axiom.
+  --cli           Force the plain CLI wizard instead of whiptail.
+  -h, --help      Show this help message.
+
+Environment:
+  AXIOM_INSTALLER_CLI=1              Force plain CLI prompts.
+  AXIOM_LICENSE_PUBLIC_KEY_HEX=...   Install the official license verification public key.
+  AXIOM_INSTALL_LICENSE_TOOL=1       Install the internal license issuing tool on trusted staff systems only.
+EOF
+}
+
+parse_args() {
+  while (($# > 0)); do
+    case "$1" in
+      --install)
+        INSTALL_MODE="install"
+        ;;
+      --repair)
+        INSTALL_MODE="repair"
+        ;;
+      --uninstall)
+        INSTALL_MODE="uninstall"
+        ;;
+      --purge)
+        PURGE_DATA_ON_UNINSTALL="true"
+        ;;
+      --cli)
+        export AXIOM_INSTALLER_CLI=1
+        ;;
+      -h | --help)
+        print_usage
+        exit 0
+        ;;
+      *)
+        echo "Unknown option: $1" >&2
+        print_usage >&2
+        exit 1
+        ;;
+    esac
+    shift
+  done
+
+  if [[ "${PURGE_DATA_ON_UNINSTALL}" == "true" && "${INSTALL_MODE}" != "uninstall" ]]; then
+    echo "--purge can only be used with --uninstall." >&2
+    exit 1
+  fi
+}
 
 require_sudo() {
   if [[ -n "${SUDO}" ]]; then
@@ -1175,6 +1233,29 @@ ensure_service_user() {
   fi
 }
 
+backup_existing_config() {
+  if [[ ! -f "${CONFIG_PATH}" ]]; then
+    return
+  fi
+
+  local backup_path
+  backup_path="${CONFIG_PATH}.bak-$(date +%Y%m%d-%H%M%S)"
+  ${SUDO} cp -a "${CONFIG_PATH}" "${backup_path}"
+  echo "Existing config backed up to ${backup_path}"
+}
+
+read_config_role() {
+  if [[ ! -f "${CONFIG_PATH}" ]]; then
+    return 1
+  fi
+
+  ${SUDO} awk -F'"' '/^[[:space:]]*role[[:space:]]*=/ { print $2; exit }' "${CONFIG_PATH}"
+}
+
+config_has_proxy_listeners() {
+  [[ -f "${CONFIG_PATH}" ]] && ${SUDO} grep -Eq '^[[:space:]]*\[\[proxy_listeners\]\]' "${CONFIG_PATH}"
+}
+
 write_config() {
   local temp_config
   temp_config="$(mktemp)"
@@ -1630,18 +1711,107 @@ print_summary() {
   ${SUDO} systemctl --no-pager --lines=12 status axiom.service || true
 }
 
+print_repair_summary() {
+  echo
+  echo "Axiom repair completed."
+  echo "Config preserved: ${CONFIG_PATH}"
+  echo "Binary: ${BINARY_PATH}"
+  echo "Service: axiom.service"
+  echo "Role: ${NODE_ROLE}"
+  echo
+  echo "Useful next checks:"
+  echo "  sudo systemctl status axiom --no-pager"
+  echo "  sudo journalctl -u axiom -n 120 -l --no-pager"
+  echo
+  ${SUDO} systemctl --no-pager --lines=12 status axiom.service || true
+}
+
+repair_existing_installation() {
+  if [[ ! -f "${CONFIG_PATH}" ]]; then
+    echo "Cannot repair Axiom because ${CONFIG_PATH} does not exist." >&2
+    echo "Run ./install.sh for a new installation." >&2
+    exit 1
+  fi
+
+  NODE_ROLE="$(read_config_role)"
+  if [[ -z "${NODE_ROLE}" ]]; then
+    echo "Cannot determine node.role from ${CONFIG_PATH}." >&2
+    exit 1
+  fi
+
+  echo
+  echo "Repairing existing Axiom installation for role: ${NODE_ROLE}"
+  backup_existing_config
+  ensure_service_user
+  build_and_install_binary
+  if config_has_proxy_listeners; then
+    configure_reverse_proxy_network_mode
+  fi
+  write_service_restart_helper
+  write_systemd_service
+  enable_and_start_service
+  print_repair_summary
+}
+
+uninstall_axiom() {
+  echo "Removing Axiom service and binaries."
+
+  if command -v systemctl >/dev/null 2>&1; then
+    ${SUDO} systemctl stop axiom.service >/dev/null 2>&1 || true
+    ${SUDO} systemctl disable axiom.service >/dev/null 2>&1 || true
+  fi
+
+  ${SUDO} setcap -r "${BINARY_PATH}" >/dev/null 2>&1 || true
+  ${SUDO} rm -f \
+    "${SERVICE_PATH}" \
+    "${BINARY_PATH}" \
+    "${LICENSE_TOOL_PATH}" \
+    "${RESTART_HELPER_PATH}" \
+    "${SUDOERS_PATH}" \
+    /etc/sysctl.d/99-axiom-reverse-proxy.conf
+
+  if command -v systemctl >/dev/null 2>&1; then
+    ${SUDO} systemctl daemon-reload || true
+  fi
+
+  if [[ "${PURGE_DATA_ON_UNINSTALL}" == "true" ]]; then
+    echo "Purging Axiom configuration, state, and logs."
+    ${SUDO} rm -rf "${CONFIG_DIR}" /var/lib/axiom /var/log/axiom
+  else
+    echo "Configuration and data were kept for recovery:"
+    echo "  ${CONFIG_DIR}"
+    echo "  /var/lib/axiom"
+    echo "  /var/log/axiom"
+    echo "Run ./install.sh --uninstall --purge to remove them as well."
+  fi
+
+  echo "Axiom uninstall completed."
+}
+
 main() {
+  parse_args "$@"
   ensure_debian_family
-  ensure_project_root
   validate_release_options
   require_sudo
+  if [[ "${INSTALL_MODE}" == "uninstall" ]]; then
+    uninstall_axiom
+    return
+  fi
+
+  ensure_project_root
   install_missing_dependencies
   ensure_rust_toolchain
+  if [[ "${INSTALL_MODE}" == "repair" ]]; then
+    repair_existing_installation
+    return
+  fi
+
   load_interfaces
   collect_configuration
   ensure_service_user
   prepare_tls_certificate
   write_service_restart_helper
+  backup_existing_config
   write_config
   build_and_install_binary
   if ((${#PROXY_INTERFACES[@]} > 0)); then

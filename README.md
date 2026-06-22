@@ -52,6 +52,28 @@ The installer embeds the full Axiom source tree, extracts it to a temporary
 directory, discovers NICs interactively, writes `/etc/axiom/axiom.toml`, builds
 the release binary, applies Linux capabilities, and starts `axiom.service`.
 
+For existing servers, use repair mode after pulling a new release. It preserves
+the installed configuration and refreshes the binary, systemd service, helper
+files, Linux capabilities, and reverse-proxy sysctl settings:
+
+```bash
+cd ~/Axiom
+git pull --ff-only
+sudo ./install.sh --repair
+```
+
+To remove Axiom while keeping configuration, state, and logs:
+
+```bash
+sudo ./install.sh --uninstall
+```
+
+To remove service, binaries, configuration, state, and logs:
+
+```bash
+sudo ./install.sh --uninstall --purge
+```
+
 During installation, the DNS Security Gateway can be enabled on a dedicated NIC.
 Axiom listens on UDP/TCP 53, checks domains against local policy and optional
 threat feeds, serves local DNS records, caches safe responses, and forwards
@@ -155,6 +177,17 @@ AXIOM_INSTALL_LICENSE_TOOL=1 ./install.sh
 
 The private key must still live outside git and customer systems, preferably as
 a protected secret or a `0600` file readable only by the license issuing service.
+
+## Operations Docs
+
+Production deployment, support, and release readiness documents live under
+`docs/`:
+
+```text
+docs/PRODUCTION_DEPLOYMENT.md
+docs/OPERATIONS_RUNBOOK.md
+docs/RELEASE_CHECKLIST.md
+```
 
 ## Policies
 

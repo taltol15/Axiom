@@ -4732,6 +4732,34 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
           </div>
           <p id="audit-count" class="text-sm text-zinc-500">0 events</p>
         </div>
+        <div class="grid gap-3 border-b border-zinc-800 px-6 py-4 lg:grid-cols-[1fr_180px_180px_auto]">
+          <label class="block">
+            <span class="text-xs font-semibold uppercase tracking-wider text-zinc-500">Search timeline</span>
+            <input id="audit-search" type="search" placeholder="Search client, file, domain, reason, rule, or target" class="mt-2 w-full rounded-md border border-zinc-700 bg-zinc-950 px-3 py-2 text-sm text-white outline-none transition focus:border-emerald-400 focus:ring-2 focus:ring-emerald-400/20">
+          </label>
+          <label class="block">
+            <span class="text-xs font-semibold uppercase tracking-wider text-zinc-500">Source</span>
+            <select id="audit-source-filter" class="mt-2 w-full rounded-md border border-zinc-700 bg-zinc-950 px-3 py-2 text-sm text-white outline-none transition focus:border-emerald-400 focus:ring-2 focus:ring-emerald-400/20">
+              <option value="all">All sources</option>
+              <option value="SMB">SMB</option>
+              <option value="DNS">DNS</option>
+            </select>
+          </label>
+          <label class="block">
+            <span class="text-xs font-semibold uppercase tracking-wider text-zinc-500">Action</span>
+            <select id="audit-action-filter" class="mt-2 w-full rounded-md border border-zinc-700 bg-zinc-950 px-3 py-2 text-sm text-white outline-none transition focus:border-emerald-400 focus:ring-2 focus:ring-emerald-400/20">
+              <option value="all">All actions</option>
+              <option value="allow">Allow</option>
+              <option value="block">Block</option>
+              <option value="monitor">Monitor</option>
+              <option value="observe">Observe</option>
+              <option value="hash">Hash</option>
+              <option value="close">Close</option>
+              <option value="error">Error</option>
+            </select>
+          </label>
+          <button id="export-audit-events" class="self-end rounded-md border border-zinc-700 px-4 py-2 text-sm font-semibold text-zinc-100 transition hover:border-emerald-400 hover:text-emerald-200">Export events</button>
+        </div>
         <div id="audit-log" class="divide-y divide-zinc-800"></div>
       </section>
 
@@ -4890,6 +4918,8 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
     let latestLicenseStatus = null;
     let latestDiagnosticsBundle = null;
     let latestSmokeTest = null;
+    let latestAuditEvents = [];
+    let latestAuditTotals = { smb: 0, dns: 0 };
     let enrollmentContext = { token: "", managementUrl: "" };
 
     function authHeaders(extra = {}) {
@@ -5684,6 +5714,32 @@ DNS node -> upstream resolvers: UDP/TCP 53`;
       return dnsNode?.dns || localDns || {};
     }
 
+    function fleetNodeHealth(node, ageSeconds) {
+      const push = node.last_control_push || null;
+      if (ageSeconds > 120) {
+        return {
+          label: "offline",
+          className: "border-red-400/40 bg-red-500/10 text-red-100"
+        };
+      }
+      if (ageSeconds > 20) {
+        return {
+          label: "stale",
+          className: "border-amber-400/40 bg-amber-500/10 text-amber-100"
+        };
+      }
+      if (push && !push.accepted) {
+        return {
+          label: "degraded",
+          className: "border-orange-400/40 bg-orange-500/10 text-orange-100"
+        };
+      }
+      return {
+        label: "online",
+        className: "border-emerald-400/40 bg-emerald-500/10 text-emerald-100"
+      };
+    }
+
     function renderFleetNodes(localNode, fleetNodes) {
       const body = document.getElementById("fleet-nodes-body");
       document.getElementById("fleet-count").textContent = `${fleetNodes.length} reporting nodes`;
@@ -5699,7 +5755,7 @@ DNS node -> upstream resolvers: UDP/TCP 53`;
       body.innerHTML = fleetNodes.map((node) => {
         const stats = node.stats || {};
         const age = Math.max(0, Math.round(nowSeconds - Number(node.last_seen_unix_timestamp_seconds || 0)));
-        const healthy = age <= 20;
+        const health = fleetNodeHealth(node, age);
         const wireBytes = Number(stats.stream_bytes_client_to_server || 0) + Number(stats.stream_bytes_server_to_client || 0);
         const dnsQueries = Number(stats.dns_queries || 0);
         const knownBadLoaded = Number(stats.known_bad_reputation_hashes_loaded || 0);
@@ -5730,7 +5786,7 @@ DNS node -> upstream resolvers: UDP/TCP 53`;
             </td>
             <td class="whitespace-nowrap px-6 py-4 text-sm text-zinc-300">${text(node.role)}</td>
             <td class="whitespace-nowrap px-6 py-4 text-sm">
-              <span class="rounded-full border px-2.5 py-1 text-xs font-semibold uppercase ${healthy ? "border-emerald-400/40 bg-emerald-500/10 text-emerald-100" : "border-amber-400/40 bg-amber-500/10 text-amber-100"}">${healthy ? "online" : "stale"}</span>
+              <span class="rounded-full border px-2.5 py-1 text-xs font-semibold uppercase ${health.className}">${health.label}</span>
               <p class="mt-2 text-xs text-zinc-500">${age}s ago · v${text(node.version)}</p>
               <p class="mt-2 text-xs ${pushOk ? "text-emerald-300" : "text-red-300"}">${text(pushDetail)}</p>
               ${pushGenerations ? `<p class="mt-1 text-xs text-zinc-500">${text(pushGenerations)}</p>` : ""}
@@ -5841,6 +5897,128 @@ DNS node -> upstream resolvers: UDP/TCP 53`;
           : [],
         "DNS policies are disabled."
       );
+    }
+
+    function normalizeAuditEvents(stats, dnsEvents) {
+      const smbAuditEvents = (stats.recent_audit_events || []).map((event) => ({
+        source: "SMB",
+        timestamp: Number(event.unix_timestamp_seconds || 0),
+        severity: event.severity,
+        kind: event.kind,
+        action: event.action,
+        subject: event.file_path || text(event.kind).replaceAll("_", " "),
+        route: `${text(event.route_name)} · ${text(event.interface)} · ${text(event.direction)}`,
+        peer: clientLabel(event.peer_addr),
+        target: event.target_addr,
+        reason: `${text(event.reason)}${event.rule_name ? ` · ${text(event.rule_name)}` : ""}`
+      }));
+      const dnsAuditEvents = (dnsEvents || []).map((event) => ({
+        source: "DNS",
+        timestamp: Number(event.unix_timestamp_seconds || 0),
+        severity: event.action === "block" ? "critical" : event.action === "monitor" || event.action === "error" ? "warning" : "info",
+        kind: "dns_query",
+        action: event.action,
+        subject: event.query_name,
+        route: `${text(event.protocol).toUpperCase()} · ${text(event.query_type)}${event.cache_hit ? " · cache hit" : ""}`,
+        peer: clientLabel(event.client_addr),
+        target: event.upstream_addr,
+        reason: `${text(event.reason)} · rcode ${text(event.response_code)} · ${text(event.latency_millis)} ms`
+      }));
+
+      return [...smbAuditEvents, ...dnsAuditEvents]
+        .sort((a, b) => b.timestamp - a.timestamp)
+        .slice(0, 300);
+    }
+
+    function filteredAuditEvents() {
+      const searchInput = document.getElementById("audit-search");
+      const sourceFilter = document.getElementById("audit-source-filter");
+      const actionFilter = document.getElementById("audit-action-filter");
+      const query = (searchInput?.value || "").trim().toLowerCase();
+      const source = sourceFilter?.value || "all";
+      const action = actionFilter?.value || "all";
+
+      return latestAuditEvents.filter((event) => {
+        if (source !== "all" && event.source !== source) return false;
+        if (action !== "all" && text(event.action).toLowerCase() !== action) return false;
+        if (!query) return true;
+
+        const haystack = [
+          event.source,
+          event.kind,
+          event.action,
+          event.subject,
+          event.route,
+          event.peer,
+          event.target,
+          event.reason
+        ].map((value) => text(value).toLowerCase()).join(" ");
+        return haystack.includes(query);
+      });
+    }
+
+    function renderAuditLog() {
+      const auditLog = document.getElementById("audit-log");
+      const visibleEvents = filteredAuditEvents();
+      const shownEvents = visibleEvents.slice(0, 180);
+
+      document.getElementById("audit-count").textContent =
+        `${visibleEvents.length} shown · ${latestAuditEvents.length} loaded · ${latestAuditTotals.smb || 0} SMB total · ${latestAuditTotals.dns || 0} DNS queries`;
+      document.getElementById("audit-state").textContent = latestAuditEvents.length
+        ? `Latest event ${new Date(latestAuditEvents[0].timestamp * 1000).toLocaleTimeString()}`
+        : "Waiting for SMB and DNS activity";
+
+      if (!latestAuditEvents.length) {
+        auditLog.innerHTML = `<div class="px-6 py-6 text-sm text-zinc-400">No SMB or DNS activity recorded.</div>`;
+        return;
+      }
+
+      if (!visibleEvents.length) {
+        auditLog.innerHTML = `<div class="px-6 py-6 text-sm text-zinc-400">No events match the current filters.</div>`;
+        return;
+      }
+
+      auditLog.innerHTML = shownEvents.map((event) => {
+        const severityClass = event.severity === "critical" ? "text-red-200" : event.severity === "warning" ? "text-amber-200" : "text-zinc-200";
+        const badgeClass = event.action === "block" ? "border-red-400/40 bg-red-500/10 text-red-100" : event.action === "monitor" ? "border-amber-400/40 bg-amber-500/10 text-amber-100" : "border-zinc-700 bg-zinc-950 text-zinc-300";
+        const sourceClass = event.source === "DNS" ? "border-sky-400/40 bg-sky-500/10 text-sky-100" : "border-emerald-400/40 bg-emerald-500/10 text-emerald-100";
+        return `
+          <div class="px-6 py-4">
+            <div class="flex flex-col gap-2 lg:flex-row lg:items-center lg:justify-between">
+              <div class="min-w-0">
+                <div class="flex flex-wrap items-center gap-2">
+                  <span class="rounded-full border px-2.5 py-1 text-xs font-semibold uppercase ${sourceClass}">${event.source}</span>
+                  <span class="rounded-full border px-2.5 py-1 text-xs font-semibold uppercase ${badgeClass}">${text(event.kind).replaceAll("_", " ")}</span>
+                  <span class="text-sm font-semibold ${severityClass}">${text(event.action).toUpperCase()}</span>
+                  <span class="text-sm text-zinc-400">${text(event.peer)} → ${text(event.target)}</span>
+                </div>
+                <p class="mt-2 truncate text-sm text-white">${text(event.subject)}</p>
+                <p class="mt-1 text-sm text-zinc-400">${text(event.reason)}</p>
+                <p class="mt-1 text-xs text-zinc-500">${text(event.route)}</p>
+              </div>
+              <p class="text-xs text-zinc-500">${new Date(event.timestamp * 1000).toLocaleString()}</p>
+            </div>
+          </div>
+        `;
+      }).join("");
+    }
+
+    function exportAuditEvents() {
+      const events = filteredAuditEvents();
+      const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+      const filename = `axiom-audit-${timestamp}.json`;
+      downloadTextFile(filename, JSON.stringify({
+        format: "axiom_audit_export_v1",
+        generated_at: new Date().toISOString(),
+        filters: {
+          search: document.getElementById("audit-search")?.value || "",
+          source: document.getElementById("audit-source-filter")?.value || "all",
+          action: document.getElementById("audit-action-filter")?.value || "all"
+        },
+        totals: latestAuditTotals,
+        events
+      }, null, 2), "application/json");
+      showToast("Audit exported", `${events.length} events exported.`, "success");
     }
 
     async function refresh() {
@@ -6031,68 +6209,12 @@ DNS node -> upstream resolvers: UDP/TCP 53`;
         }).join("");
       }
 
-      const auditLog = document.getElementById("audit-log");
-      const smbAuditEvents = (stats.recent_audit_events || []).map((event) => ({
-        source: "SMB",
-        timestamp: Number(event.unix_timestamp_seconds || 0),
-        severity: event.severity,
-        kind: event.kind,
-        action: event.action,
-        subject: event.file_path || text(event.kind).replaceAll("_", " "),
-        route: `${text(event.route_name)} · ${text(event.interface)} · ${text(event.direction)}`,
-        peer: clientLabel(event.peer_addr),
-        target: event.target_addr,
-        reason: `${text(event.reason)}${event.rule_name ? ` · ${text(event.rule_name)}` : ""}`
-      }));
-      const dnsAuditEvents = dnsEvents.map((event) => ({
-        source: "DNS",
-        timestamp: Number(event.unix_timestamp_seconds || 0),
-        severity: event.action === "block" ? "critical" : event.action === "monitor" || event.action === "error" ? "warning" : "info",
-        kind: "dns_query",
-        action: event.action,
-        subject: event.query_name,
-        route: `${text(event.protocol).toUpperCase()} · ${text(event.query_type)}${event.cache_hit ? " · cache hit" : ""}`,
-        peer: clientLabel(event.client_addr),
-        target: event.upstream_addr,
-        reason: `${text(event.reason)} · rcode ${text(event.response_code)} · ${text(event.latency_millis)} ms`
-      }));
-      const globalEvents = [...smbAuditEvents, ...dnsAuditEvents]
-        .sort((a, b) => b.timestamp - a.timestamp)
-        .slice(0, 120);
-
-      document.getElementById("audit-count").textContent =
-        `${globalEvents.length} recent events · ${stats.audit_events || 0} SMB total · ${stats.dns_queries || 0} DNS total`;
-      document.getElementById("audit-state").textContent = globalEvents.length
-        ? `Latest event ${new Date(globalEvents[0].timestamp * 1000).toLocaleTimeString()}`
-        : "Waiting for SMB and DNS activity";
-
-      if (!globalEvents.length) {
-        auditLog.innerHTML = `<div class="px-6 py-6 text-sm text-zinc-400">No SMB or DNS activity recorded.</div>`;
-      } else {
-        auditLog.innerHTML = globalEvents.map((event) => {
-          const severityClass = event.severity === "critical" ? "text-red-200" : event.severity === "warning" ? "text-amber-200" : "text-zinc-200";
-          const badgeClass = event.action === "block" ? "border-red-400/40 bg-red-500/10 text-red-100" : event.action === "monitor" ? "border-amber-400/40 bg-amber-500/10 text-amber-100" : "border-zinc-700 bg-zinc-950 text-zinc-300";
-          const sourceClass = event.source === "DNS" ? "border-sky-400/40 bg-sky-500/10 text-sky-100" : "border-emerald-400/40 bg-emerald-500/10 text-emerald-100";
-          return `
-            <div class="px-6 py-4">
-              <div class="flex flex-col gap-2 lg:flex-row lg:items-center lg:justify-between">
-                <div class="min-w-0">
-                  <div class="flex flex-wrap items-center gap-2">
-                    <span class="rounded-full border px-2.5 py-1 text-xs font-semibold uppercase ${sourceClass}">${event.source}</span>
-                    <span class="rounded-full border px-2.5 py-1 text-xs font-semibold uppercase ${badgeClass}">${text(event.kind).replaceAll("_", " ")}</span>
-                    <span class="text-sm font-semibold ${severityClass}">${text(event.action).toUpperCase()}</span>
-                    <span class="text-sm text-zinc-400">${text(event.peer)} → ${text(event.target)}</span>
-                  </div>
-                  <p class="mt-2 truncate text-sm text-white">${text(event.subject)}</p>
-                  <p class="mt-1 text-sm text-zinc-400">${text(event.reason)}</p>
-                  <p class="mt-1 text-xs text-zinc-500">${text(event.route)}</p>
-                </div>
-                <p class="text-xs text-zinc-500">${new Date(event.timestamp * 1000).toLocaleString()}</p>
-              </div>
-            </div>
-          `;
-        }).join("");
-      }
+      latestAuditEvents = normalizeAuditEvents(stats, dnsEvents);
+      latestAuditTotals = {
+        smb: Number(stats.audit_events || 0),
+        dns: Number(stats.dns_queries || 0)
+      };
+      renderAuditLog();
     }
 
     function fillModeSelect(id, value) {
@@ -6980,6 +7102,10 @@ DNS node -> upstream resolvers: UDP/TCP 53`;
     document.getElementById("rep-import-button").addEventListener("click", importReputationEntries);
     document.getElementById("reputation-search").addEventListener("input", renderReputationTable);
     document.getElementById("reputation-filter").addEventListener("change", renderReputationTable);
+    document.getElementById("audit-search").addEventListener("input", renderAuditLog);
+    document.getElementById("audit-source-filter").addEventListener("change", renderAuditLog);
+    document.getElementById("audit-action-filter").addEventListener("change", renderAuditLog);
+    document.getElementById("export-audit-events").addEventListener("click", exportAuditEvents);
     document.querySelectorAll(".top-nav-button").forEach((button) => {
       button.addEventListener("click", () => setActiveView(button.dataset.view));
     });
