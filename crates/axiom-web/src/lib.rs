@@ -3322,12 +3322,12 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
     <div class="border-t border-zinc-800 bg-zinc-900/70">
       <nav class="mx-auto flex max-w-7xl flex-wrap gap-2 px-6 py-3" aria-label="Dashboard sections">
         <button data-view="overview" class="top-nav-button active rounded-md border border-zinc-700 px-4 py-2 text-sm font-medium text-zinc-200 transition hover:border-emerald-300 hover:text-emerald-100">Overview</button>
-        <button data-view="readiness" class="top-nav-button rounded-md border border-zinc-700 px-4 py-2 text-sm font-medium text-zinc-200 transition hover:border-emerald-300 hover:text-emerald-100">Release Readiness</button>
         <button data-view="nodes" class="top-nav-button rounded-md border border-zinc-700 px-4 py-2 text-sm font-medium text-zinc-200 transition hover:border-emerald-300 hover:text-emerald-100">Nodes</button>
         <button data-view="smb" class="top-nav-button rounded-md border border-zinc-700 px-4 py-2 text-sm font-medium text-zinc-200 transition hover:border-emerald-300 hover:text-emerald-100">SMB Protection</button>
         <button data-view="dns" class="top-nav-button rounded-md border border-zinc-700 px-4 py-2 text-sm font-medium text-zinc-200 transition hover:border-emerald-300 hover:text-emerald-100">DNS Security</button>
         <button data-view="security" class="top-nav-button rounded-md border border-zinc-700 px-4 py-2 text-sm font-medium text-zinc-200 transition hover:border-emerald-300 hover:text-emerald-100">Security</button>
         <button data-view="audit" class="top-nav-button rounded-md border border-zinc-700 px-4 py-2 text-sm font-medium text-zinc-200 transition hover:border-emerald-300 hover:text-emerald-100">Global Audit Log</button>
+        <button data-view="support" class="top-nav-button rounded-md border border-zinc-700 px-4 py-2 text-sm font-medium text-zinc-200 transition hover:border-emerald-300 hover:text-emerald-100">Support</button>
         <button data-view="settings" class="top-nav-button rounded-md border border-zinc-700 px-4 py-2 text-sm font-medium text-zinc-200 transition hover:border-emerald-300 hover:text-emerald-100">Settings</button>
       </nav>
     </div>
@@ -3431,8 +3431,22 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
       </section>
     </section>
 
-    <section id="view-readiness" class="dashboard-view">
-      <section class="rounded-lg border border-zinc-800 bg-zinc-900">
+    <section id="view-support" class="dashboard-view">
+      <section class="rounded-lg border border-emerald-500/20 bg-emerald-500/5 px-6 py-5">
+        <div class="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
+          <div>
+            <p class="text-sm font-semibold uppercase tracking-wider text-emerald-300">Support</p>
+            <h2 class="mt-2 text-2xl font-semibold text-white">Support Center</h2>
+            <p class="mt-1 text-sm text-zinc-400">Release readiness, diagnostics export, and support bundle tools for production operations.</p>
+          </div>
+          <div class="rounded-lg border border-emerald-400/25 bg-zinc-950/70 px-4 py-3 text-sm text-zinc-300">
+            <p class="font-semibold text-emerald-100">Operator workflow</p>
+            <p class="mt-1 text-xs text-zinc-500">Check readiness, export diagnostics, then attach the bundle to a support case.</p>
+          </div>
+        </div>
+      </section>
+
+      <section class="mt-8 rounded-lg border border-zinc-800 bg-zinc-900">
         <div class="flex flex-col gap-4 border-b border-zinc-800 px-6 py-5 lg:flex-row lg:items-end lg:justify-between">
           <div>
             <p class="text-sm font-semibold uppercase tracking-wider text-emerald-300">Production Gate</p>
@@ -3470,6 +3484,34 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
             <h3 class="text-sm font-semibold uppercase tracking-wider text-zinc-400">Next Actions</h3>
             <div id="readiness-actions" class="mt-4 grid gap-3"></div>
           </div>
+        </div>
+      </section>
+
+      <section class="mt-8 rounded-lg border border-zinc-800 bg-zinc-900">
+        <div class="flex flex-col gap-4 border-b border-zinc-800 px-6 py-5 lg:flex-row lg:items-center lg:justify-between">
+          <div>
+            <p class="text-sm font-semibold uppercase tracking-wider text-sky-300">Support Bundle</p>
+            <h2 class="mt-2 text-xl font-semibold text-white">Export Diagnostics</h2>
+            <p id="diagnostics-state" class="mt-1 text-sm text-zinc-400">Diagnostics not loaded</p>
+          </div>
+          <div class="flex flex-wrap gap-3">
+            <button id="load-diagnostics" class="rounded-md border border-zinc-700 px-4 py-2 text-sm text-zinc-200 transition hover:border-emerald-300 hover:text-emerald-200">Load diagnostics</button>
+            <button id="export-support-bundle" class="rounded-md bg-emerald-400 px-4 py-2 text-sm font-semibold text-zinc-950 transition hover:bg-emerald-300">Export support bundle</button>
+          </div>
+        </div>
+        <div class="grid gap-6 p-6 lg:grid-cols-[0.75fr_1.25fr]">
+          <div class="rounded-lg border border-zinc-800 bg-zinc-950/50 p-5">
+            <h3 class="text-sm font-semibold uppercase tracking-wider text-zinc-400">Bundle contents</h3>
+            <ul class="mt-4 grid gap-2 text-sm text-zinc-300">
+              <li>Management process, role, and node identity</li>
+              <li>Fleet nodes, listener state, and policy warnings</li>
+              <li>SMB route stats, active connections, and file activity</li>
+              <li>DNS listener, upstream health, and recent DNS events</li>
+              <li>Selected command outputs for troubleshooting</li>
+            </ul>
+            <p class="mt-4 text-xs text-zinc-500">Secrets and license private keys are not exposed by this diagnostics endpoint.</p>
+          </div>
+          <pre id="diagnostics-output" class="max-h-96 overflow-auto whitespace-pre-wrap rounded-lg border border-zinc-800 bg-zinc-950 px-5 py-4 text-xs leading-5 text-zinc-300"></pre>
         </div>
       </section>
     </section>
@@ -3890,16 +3932,6 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
         <div id="audit-log" class="divide-y divide-zinc-800"></div>
       </section>
 
-      <section class="mt-8 rounded-lg border border-zinc-800 bg-zinc-900">
-      <div class="flex flex-col gap-4 border-b border-zinc-800 px-6 py-5 md:flex-row md:items-center md:justify-between">
-        <div>
-          <h2 class="text-xl font-semibold text-white">Runtime Diagnostics</h2>
-          <p id="diagnostics-state" class="mt-1 text-sm text-zinc-400">Diagnostics not loaded</p>
-        </div>
-        <button id="load-diagnostics" class="rounded-md border border-zinc-700 px-4 py-2 text-sm text-zinc-200 transition hover:border-emerald-300 hover:text-emerald-200">Load diagnostics</button>
-      </div>
-      <pre id="diagnostics-output" class="max-h-96 overflow-auto whitespace-pre-wrap px-6 py-5 text-xs leading-5 text-zinc-300"></pre>
-    </section>
     </section>
 
     <section id="view-settings" class="dashboard-view">
@@ -4053,6 +4085,7 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
     let lastFleetNodes = [];
     let reputationEntries = [];
     let latestLicenseStatus = null;
+    let latestDiagnosticsBundle = null;
 
     function authHeaders(extra = {}) {
       return token ? { ...extra, Authorization: `Bearer ${token}` } : extra;
@@ -4264,7 +4297,8 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
     }
 
     function setActiveView(name) {
-      const knownViews = new Set(["overview", "readiness", "nodes", "smb", "dns", "security", "audit", "settings"]);
+      if (name === "readiness") name = "support";
+      const knownViews = new Set(["overview", "nodes", "smb", "dns", "security", "audit", "support", "settings"]);
       if (!knownViews.has(name)) name = "overview";
       document.querySelectorAll(".dashboard-view").forEach((section) => {
         section.classList.toggle("active", section.id === `view-${name}`);
@@ -5609,17 +5643,18 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
       showToast("Policy self-test completed", `${(payload.results || []).length} checks evaluated.`, "success");
     }
 
-    async function loadDiagnostics() {
+    async function loadDiagnostics(silent = false) {
       document.getElementById("diagnostics-state").textContent = "Loading diagnostics";
       const response = await fetch("/api/diagnostics", { headers: authHeaders() });
       const payload = await response.json().catch(() => ({ message: "diagnostics failed" }));
 
       if (!response.ok) {
         document.getElementById("diagnostics-state").textContent = payload.message || "Diagnostics failed";
-        showToast("Diagnostics failed", payload.message || "Diagnostics request failed.", "error");
-        return;
+        if (!silent) showToast("Diagnostics failed", payload.message || "Diagnostics request failed.", "error");
+        return null;
       }
 
+      const status = payload.status || {};
       const important = {
         process_id: payload.process_id,
         executable_path: payload.executable_path,
@@ -5629,16 +5664,50 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
         deployment_warnings: payload.deployment_warnings,
         proxy_listeners: payload.proxy_listeners,
         dns: payload.dns,
-        route_stats: payload.status.route_stats,
-        active_connection_details: payload.status.active_connection_details,
-        file_activity: payload.status.file_activity,
-        recent_dns_events: payload.status.recent_dns_events,
+        route_stats: status.route_stats || [],
+        active_connection_details: status.active_connection_details || [],
+        file_activity: status.file_activity || [],
+        recent_dns_events: status.recent_dns_events || [],
         commands: payload.command_outputs
       };
 
-      document.getElementById("diagnostics-output").textContent = JSON.stringify(important, null, 2);
-      document.getElementById("diagnostics-state").textContent = "Diagnostics loaded";
-      showToast("Diagnostics loaded", "Deployment and service state were refreshed.", "success");
+      latestDiagnosticsBundle = {
+        format: "axiom_support_bundle_v1",
+        generated_at: new Date().toISOString(),
+        generated_by: "Axiom Management Console",
+        diagnostics: important
+      };
+
+      document.getElementById("diagnostics-output").textContent = JSON.stringify(latestDiagnosticsBundle, null, 2);
+      document.getElementById("diagnostics-state").textContent = `Diagnostics loaded · ${new Date().toLocaleTimeString()}`;
+      if (!silent) showToast("Diagnostics loaded", "Deployment and service state were refreshed.", "success");
+      return latestDiagnosticsBundle;
+    }
+
+    async function exportSupportBundle() {
+      const button = document.getElementById("export-support-bundle");
+      setButtonBusy(button, true, "Exporting");
+      try {
+        const bundle = latestDiagnosticsBundle || await loadDiagnostics(true);
+        if (!bundle) {
+          showToast("Support bundle failed", "Diagnostics could not be loaded.", "error");
+          return;
+        }
+
+        const node = bundle.diagnostics?.node || {};
+        const label = safeFilePart(node.display_name || node.node_id || node.role || "management");
+        const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+        const filename = `axiom-support-${label}-${timestamp}.json`;
+        downloadTextFile(filename, JSON.stringify(bundle, null, 2), "application/json");
+        document.getElementById("diagnostics-state").textContent = `Support bundle exported · ${new Date().toLocaleTimeString()}`;
+        showToast("Support bundle exported", filename, "success");
+      } catch (error) {
+        const message = `Support bundle export failed: ${error.message || error}`;
+        document.getElementById("diagnostics-state").textContent = message;
+        showToast("Support bundle failed", message, "error");
+      } finally {
+        setButtonBusy(button, false);
+      }
     }
 
     function updateTlsSettingsUi(security, bindAddr) {
@@ -5755,7 +5824,8 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
     document.getElementById("save-policies").addEventListener("click", savePolicies);
     document.getElementById("save-dns-policy").addEventListener("click", saveDnsPolicy);
     document.getElementById("run-policy-self-test").addEventListener("click", runPolicySelfTest);
-    document.getElementById("load-diagnostics").addEventListener("click", loadDiagnostics);
+    document.getElementById("load-diagnostics").addEventListener("click", () => loadDiagnostics());
+    document.getElementById("export-support-bundle").addEventListener("click", exportSupportBundle);
     document.getElementById("save-settings").addEventListener("click", saveLocalSettings);
     document.getElementById("copy-enrollment-token").addEventListener("click", copyEnrollmentToken);
     document.getElementById("rotate-enrollment-token").addEventListener("click", rotateEnrollmentToken);
