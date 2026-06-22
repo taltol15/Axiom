@@ -3322,6 +3322,7 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
     <div class="border-t border-zinc-800 bg-zinc-900/70">
       <nav class="mx-auto flex max-w-7xl flex-wrap gap-2 px-6 py-3" aria-label="Dashboard sections">
         <button data-view="overview" class="top-nav-button active rounded-md border border-zinc-700 px-4 py-2 text-sm font-medium text-zinc-200 transition hover:border-emerald-300 hover:text-emerald-100">Overview</button>
+        <button data-view="readiness" class="top-nav-button rounded-md border border-zinc-700 px-4 py-2 text-sm font-medium text-zinc-200 transition hover:border-emerald-300 hover:text-emerald-100">Release Readiness</button>
         <button data-view="nodes" class="top-nav-button rounded-md border border-zinc-700 px-4 py-2 text-sm font-medium text-zinc-200 transition hover:border-emerald-300 hover:text-emerald-100">Nodes</button>
         <button data-view="smb" class="top-nav-button rounded-md border border-zinc-700 px-4 py-2 text-sm font-medium text-zinc-200 transition hover:border-emerald-300 hover:text-emerald-100">SMB Protection</button>
         <button data-view="dns" class="top-nav-button rounded-md border border-zinc-700 px-4 py-2 text-sm font-medium text-zinc-200 transition hover:border-emerald-300 hover:text-emerald-100">DNS Security</button>
@@ -3425,6 +3426,49 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
                 <p id="dns-policy" class="mt-2 text-sm font-medium text-white">—</p>
               </div>
             </div>
+          </div>
+        </div>
+      </section>
+    </section>
+
+    <section id="view-readiness" class="dashboard-view">
+      <section class="rounded-lg border border-zinc-800 bg-zinc-900">
+        <div class="flex flex-col gap-4 border-b border-zinc-800 px-6 py-5 lg:flex-row lg:items-end lg:justify-between">
+          <div>
+            <p class="text-sm font-semibold uppercase tracking-wider text-emerald-300">Production Gate</p>
+            <h2 class="mt-2 text-2xl font-semibold text-white">Release Readiness</h2>
+            <p id="readiness-summary" class="mt-1 text-sm text-zinc-400">Waiting for deployment telemetry</p>
+          </div>
+          <div class="rounded-lg border border-zinc-700 bg-zinc-950 px-5 py-4 text-right">
+            <p class="text-xs font-semibold uppercase tracking-wider text-zinc-500">Readiness score</p>
+            <p id="readiness-score" class="mt-2 text-4xl font-semibold text-white">—</p>
+            <p id="readiness-score-detail" class="mt-1 text-xs text-zinc-500">Calculating</p>
+          </div>
+        </div>
+
+        <div class="grid gap-4 border-b border-zinc-800 p-6 md:grid-cols-3">
+          <article class="rounded-lg border border-zinc-800 bg-zinc-950/60 p-5">
+            <p class="text-xs font-semibold uppercase tracking-wider text-zinc-500">Blocking Issues</p>
+            <p id="readiness-fail-count" class="mt-3 text-3xl font-semibold text-red-300">0</p>
+          </article>
+          <article class="rounded-lg border border-zinc-800 bg-zinc-950/60 p-5">
+            <p class="text-xs font-semibold uppercase tracking-wider text-zinc-500">Warnings</p>
+            <p id="readiness-warn-count" class="mt-3 text-3xl font-semibold text-amber-300">0</p>
+          </article>
+          <article class="rounded-lg border border-zinc-800 bg-zinc-950/60 p-5">
+            <p class="text-xs font-semibold uppercase tracking-wider text-zinc-500">Passed Checks</p>
+            <p id="readiness-pass-count" class="mt-3 text-3xl font-semibold text-emerald-300">0</p>
+          </article>
+        </div>
+
+        <div class="grid gap-6 p-6 lg:grid-cols-[1.25fr_0.75fr]">
+          <div>
+            <h3 class="text-sm font-semibold uppercase tracking-wider text-zinc-400">Checks</h3>
+            <div id="readiness-checks" class="mt-4 grid gap-3"></div>
+          </div>
+          <div>
+            <h3 class="text-sm font-semibold uppercase tracking-wider text-zinc-400">Next Actions</h3>
+            <div id="readiness-actions" class="mt-4 grid gap-3"></div>
           </div>
         </div>
       </section>
@@ -4220,7 +4264,7 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
     }
 
     function setActiveView(name) {
-      const knownViews = new Set(["overview", "nodes", "smb", "dns", "security", "audit", "settings"]);
+      const knownViews = new Set(["overview", "readiness", "nodes", "smb", "dns", "security", "audit", "settings"]);
       if (!knownViews.has(name)) name = "overview";
       document.querySelectorAll(".dashboard-view").forEach((section) => {
         section.classList.toggle("active", section.id === `view-${name}`);
@@ -4236,6 +4280,171 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
       if (action === "monitor") return "border-amber-400/40 bg-amber-500/10 text-amber-100";
       if (action === "error") return "border-orange-400/40 bg-orange-500/10 text-orange-100";
       return "border-emerald-400/40 bg-emerald-500/10 text-emerald-100";
+    }
+
+    function readinessTone(status) {
+      if (status === "pass") return {
+        row: "border-emerald-400/30 bg-emerald-500/10",
+        badge: "border-emerald-400/40 bg-emerald-500/10 text-emerald-100",
+        text: "text-emerald-300",
+        label: "pass"
+      };
+      if (status === "warn") return {
+        row: "border-amber-400/30 bg-amber-500/10",
+        badge: "border-amber-400/40 bg-amber-500/10 text-amber-100",
+        text: "text-amber-300",
+        label: "review"
+      };
+      return {
+        row: "border-red-400/35 bg-red-500/10",
+        badge: "border-red-400/40 bg-red-500/10 text-red-100",
+        text: "text-red-300",
+        label: "fix"
+      };
+    }
+
+    function readinessCheck(status, title, detail, action) {
+      return { status, title, detail, action };
+    }
+
+    function nodeAgeSeconds(node) {
+      return Math.max(0, Math.round(Date.now() / 1000 - Number(node.last_seen_unix_timestamp_seconds || 0)));
+    }
+
+    function collectReadinessChecks(data, stats, fleetNodes, dns) {
+      const checks = [];
+      const warnings = data.deployment_warnings || {};
+      const smbWarnings = warnings.smb || [];
+      const dnsWarnings = warnings.dns || [];
+      const smbNodes = fleetNodes.filter((node) => node.role === "smb_proxy");
+      const dnsNodes = fleetNodes.filter((node) => node.role === "dns");
+      const staleNodes = fleetNodes.filter((node) => nodeAgeSeconds(node) > 45);
+      const pushFailures = fleetNodes.filter((node) => node.last_control_push && !node.last_control_push.accepted);
+      const missingPush = fleetNodes.filter((node) => !node.last_control_push);
+      const smbRoutes = [
+        ...(data.proxy_listeners || []),
+        ...fleetNodes.flatMap((node) => node.proxy_listeners || [])
+      ];
+      const readySmbRoutes = smbRoutes.filter((route) => route.listener_ready);
+      const hasSmbCapacity = readySmbRoutes.length > 0 || smbNodes.length > 0;
+      const hasDnsCapacity = Boolean(dns?.enabled) || dnsNodes.length > 0;
+
+      checks.push(readinessCheck(
+        data.license?.valid ? "pass" : "fail",
+        "License entitlement",
+        data.license?.message || "License state unavailable",
+        data.license?.valid ? "No action needed." : "Install a signed .axlic license before customer release."
+      ));
+
+      checks.push(readinessCheck(
+        data.security?.https_enabled ? "pass" : "fail",
+        "Management portal HTTPS",
+        data.security?.https_enabled ? `HTTPS active at ${text(data.security.https_url)}` : "Management portal is currently reachable over HTTP.",
+        data.security?.https_enabled ? "No action needed." : "Enable HTTPS under Settings and use a trusted certificate for production."
+      ));
+
+      checks.push(readinessCheck(
+        data.security?.directory_enabled ? "pass" : "warn",
+        "Administrator authentication",
+        data.security?.directory_enabled ? `Directory login enabled · ${text(data.security.directory_url)}` : "Local admin login only.",
+        data.security?.directory_enabled ? "No action needed." : "Connect AD/LDAP before broader customer rollout, or document local-admin operation clearly."
+      ));
+
+      checks.push(readinessCheck(
+        fleetNodes.length && !staleNodes.length ? "pass" : fleetNodes.length ? "warn" : "fail",
+        "Node enrollment and heartbeat",
+        fleetNodes.length ? `${fleetNodes.length} reporting nodes · ${staleNodes.length} stale` : "No remote DNS or SMB nodes are reporting.",
+        fleetNodes.length && !staleNodes.length ? "No action needed." : "Verify node service status, enrollment token, and management reachability."
+      ));
+
+      checks.push(readinessCheck(
+        pushFailures.length ? "fail" : missingPush.length ? "warn" : "pass",
+        "Policy push acknowledgement",
+        pushFailures.length ? `${pushFailures.length} nodes rejected or missed the last push.` : missingPush.length ? `${missingPush.length} nodes have no recorded policy push yet.` : "All reporting nodes acknowledged their latest control push.",
+        pushFailures.length ? "Open Nodes and inspect failed push messages." : missingPush.length ? "Save SMB/DNS/Reputation policy once to establish a baseline acknowledgement." : "No action needed."
+      ));
+
+      checks.push(readinessCheck(
+        hasSmbCapacity && !smbWarnings.length ? "pass" : hasSmbCapacity ? "warn" : "fail",
+        "SMB protection path",
+        hasSmbCapacity ? `${readySmbRoutes.length || smbNodes.length} SMB route/node targets available · ${smbWarnings.length} warnings` : "No SMB proxy route or node is available.",
+        hasSmbCapacity && !smbWarnings.length ? "No action needed." : "Ensure clients use Axiom as the SMB endpoint and cannot bypass TCP/445 directly to file servers."
+      ));
+
+      checks.push(readinessCheck(
+        hasDnsCapacity && !dnsWarnings.length ? "pass" : hasDnsCapacity ? "warn" : "warn",
+        "DNS security path",
+        hasDnsCapacity ? `${dnsNodes.length || 1} DNS node/listener targets available · ${dnsWarnings.length} warnings` : "No DNS node/listener is enabled. This is acceptable for SMB-only deployments.",
+        hasDnsCapacity && !dnsWarnings.length ? "No action needed." : "Verify upstream resolvers, avoid forwarding loops, and define DNS policies for customer environments."
+      ));
+
+      checks.push(readinessCheck(
+        Number(stats.known_bad_reputation_hashes_loaded || 0) > 0 ? "pass" : "warn",
+        "Reputation feed on SMB nodes",
+        `${Number(stats.known_bad_reputation_hashes_loaded || 0)} known-bad hashes loaded across runtime telemetry.`,
+        Number(stats.known_bad_reputation_hashes_loaded || 0) > 0 ? "No action needed." : "Add a known_bad test hash in Reputation Center and confirm SMB nodes acknowledge it."
+      ));
+
+      checks.push(readinessCheck(
+        Number(stats.audit_events || 0) > 0 || Number(stats.dns_queries || 0) > 0 ? "pass" : "warn",
+        "Audit telemetry",
+        `${Number(stats.audit_events || 0)} SMB audit events · ${Number(stats.dns_queries || 0)} DNS queries observed.`,
+        Number(stats.audit_events || 0) > 0 || Number(stats.dns_queries || 0) > 0 ? "No action needed." : "Run a smoke test through SMB and DNS before release validation."
+      ));
+
+      return checks;
+    }
+
+    function renderReleaseReadiness(data, stats, fleetNodes, dns) {
+      const checks = collectReadinessChecks(data, stats, fleetNodes, dns);
+      const passCount = checks.filter((check) => check.status === "pass").length;
+      const warnCount = checks.filter((check) => check.status === "warn").length;
+      const failCount = checks.filter((check) => check.status === "fail").length;
+      const score = Math.round(((passCount + warnCount * 0.5) / Math.max(1, checks.length)) * 100);
+      const releaseState = failCount ? "Not ready for production" : warnCount ? "Release candidate with warnings" : "Ready for controlled release";
+      const scoreClass = failCount ? "text-red-300" : warnCount ? "text-amber-300" : "text-emerald-300";
+
+      document.getElementById("readiness-summary").textContent =
+        `${releaseState} · checked ${checks.length} controls at ${new Date().toLocaleTimeString()}`;
+      document.getElementById("readiness-score").textContent = `${score}%`;
+      document.getElementById("readiness-score").className = `mt-2 text-4xl font-semibold ${scoreClass}`;
+      document.getElementById("readiness-score-detail").textContent =
+        failCount ? "Fix blocking issues before release." : warnCount ? "Review warnings before customer rollout." : "Core checks are green.";
+      document.getElementById("readiness-fail-count").textContent = failCount;
+      document.getElementById("readiness-warn-count").textContent = warnCount;
+      document.getElementById("readiness-pass-count").textContent = passCount;
+
+      document.getElementById("readiness-checks").innerHTML = checks.map((check) => {
+        const tone = readinessTone(check.status);
+        return `
+          <article class="rounded-lg border ${tone.row} p-4">
+            <div class="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
+              <div class="min-w-0">
+                <p class="text-sm font-semibold text-white">${html(check.title)}</p>
+                <p class="mt-1 text-sm text-zinc-400">${html(check.detail)}</p>
+              </div>
+              <span class="w-fit rounded-full border px-2.5 py-1 text-xs font-semibold uppercase ${tone.badge}">${tone.label}</span>
+            </div>
+            <p class="mt-3 text-xs ${tone.text}">${html(check.action)}</p>
+          </article>
+        `;
+      }).join("");
+
+      const actions = checks
+        .filter((check) => check.status !== "pass")
+        .slice(0, 6);
+      document.getElementById("readiness-actions").innerHTML = actions.length
+        ? actions.map((check, index) => {
+            const tone = readinessTone(check.status);
+            return `
+              <div class="rounded-lg border border-zinc-800 bg-zinc-950/60 p-4">
+                <p class="text-xs font-semibold uppercase tracking-wider ${tone.text}">Step ${index + 1} · ${tone.label}</p>
+                <p class="mt-2 text-sm font-semibold text-white">${html(check.title)}</p>
+                <p class="mt-1 text-sm text-zinc-400">${html(check.action)}</p>
+              </div>
+            `;
+          }).join("")
+        : `<div class="rounded-lg border border-emerald-400/30 bg-emerald-500/10 p-4 text-sm text-emerald-100">All readiness checks passed. Keep the smoke-test evidence and proceed to packaging/customer documentation.</div>`;
     }
 
     function renderList(containerId, rows, emptyText) {
@@ -4534,6 +4743,7 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
       document.getElementById("dns-listener").textContent = dns.enabled ? `UDP ${dns.listen_udp_addr} · TCP ${dns.listen_tcp_addr}` : "disabled";
       document.getElementById("dns-upstreams").textContent = dns.enabled ? (dns.upstreams || []).join(", ") : "—";
       document.getElementById("dns-policy").textContent = dns.enabled ? `block response: ${dns.block_response}` : "—";
+      renderReleaseReadiness(data, stats, fleetNodes, dns);
       renderDnsSummary(dns, dnsEvents, stats);
 
       const dnsEventsBody = document.getElementById("dns-events-body");
