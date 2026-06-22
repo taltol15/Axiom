@@ -24,8 +24,9 @@ use axiom_core::{
 use axiom_license::{LicenseStatus, LicenseUsage, evaluate_license, install_license_text};
 use axiom_net::bind_tcp_listener_to_interface;
 use axiom_reputation::{
-    FileReputationReport, ReputationBulkImportRequest, ReputationCreateRequest, ReputationError,
-    ReputationLookupResponse, ReputationStore, ReputationUpdateRequest, ReputationVerdict,
+    FileReputationReport, ReputationBulkImportRequest, ReputationBulkImportResponse,
+    ReputationCreateRequest, ReputationEntry, ReputationError, ReputationLookupResponse,
+    ReputationStore, ReputationUpdateRequest, ReputationVerdict,
 };
 use axum::{
     Json, Router,
@@ -394,7 +395,11 @@ async fn api_create_reputation(
         Ok(entry) => {
             let push_results = push_reputation_hashes_to_smb_nodes(state.as_ref()).await;
             warn_failed_node_pushes("reputation create", &push_results);
-            Json(entry).into_response()
+            Json(ReputationEntryMutationResponse {
+                entry,
+                node_push_results: push_results,
+            })
+            .into_response()
         }
         Err(error) => reputation_error_response(error),
     }
@@ -419,7 +424,11 @@ async fn api_update_reputation(
         Ok(entry) => {
             let push_results = push_reputation_hashes_to_smb_nodes(state.as_ref()).await;
             warn_failed_node_pushes("reputation update", &push_results);
-            Json(entry).into_response()
+            Json(ReputationEntryMutationResponse {
+                entry,
+                node_push_results: push_results,
+            })
+            .into_response()
         }
         Err(error) => reputation_error_response(error),
     }
@@ -443,7 +452,11 @@ async fn api_delete_reputation(
         Ok(entry) => {
             let push_results = push_reputation_hashes_to_smb_nodes(state.as_ref()).await;
             warn_failed_node_pushes("reputation delete", &push_results);
-            Json(entry).into_response()
+            Json(ReputationEntryMutationResponse {
+                entry,
+                node_push_results: push_results,
+            })
+            .into_response()
         }
         Err(error) => reputation_error_response(error),
     }
@@ -466,7 +479,11 @@ async fn api_import_reputation(
     let response = state.reputation.bulk_import(request, &actor);
     let push_results = push_reputation_hashes_to_smb_nodes(state.as_ref()).await;
     warn_failed_node_pushes("reputation import", &push_results);
-    Json(response).into_response()
+    Json(ReputationImportWithPushResponse {
+        response,
+        node_push_results: push_results,
+    })
+    .into_response()
 }
 
 async fn api_report_file_reputation(
@@ -2424,6 +2441,20 @@ struct DnsPolicyUpdateResponse {
 }
 
 #[derive(Debug, Serialize)]
+struct ReputationEntryMutationResponse {
+    #[serde(flatten)]
+    entry: ReputationEntry,
+    node_push_results: Vec<NodePushResult>,
+}
+
+#[derive(Debug, Serialize)]
+struct ReputationImportWithPushResponse {
+    #[serde(flatten)]
+    response: ReputationBulkImportResponse,
+    node_push_results: Vec<NodePushResult>,
+}
+
+#[derive(Debug, Serialize)]
 struct NodePushResult {
     node_id: String,
     role: NodeRole,
@@ -3131,6 +3162,91 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
       color: #94a3b8;
       font-size: 0.875rem;
       margin-top: 0.35rem;
+    }
+
+    .toast-stack {
+      bottom: 1.25rem;
+      display: grid;
+      gap: 0.75rem;
+      max-width: min(28rem, calc(100vw - 2rem));
+      position: fixed;
+      right: 1.25rem;
+      z-index: 80;
+    }
+
+    .toast {
+      background: rgba(15, 23, 42, 0.96);
+      border: 1px solid rgba(148, 163, 184, 0.24);
+      border-radius: 8px;
+      box-shadow: 0 22px 56px rgba(2, 6, 23, 0.34);
+      color: #e2e8f0;
+      opacity: 0;
+      padding: 0.9rem 1rem;
+      transform: translateY(0.65rem);
+      transition: opacity 160ms ease, transform 160ms ease;
+    }
+
+    .toast.show {
+      opacity: 1;
+      transform: translateY(0);
+    }
+
+    .toast.success { border-color: rgba(52, 211, 153, 0.5); }
+    .toast.warning { border-color: rgba(251, 191, 36, 0.55); }
+    .toast.error { border-color: rgba(248, 113, 113, 0.58); }
+
+    .push-progress {
+      background: rgba(15, 23, 42, 0.97);
+      border: 1px solid rgba(52, 211, 153, 0.34);
+      border-radius: 8px;
+      box-shadow: 0 24px 70px rgba(2, 6, 23, 0.42);
+      color: #e2e8f0;
+      left: 50%;
+      max-width: min(40rem, calc(100vw - 2rem));
+      padding: 1rem;
+      position: fixed;
+      top: 1rem;
+      transform: translateX(-50%);
+      width: 40rem;
+      z-index: 70;
+    }
+
+    .push-progress-bar {
+      background: rgba(51, 65, 85, 0.8);
+      border-radius: 999px;
+      height: 0.45rem;
+      margin-top: 0.85rem;
+      overflow: hidden;
+    }
+
+    .push-progress-fill {
+      background: linear-gradient(90deg, #34f5c5, #2fe3ff);
+      height: 100%;
+      transition: width 220ms ease;
+      width: 8%;
+    }
+
+    .button-busy {
+      cursor: wait !important;
+      opacity: 0.75;
+      pointer-events: none;
+    }
+
+    .button-busy::after {
+      animation: axiom-spin 700ms linear infinite;
+      border: 2px solid rgba(15, 23, 42, 0.25);
+      border-top-color: rgba(15, 23, 42, 0.9);
+      border-radius: 999px;
+      content: "";
+      display: inline-block;
+      height: 0.85rem;
+      margin-left: 0.55rem;
+      vertical-align: -0.12rem;
+      width: 0.85rem;
+    }
+
+    @keyframes axiom-spin {
+      to { transform: rotate(360deg); }
     }
 
     .rounded-lg {
@@ -3870,10 +3986,27 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
     </div>
   </footer>
 
+  <div id="toast-stack" class="toast-stack" aria-live="polite" aria-atomic="true"></div>
+
+  <section id="push-progress" class="push-progress hidden" aria-live="polite" aria-atomic="true">
+    <div class="flex items-start justify-between gap-4">
+      <div>
+        <p id="push-progress-title" class="text-sm font-semibold text-white">Applying update</p>
+        <p id="push-progress-detail" class="mt-1 text-xs text-zinc-400">Preparing node push</p>
+      </div>
+      <span id="push-progress-percent" class="rounded-full border border-emerald-400/35 bg-emerald-500/10 px-2.5 py-1 text-xs font-semibold text-emerald-100">0%</span>
+    </div>
+    <div class="push-progress-bar">
+      <div id="push-progress-fill" class="push-progress-fill"></div>
+    </div>
+    <div id="push-progress-results" class="mt-3 grid gap-2 text-xs text-zinc-300"></div>
+  </section>
+
   <script>
     const token = localStorage.getItem("axiomToken") || "";
     const modes = ["disabled", "monitor", "block"];
     let clientIdentities = {};
+    let lastFleetNodes = [];
     let reputationEntries = [];
     let latestLicenseStatus = null;
 
@@ -3894,6 +4027,15 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
 
     function text(value) {
       return value === null || value === undefined || value === "" ? "—" : String(value);
+    }
+
+    function html(value) {
+      return text(value)
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;")
+        .replaceAll("'", "&#39;");
     }
 
     function licenseBadgeClass(state) {
@@ -3970,6 +4112,102 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
     function formatTime(seconds) {
       if (!seconds) return "not available";
       return new Date(Number(seconds) * 1000).toLocaleString();
+    }
+
+    function showToast(title, message, tone = "success") {
+      const stack = document.getElementById("toast-stack");
+      const toast = document.createElement("div");
+      toast.className = `toast ${tone}`;
+      toast.innerHTML = `
+        <p class="text-sm font-semibold text-white">${html(title)}</p>
+        <p class="mt-1 text-xs text-zinc-400">${html(message)}</p>
+      `;
+      stack.appendChild(toast);
+      requestAnimationFrame(() => toast.classList.add("show"));
+      window.setTimeout(() => {
+        toast.classList.remove("show");
+        window.setTimeout(() => toast.remove(), 220);
+      }, tone === "error" ? 7600 : 4600);
+    }
+
+    function setButtonBusy(buttonOrId, busy, busyLabel) {
+      const button = typeof buttonOrId === "string" ? document.getElementById(buttonOrId) : buttonOrId;
+      if (!button) return;
+      if (!button.dataset.originalLabel) {
+        button.dataset.originalLabel = button.textContent.trim();
+      }
+      button.classList.toggle("button-busy", Boolean(busy));
+      button.disabled = Boolean(busy);
+      button.textContent = busy ? (busyLabel || "Working") : button.dataset.originalLabel;
+    }
+
+    function nodeTargetsFor(kind) {
+      const role = kind === "dns" ? "dns" : "smb_proxy";
+      return lastFleetNodes.filter((node) => node.role === role);
+    }
+
+    function setPushProgress(percent, detail) {
+      const safePercent = Math.max(0, Math.min(100, Number(percent || 0)));
+      document.getElementById("push-progress-fill").style.width = `${safePercent}%`;
+      document.getElementById("push-progress-percent").textContent = `${Math.round(safePercent)}%`;
+      if (detail) document.getElementById("push-progress-detail").textContent = detail;
+    }
+
+    function beginPushProgress(title, targets) {
+      const panel = document.getElementById("push-progress");
+      const targetCount = Array.isArray(targets) ? targets.length : 0;
+      document.getElementById("push-progress-title").textContent = title;
+      document.getElementById("push-progress-detail").textContent =
+        targetCount ? `Sending encrypted update to ${targetCount} node${targetCount === 1 ? "" : "s"}` : "Saving locally; no remote nodes targeted";
+      document.getElementById("push-progress-results").innerHTML = targetCount
+        ? targets.map((node) => `
+            <div class="flex items-center justify-between rounded-md border border-zinc-700 bg-zinc-950/50 px-3 py-2">
+              <span>${html(node.display_name || node.node_id)}</span>
+              <span class="text-sky-200">pending</span>
+            </div>
+          `).join("")
+        : `<div class="rounded-md border border-zinc-700 bg-zinc-950/50 px-3 py-2 text-zinc-400">No remote node target for this action.</div>`;
+      panel.classList.remove("hidden");
+      setPushProgress(targetCount ? 18 : 100);
+    }
+
+    function completePushProgress(results, localMessage) {
+      const items = Array.isArray(results) ? results : [];
+      const accepted = items.filter((item) => item.accepted).length;
+      const failed = items.length - accepted;
+      const tone = failed ? "warning" : "success";
+      const summary = items.length
+        ? `${accepted}/${items.length} nodes acknowledged the update`
+        : (localMessage || "Saved locally");
+      document.getElementById("push-progress-detail").textContent = summary;
+      document.getElementById("push-progress-results").innerHTML = items.length
+        ? items.map((item) => `
+            <div class="flex items-start justify-between gap-3 rounded-md border ${item.accepted ? "border-emerald-400/30 bg-emerald-500/10" : "border-red-400/35 bg-red-500/10"} px-3 py-2">
+              <div class="min-w-0">
+                <p class="truncate text-zinc-100">${html(item.node_id)}</p>
+                <p class="mt-1 text-[0.7rem] text-zinc-400">${html(item.message)}</p>
+              </div>
+              <span class="${item.accepted ? "text-emerald-200" : "text-red-200"}">${item.accepted ? "ack" : "failed"}</span>
+            </div>
+          `).join("")
+        : `<div class="rounded-md border border-zinc-700 bg-zinc-950/50 px-3 py-2 text-zinc-400">${html(localMessage || "No remote nodes were targeted.")}</div>`;
+      setPushProgress(100);
+      showToast(
+        failed ? "Update saved with node warnings" : "Update applied",
+        summary,
+        tone
+      );
+      if (!failed) {
+        window.setTimeout(() => document.getElementById("push-progress").classList.add("hidden"), 2600);
+      }
+    }
+
+    function failPushProgress(message) {
+      document.getElementById("push-progress-detail").textContent = message || "Update failed";
+      document.getElementById("push-progress-results").innerHTML =
+        `<div class="rounded-md border border-red-400/35 bg-red-500/10 px-3 py-2 text-red-100">${html(message || "Update failed")}</div>`;
+      setPushProgress(100);
+      showToast("Update failed", message || "The request did not complete.", "error");
     }
 
     function renderPolicyRuntime(runtime) {
@@ -4256,6 +4494,7 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
       const data = await response.json();
       clientIdentities = data.client_identities || {};
       const fleetNodes = data.fleet_nodes || [];
+      lastFleetNodes = fleetNodes;
       const stats = aggregateStats(data.stats, fleetNodes);
       updateLicenseUi(data.license);
       renderFleetNodes(data.node || {}, fleetNodes);
@@ -4670,61 +4909,110 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
     }
 
     async function addReputationEntry() {
+      const button = document.getElementById("rep-add-button");
+      const targets = nodeTargetsFor("smb");
+      setButtonBusy(button, true, "Adding");
+      beginPushProgress("Syncing reputation feed", targets);
       document.getElementById("reputation-state").textContent = "Adding reputation entry";
-      const response = await fetch("/api/reputation", {
-        method: "POST",
-        headers: authHeaders({ "Content-Type": "application/json" }),
-        body: JSON.stringify({
-          sha256: document.getElementById("rep-add-sha256").value.trim(),
-          md5: document.getElementById("rep-add-md5").value.trim() || null,
-          verdict: document.getElementById("rep-add-verdict").value,
-          notes: document.getElementById("rep-add-notes").value.trim(),
-          source: "Administrator"
-        })
-      });
-      const payload = await response.json().catch(() => ({ message: "add failed" }));
-      if (!response.ok) {
-        document.getElementById("reputation-state").textContent = payload.message || "Reputation add failed";
-        return;
+      setPushProgress(40, "Saving reputation entry on management server");
+      try {
+        const response = await fetch("/api/reputation", {
+          method: "POST",
+          headers: authHeaders({ "Content-Type": "application/json" }),
+          body: JSON.stringify({
+            sha256: document.getElementById("rep-add-sha256").value.trim(),
+            md5: document.getElementById("rep-add-md5").value.trim() || null,
+            verdict: document.getElementById("rep-add-verdict").value,
+            notes: document.getElementById("rep-add-notes").value.trim(),
+            source: "Administrator"
+          })
+        });
+        const payload = await response.json().catch(() => ({ message: "add failed" }));
+        if (!response.ok) {
+          document.getElementById("reputation-state").textContent = payload.message || "Reputation add failed";
+          failPushProgress(payload.message || "Reputation add failed");
+          return;
+        }
+        document.getElementById("rep-add-sha256").value = "";
+        document.getElementById("rep-add-md5").value = "";
+        document.getElementById("rep-add-notes").value = "";
+        document.getElementById("reputation-state").textContent =
+          `Reputation entry saved · ${describePushResults(payload.node_push_results)}`;
+        completePushProgress(payload.node_push_results, "Reputation entry saved locally");
+        await loadReputationCenter();
+        await refresh();
+      } catch (error) {
+        const message = `Reputation add failed: ${error.message || error}`;
+        document.getElementById("reputation-state").textContent = message;
+        failPushProgress(message);
+      } finally {
+        setButtonBusy(button, false);
       }
-      document.getElementById("rep-add-sha256").value = "";
-      document.getElementById("rep-add-md5").value = "";
-      document.getElementById("rep-add-notes").value = "";
-      await loadReputationCenter();
     }
 
     async function importReputationEntries() {
+      const button = document.getElementById("rep-import-button");
+      const targets = nodeTargetsFor("smb");
+      setButtonBusy(button, true, "Importing");
+      beginPushProgress("Importing and syncing reputation feed", targets);
       document.getElementById("reputation-state").textContent = "Importing reputation entries";
-      const response = await fetch("/api/reputation/import", {
-        method: "POST",
-        headers: authHeaders({ "Content-Type": "application/json" }),
-        body: JSON.stringify({
-          contents: document.getElementById("rep-import-contents").value,
-          source: "Manual Import"
-        })
-      });
-      const payload = await response.json().catch(() => ({ message: "import failed" }));
-      if (!response.ok) {
-        document.getElementById("reputation-state").textContent = payload.message || "Import failed";
-        return;
+      setPushProgress(40, "Parsing and saving imported reputation entries");
+      try {
+        const response = await fetch("/api/reputation/import", {
+          method: "POST",
+          headers: authHeaders({ "Content-Type": "application/json" }),
+          body: JSON.stringify({
+            contents: document.getElementById("rep-import-contents").value,
+            source: "Manual Import"
+          })
+        });
+        const payload = await response.json().catch(() => ({ message: "import failed" }));
+        if (!response.ok) {
+          document.getElementById("reputation-state").textContent = payload.message || "Import failed";
+          failPushProgress(payload.message || "Import failed");
+          return;
+        }
+        document.getElementById("reputation-state").textContent =
+          `Imported ${payload.imported || 0}, skipped ${payload.skipped || 0} · ${describePushResults(payload.node_push_results)}`;
+        completePushProgress(payload.node_push_results, "Reputation import saved locally");
+        await loadReputationCenter();
+        await refresh();
+      } catch (error) {
+        const message = `Import failed: ${error.message || error}`;
+        document.getElementById("reputation-state").textContent = message;
+        failPushProgress(message);
+      } finally {
+        setButtonBusy(button, false);
       }
-      document.getElementById("reputation-state").textContent =
-        `Imported ${payload.imported || 0}, skipped ${payload.skipped || 0}`;
-      await loadReputationCenter();
     }
 
     async function deleteReputationEntry(id) {
       if (!confirm("Delete this reputation entry?")) return;
-      const response = await fetch(`/api/reputation/${id}`, {
-        method: "DELETE",
-        headers: authHeaders()
-      });
-      if (!response.ok) {
+      const targets = nodeTargetsFor("smb");
+      beginPushProgress("Removing reputation entry and syncing feed", targets);
+      document.getElementById("reputation-state").textContent = "Deleting reputation entry";
+      setPushProgress(40, "Removing reputation entry on management server");
+      try {
+        const response = await fetch(`/api/reputation/${id}`, {
+          method: "DELETE",
+          headers: authHeaders()
+        });
         const payload = await response.json().catch(() => ({ message: "delete failed" }));
-        document.getElementById("reputation-state").textContent = payload.message || "Delete failed";
-        return;
+        if (!response.ok) {
+          document.getElementById("reputation-state").textContent = payload.message || "Delete failed";
+          failPushProgress(payload.message || "Delete failed");
+          return;
+        }
+        document.getElementById("reputation-state").textContent =
+          `Reputation entry deleted · ${describePushResults(payload.node_push_results)}`;
+        completePushProgress(payload.node_push_results, "Reputation entry deleted locally");
+        await loadReputationCenter();
+        await refresh();
+      } catch (error) {
+        const message = `Delete failed: ${error.message || error}`;
+        document.getElementById("reputation-state").textContent = message;
+        failPushProgress(message);
       }
-      await loadReputationCenter();
     }
 
     async function loadEnrollmentToken() {
@@ -4750,9 +5038,11 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
       try {
         await navigator.clipboard.writeText(value);
         document.getElementById("enrollment-token-state").textContent = `Token copied · ${new Date().toLocaleTimeString()}`;
+        showToast("Enrollment token copied", "Use it only during trusted node enrollment.", "success");
       } catch (_) {
         document.getElementById("enrollment-token-value").select();
         document.getElementById("enrollment-token-state").textContent = "Token selected";
+        showToast("Enrollment token selected", "Copy it manually from the field.", "warning");
       }
     }
 
@@ -4775,6 +5065,7 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
       document.getElementById("enrollment-token-value").value = payload.token || "";
       document.getElementById("enrollment-token-preview").textContent = payload.token_preview || "rotated";
       document.getElementById("enrollment-token-state").textContent = `Token rotated · management ${payload.management_url}`;
+      showToast("Enrollment token rotated", "Existing nodes must be re-enrolled with the new token.", "warning");
       await refresh();
     }
 
@@ -4788,9 +5079,11 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
       try {
         await navigator.clipboard.writeText(value);
         document.getElementById("license-install-state").textContent = `Activation request copied · ${new Date().toLocaleTimeString()}`;
+        showToast("Activation request copied", "Upload it to the customer portal to issue a license.", "success");
       } catch (_) {
         document.getElementById("license-activation-request").select();
         document.getElementById("license-install-state").textContent = "Activation request selected";
+        showToast("Activation request selected", "Copy it manually from the field.", "warning");
       }
     }
 
@@ -4827,6 +5120,7 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
       const filename = `axiom-${hostname}-${fingerprint}.axact`;
       downloadTextFile(filename, JSON.stringify(activationFile, null, 2), "application/vnd.axiom.activation+json");
       document.getElementById("license-install-state").textContent = `Activation file downloaded · ${new Date().toLocaleTimeString()}`;
+      showToast("Activation file downloaded", filename, "success");
     }
 
     async function submitLicenseText(licenseText, successMessage) {
@@ -4844,11 +5138,13 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
       const payload = await response.json().catch(() => ({ message: "license install failed" }));
       if (!response.ok) {
         document.getElementById("license-install-state").textContent = payload.message || "License install failed";
+        showToast("License install failed", payload.message || "License install failed", "error");
         return;
       }
 
       updateLicenseUi(payload);
       document.getElementById("license-install-state").textContent = successMessage || `License installed · ${new Date().toLocaleTimeString()}`;
+      showToast("License installed", payload.message || "Axiom license is active.", "success");
       await refresh();
     }
 
@@ -4895,23 +5191,40 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
     }
 
     async function saveDnsPolicy() {
+      const button = document.getElementById("save-dns-policy");
+      const targets = nodeTargetsFor("dns");
+      setButtonBusy(button, true, "Applying");
+      beginPushProgress("Applying DNS policy", targets);
       document.getElementById("dns-policy-state").textContent = "Saving DNS policy";
-      const response = await fetch("/api/dns-policy", {
-        method: "PUT",
-        headers: authHeaders({ "Content-Type": "application/json" }),
-        body: JSON.stringify(readDnsPolicyPayload())
-      });
+      setPushProgress(42, "Persisting DNS policy on management server");
+      try {
+        const response = await fetch("/api/dns-policy", {
+          method: "PUT",
+          headers: authHeaders({ "Content-Type": "application/json" }),
+          body: JSON.stringify(readDnsPolicyPayload())
+        });
 
-      const payload = await response.json().catch(() => ({ message: "DNS policy save failed" }));
-      if (!response.ok) {
-        document.getElementById("dns-policy-state").textContent = payload.message || "DNS policy save failed";
-        return;
+        const payload = await response.json().catch(() => ({ message: "DNS policy save failed" }));
+        if (!response.ok) {
+          document.getElementById("dns-policy-state").textContent = payload.message || "DNS policy save failed";
+          failPushProgress(payload.message || "DNS policy save failed");
+          return;
+        }
+
+        setPushProgress(78, "Waiting for node acknowledgements");
+        await loadDnsPolicy();
+        const pushSummary = describePushResults(payload.node_push_results);
+        document.getElementById("dns-policy-state").textContent =
+          `Saved and active on PID ${payload.process_id} · generation ${payload.dns_policy_runtime.generation} · ${pushSummary}`;
+        completePushProgress(payload.node_push_results, "DNS policy saved locally");
+        await refresh();
+      } catch (error) {
+        const message = `DNS policy save failed: ${error.message || error}`;
+        document.getElementById("dns-policy-state").textContent = message;
+        failPushProgress(message);
+      } finally {
+        setButtonBusy(button, false);
       }
-
-      await loadDnsPolicy();
-      document.getElementById("dns-policy-state").textContent =
-        `Saved and active on PID ${payload.process_id} · generation ${payload.dns_policy_runtime.generation} · ${describePushResults(payload.node_push_results)}`;
-      await refresh();
     }
 
     function readPolicyPayload() {
@@ -5019,24 +5332,41 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
     }
 
     async function savePolicies() {
+      const button = document.getElementById("save-policies");
+      const targets = nodeTargetsFor("smb");
+      setButtonBusy(button, true, "Applying");
+      beginPushProgress("Applying SMB policy and reputation feed", targets);
       document.getElementById("policy-state").textContent = "Saving policies";
-      const response = await fetch("/api/policies", {
-        method: "PUT",
-        headers: authHeaders({ "Content-Type": "application/json" }),
-        body: JSON.stringify(readPolicyPayload())
-      });
+      setPushProgress(42, "Persisting SMB policy on management server");
+      try {
+        const response = await fetch("/api/policies", {
+          method: "PUT",
+          headers: authHeaders({ "Content-Type": "application/json" }),
+          body: JSON.stringify(readPolicyPayload())
+        });
 
-      const payload = await response.json().catch(() => ({ message: "save failed" }));
-      if (!response.ok) {
-        document.getElementById("policy-state").textContent = payload.message || "Policy save failed";
-        return;
+        const payload = await response.json().catch(() => ({ message: "save failed" }));
+        if (!response.ok) {
+          document.getElementById("policy-state").textContent = payload.message || "Policy save failed";
+          failPushProgress(payload.message || "Policy save failed");
+          return;
+        }
+
+        setPushProgress(78, "Waiting for SMB node acknowledgements");
+        await loadPolicies();
+        renderPolicyRuntime(payload.policy_runtime);
+        const pushSummary = describePushResults(payload.node_push_results);
+        document.getElementById("policy-state").textContent =
+          `Saved and active on PID ${payload.process_id} · generation ${payload.policy_runtime.generation} · ${pushSummary}`;
+        completePushProgress(payload.node_push_results, "SMB policy saved locally");
+        await refresh();
+      } catch (error) {
+        const message = `Policy save failed: ${error.message || error}`;
+        document.getElementById("policy-state").textContent = message;
+        failPushProgress(message);
+      } finally {
+        setButtonBusy(button, false);
       }
-
-      await loadPolicies();
-      renderPolicyRuntime(payload.policy_runtime);
-      document.getElementById("policy-state").textContent =
-        `Saved and active on PID ${payload.process_id} · generation ${payload.policy_runtime.generation} · ${describePushResults(payload.node_push_results)}`;
-      await refresh();
     }
 
     async function runPolicySelfTest() {
@@ -5049,6 +5379,7 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
 
       if (!response.ok) {
         document.getElementById("self-test-state").textContent = payload.message || "Self-test failed";
+        showToast("Self-test failed", payload.message || "Policy self-test failed.", "error");
         return;
       }
 
@@ -5065,6 +5396,7 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
       }).join("");
       document.getElementById("self-test-state").textContent =
         `Self-test completed on PID ${payload.process_id}`;
+      showToast("Policy self-test completed", `${(payload.results || []).length} checks evaluated.`, "success");
     }
 
     async function loadDiagnostics() {
@@ -5074,6 +5406,7 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
 
       if (!response.ok) {
         document.getElementById("diagnostics-state").textContent = payload.message || "Diagnostics failed";
+        showToast("Diagnostics failed", payload.message || "Diagnostics request failed.", "error");
         return;
       }
 
@@ -5095,6 +5428,7 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
 
       document.getElementById("diagnostics-output").textContent = JSON.stringify(important, null, 2);
       document.getElementById("diagnostics-state").textContent = "Diagnostics loaded";
+      showToast("Diagnostics loaded", "Deployment and service state were refreshed.", "success");
     }
 
     function updateTlsSettingsUi(security, bindAddr) {
@@ -5150,6 +5484,7 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
 
       if (!response.ok) {
         document.getElementById("https-status").textContent = payload.message || "TLS settings were rejected";
+        showToast("TLS update failed", payload.message || "TLS settings were rejected.", "error");
         return;
       }
 
@@ -5169,6 +5504,11 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
       }
       document.getElementById("tls-restart-command").textContent =
         payload.restart_command || "sudo systemctl restart axiom.service";
+      showToast(
+        enabled ? "HTTPS activation scheduled" : "HTTP mode scheduled",
+        payload.next_url ? `Open ${payload.next_url} after restart.` : payload.message,
+        "warning"
+      );
     }
 
     function applyTheme(theme) {
@@ -5194,6 +5534,7 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
       localStorage.setItem("axiomTheme", theme);
       applyTheme(theme);
       document.getElementById("settings-state").textContent = `Settings saved locally · ${new Date().toLocaleTimeString()}`;
+      showToast("Settings saved", "Local display preferences were updated.", "success");
     }
 
     document.getElementById("logout").addEventListener("click", async () => {
