@@ -4273,7 +4273,7 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
             <ul class="mt-4 grid gap-2 text-sm text-zinc-300">
               <li>Management process, role, and node identity</li>
               <li>Fleet nodes, listener state, and policy warnings</li>
-              <li>SMB route stats, active connections, and file activity</li>
+              <li>SMB route stats, active connections, file activity, and inspection proof</li>
               <li>DNS listener, upstream health, and recent DNS events</li>
               <li>Selected command outputs for troubleshooting</li>
             </ul>
@@ -4371,6 +4371,53 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
               </tr>
             </thead>
             <tbody id="live-connections-body" class="divide-y divide-zinc-800"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="mt-8 rounded-lg border border-emerald-400/30 bg-zinc-900">
+        <div class="flex flex-col gap-2 border-b border-zinc-800 px-6 py-5 md:flex-row md:items-end md:justify-between">
+          <div>
+            <p class="text-sm font-semibold uppercase tracking-wider text-emerald-300">Proxy Path Proof</p>
+            <h2 class="mt-2 text-xl font-semibold text-white">Live Inspection Proof</h2>
+            <p id="inspection-proof-state" class="mt-1 text-sm text-zinc-400">Waiting for SMB CREATE/WRITE/CLOSE evidence</p>
+          </div>
+          <p id="inspection-proof-count" class="text-sm text-zinc-500">0 proof records</p>
+        </div>
+
+        <div class="grid gap-4 border-b border-zinc-800 px-6 py-5 md:grid-cols-4">
+          <div class="rounded-md border border-zinc-800 bg-zinc-950/50 p-4">
+            <p class="text-xs font-semibold uppercase tracking-wider text-zinc-500">Observed Files</p>
+            <p id="proof-observed-count" class="mt-2 text-2xl font-semibold text-white">0</p>
+          </div>
+          <div class="rounded-md border border-zinc-800 bg-zinc-950/50 p-4">
+            <p class="text-xs font-semibold uppercase tracking-wider text-zinc-500">Hashed Streams</p>
+            <p id="proof-hashed-count" class="mt-2 text-2xl font-semibold text-emerald-200">0</p>
+          </div>
+          <div class="rounded-md border border-zinc-800 bg-zinc-950/50 p-4">
+            <p class="text-xs font-semibold uppercase tracking-wider text-zinc-500">Blocked Proofs</p>
+            <p id="proof-blocked-count" class="mt-2 text-2xl font-semibold text-red-200">0</p>
+          </div>
+          <div class="rounded-md border border-zinc-800 bg-zinc-950/50 p-4">
+            <p class="text-xs font-semibold uppercase tracking-wider text-zinc-500">Known-bad Feed</p>
+            <p id="proof-known-bad-loaded" class="mt-2 text-2xl font-semibold text-cyan-200">0</p>
+          </div>
+        </div>
+
+        <div class="overflow-x-auto">
+          <table class="min-w-full divide-y divide-zinc-800">
+            <thead class="bg-zinc-950/60">
+              <tr>
+                <th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-zinc-400">File</th>
+                <th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-zinc-400">Client -> Target</th>
+                <th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-zinc-400">Proof State</th>
+                <th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-zinc-400">Streamed Bytes</th>
+                <th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-zinc-400">Hash / Reputation</th>
+                <th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-zinc-400">Runtime</th>
+                <th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-zinc-400">Updated</th>
+              </tr>
+            </thead>
+            <tbody id="inspection-proof-body" class="divide-y divide-zinc-800"></tbody>
           </table>
         </div>
       </section>
@@ -5151,6 +5198,20 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
       return "border-emerald-400/40 bg-emerald-500/10 text-emerald-100";
     }
 
+    function proofBadgeClass(state) {
+      if (state === "blocked" || state === "known_bad") return "border-red-400/40 bg-red-500/10 text-red-100";
+      if (state === "monitored" || state === "unknown") return "border-amber-400/40 bg-amber-500/10 text-amber-100";
+      if (state === "hashed" || state === "known_good") return "border-emerald-400/40 bg-emerald-500/10 text-emerald-100";
+      if (state === "hashing") return "border-cyan-400/40 bg-cyan-500/10 text-cyan-100";
+      return "border-zinc-700 bg-zinc-950 text-zinc-300";
+    }
+
+    function shortHash(value) {
+      const raw = text(value);
+      if (raw === "—" || raw.length <= 18) return raw;
+      return `${raw.slice(0, 10)}…${raw.slice(-8)}`;
+    }
+
     function readinessTone(status) {
       if (status === "pass") return {
         row: "border-emerald-400/30 bg-emerald-500/10",
@@ -5692,12 +5753,12 @@ DNS node -> upstream resolvers: UDP/TCP 53`;
         numericKeys.forEach((key) => {
           stats[key] = numberStat(stats, key) + numberStat(remote, key);
         });
-        ["route_stats", "active_connection_details", "file_activity", "recent_threats", "recent_audit_events", "recent_dns_events"].forEach((key) => {
+        ["route_stats", "active_connection_details", "file_activity", "inspection_proofs", "recent_threats", "recent_audit_events", "recent_dns_events"].forEach((key) => {
           stats[key] = [...(stats[key] || []), ...(remote[key] || [])];
         });
       });
 
-      ["recent_threats", "recent_audit_events", "recent_dns_events", "active_connection_details", "file_activity"].forEach((key) => {
+      ["recent_threats", "recent_audit_events", "recent_dns_events", "active_connection_details", "file_activity", "inspection_proofs"].forEach((key) => {
         stats[key] = (stats[key] || [])
           .slice()
           .sort((left, right) => Number(right.last_activity_unix_timestamp_seconds || right.unix_timestamp_seconds || 0) - Number(left.last_activity_unix_timestamp_seconds || left.unix_timestamp_seconds || 0))
@@ -6139,6 +6200,68 @@ DNS node -> upstream resolvers: UDP/TCP 53`;
                 <span class="rounded-full border px-2.5 py-1 text-xs font-semibold uppercase ${actionClass}">${text(connection.last_action)}</span>
                 <p class="mt-2 text-xs text-zinc-500">${formatTime(connection.last_activity_unix_timestamp_seconds)}</p>
               </td>
+            </tr>
+          `;
+        }).join("");
+      }
+
+      const inspectionProofs = stats.inspection_proofs || [];
+      const proofBody = document.getElementById("inspection-proof-body");
+      const hashedProofs = inspectionProofs.filter((proof) =>
+        proof.sha256 || proof.state === "hashed" || proof.state === "known_good" || proof.state === "known_bad" || proof.state === "blocked"
+      );
+      const blockedProofs = inspectionProofs.filter((proof) => proof.state === "blocked" || proof.last_policy_action === "block");
+      document.getElementById("inspection-proof-count").textContent = `${inspectionProofs.length} proof records`;
+      document.getElementById("proof-observed-count").textContent = inspectionProofs.length;
+      document.getElementById("proof-hashed-count").textContent = hashedProofs.length;
+      document.getElementById("proof-blocked-count").textContent = blockedProofs.length;
+      document.getElementById("proof-known-bad-loaded").textContent = stats.known_bad_reputation_hashes_loaded || 0;
+      document.getElementById("inspection-proof-state").textContent = inspectionProofs.length
+        ? `Latest proof ${formatTime(inspectionProofs[0].last_activity_unix_timestamp_seconds)}`
+        : "Waiting for SMB CREATE/WRITE/CLOSE evidence";
+
+      if (!inspectionProofs.length) {
+        proofBody.innerHTML = `<tr><td colspan="7" class="px-6 py-6 text-sm text-zinc-400">No SMB inspection proof records yet. Copy a file through the SMB node to generate evidence.</td></tr>`;
+      } else {
+        proofBody.innerHTML = inspectionProofs.slice(0, 80).map((proof) => {
+          const state = text(proof.state);
+          const stateLabel = state.replaceAll("_", " ");
+          const stateClass = proofBadgeClass(state);
+          const proofBytes = Math.max(Number(proof.bytes_observed || 0), Number(proof.smb_write_bytes || 0));
+          const reputation = proof.reputation_verdict
+            ? `${text(proof.reputation_verdict)} · ${text(proof.reputation_action)}`
+            : (proof.last_policy_rule ? `${text(proof.last_policy_action)} · ${text(proof.last_policy_rule)}` : "pending");
+          const hashText = proof.sha256
+            ? `sha256 ${shortHash(proof.sha256)}`
+            : "hash pending";
+          return `
+            <tr class="hover:bg-zinc-800/40">
+              <td class="max-w-xs px-6 py-4 text-sm font-medium text-white">
+                <p class="truncate">${html(proof.file_path)}</p>
+                <p class="mt-1 text-xs text-zinc-500">${html(proof.route_name)} · ${html(proof.interface)} · ${html(proof.mime_type)}</p>
+              </td>
+              <td class="whitespace-nowrap px-6 py-4 text-sm text-zinc-300">
+                <p>${html(clientLabel(proof.peer_addr))}</p>
+                <p class="mt-1 text-xs text-cyan-200">→ ${html(proof.target_addr)}</p>
+              </td>
+              <td class="min-w-80 px-6 py-4 text-sm text-zinc-300">
+                <span class="rounded-full border px-2.5 py-1 text-xs font-semibold uppercase ${stateClass}">${html(stateLabel)}</span>
+                <p class="mt-2 line-clamp-2 text-zinc-400">${html(proof.proof)}</p>
+              </td>
+              <td class="whitespace-nowrap px-6 py-4 text-sm text-lime-200">
+                <p>${formatBytes(proofBytes)}</p>
+                <p class="mt-1 text-xs text-zinc-500">${text(proof.smb_write_requests || 0)} writes · last frame ${formatBytes(proof.last_smb_frame_bytes || 0)}</p>
+              </td>
+              <td class="min-w-72 px-6 py-4 text-sm text-zinc-300">
+                <p class="font-mono text-xs text-emerald-200">${html(hashText)}</p>
+                <p class="mt-1 text-xs text-zinc-500">md5 ${html(shortHash(proof.md5))}</p>
+                <p class="mt-1 text-xs text-zinc-400">${html(reputation)}</p>
+              </td>
+              <td class="whitespace-nowrap px-6 py-4 text-sm text-zinc-300">
+                <p>policy gen ${text(proof.policy_generation)}</p>
+                <p class="mt-1 text-xs text-zinc-500">${text(proof.known_bad_reputation_hashes_loaded)} known-bad hashes</p>
+              </td>
+              <td class="whitespace-nowrap px-6 py-4 text-xs text-zinc-500">${formatTime(proof.last_activity_unix_timestamp_seconds)}</td>
             </tr>
           `;
         }).join("");
@@ -6922,6 +7045,7 @@ DNS node -> upstream resolvers: UDP/TCP 53`;
         route_stats: status.route_stats || [],
         active_connection_details: status.active_connection_details || [],
         file_activity: status.file_activity || [],
+        inspection_proofs: status.inspection_proofs || [],
         recent_dns_events: status.recent_dns_events || [],
         commands: payload.command_outputs
       };

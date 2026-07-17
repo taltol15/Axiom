@@ -77,10 +77,12 @@ From a Windows test workstation:
 1. Browse to `\\<smb-node-ip>\<share>`.
 2. Copy a normal file.
 3. Confirm SMB Protected Traffic increases in the Overview page.
-4. Confirm the file appears under SMB Protection -> File transfer ledger.
-5. Add the file hash as `known_bad` in Security -> Reputation Center.
-6. Set SMB reputation action to `block`.
-7. Copy the same file again and confirm the transfer is blocked.
+4. Confirm SMB Protection -> Live Inspection Proof shows the file as observed,
+   hashing, and then hashed with SHA256/MD5.
+5. Confirm the file appears under SMB Protection -> File transfer ledger.
+6. Add the file hash as `known_bad` in Security -> Reputation Center.
+7. Set SMB reputation action to `block`.
+8. Copy the same file again and confirm the transfer is blocked.
 
 ## DNS Validation
 
@@ -105,4 +107,3 @@ Use the Management UI for:
 - Backup and restore
 
 Use SSH only for OS-level maintenance or support troubleshooting.
-

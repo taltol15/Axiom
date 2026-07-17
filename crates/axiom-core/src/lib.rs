@@ -19,6 +19,7 @@ const MAX_RETAINED_AUDIT_EVENTS: usize = 512;
 const MAX_RETAINED_DNS_EVENTS: usize = 512;
 const MAX_RETAINED_FILE_HASH_EVENTS: usize = 512;
 const MAX_TRACKED_FILE_ACTIVITIES: usize = 512;
+const MAX_TRACKED_INSPECTION_PROOFS: usize = 512;
 const ARCHIVE_MAX_PATTERN_LEN: usize = 8;
 const STREAM_INSPECTION_TAIL_LEN: usize = 4096;
 const AUDIT_LOG_PATH: &str = "/var/log/axiom/audit.jsonl";
@@ -36,6 +37,7 @@ pub struct AppState {
     route_stats: Mutex<HashMap<String, RouteRuntimeStats>>,
     active_connections: Mutex<HashMap<String, ActiveConnectionStats>>,
     file_activity: Mutex<HashMap<String, FileActivityStats>>,
+    inspection_proofs: Mutex<HashMap<String, SmbInspectionProof>>,
     recent_threats: Mutex<VecDeque<ThreatEvent>>,
     recent_audit_events: Mutex<VecDeque<AuditEvent>>,
     recent_dns_events: Mutex<VecDeque<DnsQueryEvent>>,
@@ -57,6 +59,7 @@ impl AppState {
             route_stats: Mutex::new(HashMap::new()),
             active_connections: Mutex::new(HashMap::new()),
             file_activity: Mutex::new(HashMap::new()),
+            inspection_proofs: Mutex::new(HashMap::new()),
             recent_threats: Mutex::new(VecDeque::with_capacity(MAX_RETAINED_THREAT_EVENTS)),
             recent_audit_events: Mutex::new(VecDeque::with_capacity(MAX_RETAINED_AUDIT_EVENTS)),
             recent_dns_events: Mutex::new(VecDeque::with_capacity(MAX_RETAINED_DNS_EVENTS)),
@@ -305,6 +308,11 @@ impl AppState {
             activity.last_rule_name = None;
             activity.last_bytes_in_chunk = Some(bytes_in_chunk);
         });
+        self.record_smb_inspection_proof(context, &file_path, |proof| {
+            proof.state = SmbInspectionProofState::Observed;
+            proof.proof = "SMB CREATE observed on the Axiom proxy path".to_string();
+            proof.last_smb_frame_bytes = Some(bytes_in_chunk);
+        });
         self.upsert_active_connection(context, |connection| {
             connection.last_file_path = Some(file_path.clone());
             connection.observed_file_events += 1;
@@ -368,6 +376,14 @@ impl AppState {
             activity.last_rule_name = None;
             activity.last_bytes_in_chunk = Some(bytes);
         });
+        self.record_smb_inspection_proof(context, file_path, |proof| {
+            proof.state = SmbInspectionProofState::Hashing;
+            proof.proof = "SMB WRITE payload observed and included in streaming hash".to_string();
+            proof.smb_write_requests += 1;
+            proof.smb_write_bytes = proof.smb_write_bytes.saturating_add(bytes);
+            proof.bytes_observed = proof.bytes_observed.saturating_add(bytes);
+            proof.last_smb_frame_bytes = Some(bytes);
+        });
         self.upsert_active_connection(context, |connection| {
             connection.last_file_path = Some(file_path.to_string());
         });
@@ -385,6 +401,26 @@ impl AppState {
             target_addr: transfer.target_addr,
             file_path_hint: Some(&transfer.file_name),
         };
+        let file_name = transfer.file_name.clone();
+        let sha256 = transfer.sha256.clone();
+        let md5 = transfer.md5.clone();
+        let extension = transfer.extension.clone();
+        let mime_type = transfer.mime_type.clone();
+        let file_size = transfer.file_size;
+
+        self.record_smb_inspection_proof(&context, &file_name, |proof| {
+            if proof.state != SmbInspectionProofState::Blocked {
+                proof.state = SmbInspectionProofState::Hashed;
+            }
+            proof.proof = "SMB file stream observed by Axiom and SHA256/MD5 finalized".to_string();
+            proof.bytes_observed = proof.bytes_observed.max(file_size);
+            proof.sha256 = Some(sha256);
+            proof.md5 = Some(md5);
+            proof.extension = extension;
+            proof.mime_type = mime_type;
+            proof.completed_unix_timestamp_seconds = Some(unix_timestamp_seconds());
+        });
+
         self.push_audit_event(AuditEvent::from_context(
             &context,
             AuditEventKind::FileHashCompleted,
@@ -457,6 +493,21 @@ impl AppState {
             target_addr: transfer.target_addr,
             file_path_hint: Some(&transfer.file_name),
         };
+        self.record_smb_inspection_proof(&context, &transfer.file_name, |proof| {
+            proof.reputation_verdict = Some(verdict);
+            proof.reputation_action = Some(action);
+            proof.proof = reason.clone();
+            proof.reputation_checked_unix_timestamp_seconds = Some(unix_timestamp_seconds());
+            proof.state = match (verdict, action) {
+                (
+                    ReputationVerdict::KnownBad,
+                    KnownBadAction::Block | KnownBadAction::Quarantine,
+                ) => SmbInspectionProofState::Blocked,
+                (ReputationVerdict::KnownBad, _) => SmbInspectionProofState::KnownBad,
+                (ReputationVerdict::KnownGood, _) => SmbInspectionProofState::KnownGood,
+                (ReputationVerdict::Unknown, _) => SmbInspectionProofState::Unknown,
+            };
+        });
         let severity = match verdict {
             ReputationVerdict::KnownBad => AuditSeverity::Critical,
             ReputationVerdict::Unknown => AuditSeverity::Warning,
@@ -764,6 +815,7 @@ impl AppState {
             route_stats: self.route_snapshots(),
             active_connection_details: self.active_connection_snapshots(),
             file_activity: self.file_activity_snapshots(),
+            inspection_proofs: self.inspection_proof_snapshots(),
             recent_threats,
             recent_audit_events,
             recent_dns_events,
@@ -891,6 +943,20 @@ impl AppState {
             activity.last_reason = event.reason.clone();
             activity.last_rule_name = Some(event.rule_name.clone());
             activity.last_bytes_in_chunk = Some(event.bytes_in_chunk as u64);
+        });
+        self.record_smb_inspection_proof(&context, &file_path_hint, |proof| {
+            proof.state = match event.action {
+                PolicyMode::Block => SmbInspectionProofState::Blocked,
+                PolicyMode::Monitor => SmbInspectionProofState::Monitored,
+                PolicyMode::Disabled => proof.state,
+            };
+            proof.proof = event.reason.clone();
+            proof.last_policy_rule = Some(event.rule_name.clone());
+            proof.last_policy_action = Some(policy_mode_label(event.action).to_string());
+            proof.last_smb_frame_bytes = Some(event.bytes_in_chunk as u64);
+            if let Some(sha256) = extract_sha256_hint(&event.reason) {
+                proof.sha256 = Some(sha256);
+            }
         });
     }
 
@@ -1025,6 +1091,105 @@ impl AppState {
         });
         snapshots
     }
+
+    fn inspection_proof_snapshots(&self) -> Vec<SmbInspectionProof> {
+        let mut snapshots: Vec<_> = self
+            .inspection_proofs
+            .lock()
+            .expect("inspection proofs mutex poisoned")
+            .values()
+            .cloned()
+            .collect();
+
+        snapshots.sort_by(|left, right| {
+            right
+                .last_activity_unix_timestamp_seconds
+                .cmp(&left.last_activity_unix_timestamp_seconds)
+                .then_with(|| left.file_path.cmp(&right.file_path))
+        });
+        snapshots
+    }
+
+    fn record_smb_inspection_proof(
+        &self,
+        context: &InspectionContext<'_>,
+        file_path: &str,
+        update: impl FnOnce(&mut SmbInspectionProof),
+    ) {
+        let key = inspection_proof_key(
+            context.route_name,
+            context.peer_addr,
+            context.target_addr,
+            file_path,
+        );
+        let now = unix_timestamp_seconds();
+        let policy_generation = self.policy_generation.load(Ordering::Relaxed);
+        let known_bad_hash_count = self.known_bad_reputation_hash_count();
+        let extension = file_extension(file_path);
+        let mime_type = extension.as_deref().map(guess_mime_type);
+
+        let mut proofs = self
+            .inspection_proofs
+            .lock()
+            .expect("inspection proofs mutex poisoned");
+
+        if !proofs.contains_key(&key)
+            && proofs.len() >= MAX_TRACKED_INSPECTION_PROOFS
+            && let Some(oldest_key) = proofs
+                .iter()
+                .min_by_key(|(_, proof)| proof.last_activity_unix_timestamp_seconds)
+                .map(|(proof_key, _)| proof_key.clone())
+        {
+            proofs.remove(&oldest_key);
+        }
+
+        let proof = proofs
+            .entry(key.clone())
+            .or_insert_with(|| SmbInspectionProof {
+                inspection_id: key,
+                route_name: context.route_name.to_string(),
+                interface: context.interface.to_string(),
+                direction: context.direction,
+                peer_addr: context.peer_addr,
+                target_addr: context.target_addr,
+                destination_share: Some(context.route_name.to_string()),
+                source_user: None,
+                file_path: file_path.to_string(),
+                state: SmbInspectionProofState::Observed,
+                proof: "SMB file flow observed on the Axiom proxy path".to_string(),
+                bytes_observed: 0,
+                smb_write_requests: 0,
+                smb_write_bytes: 0,
+                last_smb_frame_bytes: None,
+                sha256: None,
+                md5: None,
+                extension: extension.clone(),
+                mime_type: mime_type.clone(),
+                reputation_verdict: None,
+                reputation_action: None,
+                last_policy_rule: None,
+                last_policy_action: None,
+                policy_generation,
+                known_bad_reputation_hashes_loaded: known_bad_hash_count,
+                first_seen_unix_timestamp_seconds: now,
+                last_activity_unix_timestamp_seconds: now,
+                completed_unix_timestamp_seconds: None,
+                reputation_checked_unix_timestamp_seconds: None,
+            });
+
+        proof.route_name = context.route_name.to_string();
+        proof.interface = context.interface.to_string();
+        proof.direction = context.direction;
+        proof.peer_addr = context.peer_addr;
+        proof.target_addr = context.target_addr;
+        proof.file_path = file_path.to_string();
+        proof.extension = proof.extension.clone().or(extension);
+        proof.mime_type = proof.mime_type.clone().or(mime_type);
+        proof.policy_generation = policy_generation;
+        proof.known_bad_reputation_hashes_loaded = known_bad_hash_count;
+        update(proof);
+        proof.last_activity_unix_timestamp_seconds = now;
+    }
 }
 
 impl Default for AppState {
@@ -1107,6 +1272,7 @@ pub struct StatusSnapshot {
     pub route_stats: Vec<RouteStatsSnapshot>,
     pub active_connection_details: Vec<ActiveConnectionStats>,
     pub file_activity: Vec<FileActivityStats>,
+    pub inspection_proofs: Vec<SmbInspectionProof>,
     pub recent_threats: Vec<ThreatEvent>,
     pub recent_audit_events: Vec<AuditEvent>,
     pub recent_dns_events: Vec<DnsQueryEvent>,
@@ -1220,6 +1386,52 @@ pub struct FileActivityStats {
     pub last_rule_name: Option<String>,
     pub last_bytes_in_chunk: Option<u64>,
     pub last_activity_unix_timestamp_seconds: u64,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SmbInspectionProofState {
+    Observed,
+    Hashing,
+    Hashed,
+    KnownGood,
+    KnownBad,
+    Unknown,
+    Monitored,
+    Blocked,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SmbInspectionProof {
+    pub inspection_id: String,
+    pub route_name: String,
+    pub interface: String,
+    pub direction: TrafficDirection,
+    pub peer_addr: SocketAddr,
+    pub target_addr: SocketAddr,
+    pub destination_share: Option<String>,
+    pub source_user: Option<String>,
+    pub file_path: String,
+    pub state: SmbInspectionProofState,
+    pub proof: String,
+    pub bytes_observed: u64,
+    pub smb_write_requests: u64,
+    pub smb_write_bytes: u64,
+    pub last_smb_frame_bytes: Option<u64>,
+    pub sha256: Option<String>,
+    pub md5: Option<String>,
+    pub extension: Option<String>,
+    pub mime_type: Option<String>,
+    pub reputation_verdict: Option<ReputationVerdict>,
+    pub reputation_action: Option<KnownBadAction>,
+    pub last_policy_rule: Option<String>,
+    pub last_policy_action: Option<String>,
+    pub policy_generation: u64,
+    pub known_bad_reputation_hashes_loaded: usize,
+    pub first_seen_unix_timestamp_seconds: u64,
+    pub last_activity_unix_timestamp_seconds: u64,
+    pub completed_unix_timestamp_seconds: Option<u64>,
+    pub reputation_checked_unix_timestamp_seconds: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2334,8 +2546,54 @@ fn extract_file_path_hint(reason: &str) -> Option<String> {
     Some(reason[start + 1..start + 1 + end].to_string())
 }
 
+fn extract_sha256_hint(reason: &str) -> Option<String> {
+    reason
+        .split(|character: char| !character.is_ascii_hexdigit())
+        .map(str::trim)
+        .find(|token| token.len() == 64 && token.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .map(|token| token.to_ascii_lowercase())
+}
+
 fn file_activity_key(route_name: &str, peer_addr: SocketAddr, file_path: &str) -> String {
     format!("{route_name}|{}|{file_path}", peer_addr.ip())
+}
+
+fn inspection_proof_key(
+    route_name: &str,
+    peer_addr: SocketAddr,
+    target_addr: SocketAddr,
+    file_path: &str,
+) -> String {
+    format!("{route_name}|{peer_addr}|{target_addr}|{file_path}")
+}
+
+fn file_extension(file_path: &str) -> Option<String> {
+    let name = file_path.rsplit(['\\', '/']).next().unwrap_or(file_path);
+    name.rsplit_once('.')
+        .map(|(_, extension)| extension.to_ascii_lowercase())
+        .filter(|extension| !extension.is_empty())
+}
+
+fn guess_mime_type(extension: &str) -> String {
+    match extension {
+        "txt" | "log" | "csv" => "text/plain",
+        "pdf" => "application/pdf",
+        "zip" => "application/zip",
+        "rar" => "application/vnd.rar",
+        "7z" => "application/x-7z-compressed",
+        "exe" | "dll" => "application/vnd.microsoft.portable-executable",
+        "doc" => "application/msword",
+        "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "xls" => "application/vnd.ms-excel",
+        "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "ppt" => "application/vnd.ms-powerpoint",
+        "pptx" => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        "jpg" | "jpeg" => "image/jpeg",
+        "png" => "image/png",
+        "gif" => "image/gif",
+        _ => "application/octet-stream",
+    }
+    .to_string()
 }
 
 fn active_connection_key(
@@ -2601,6 +2859,59 @@ mod tests {
         let result = policy.inspect_chunk(&context, chunk);
 
         assert!(matches!(result, InspectionResult::Allow { .. }));
+    }
+
+    #[test]
+    fn records_smb_inspection_proof_lifecycle() {
+        let state = AppState::default();
+        let context = test_context();
+
+        state.record_file_observed(&context, "tal.txt".to_string(), 128);
+        state.record_file_write_payload(&context, "tal.txt", 11);
+
+        let snapshot = state.snapshot();
+        let proof = snapshot
+            .inspection_proofs
+            .first()
+            .expect("inspection proof should be recorded");
+        assert_eq!(proof.state, SmbInspectionProofState::Hashing);
+        assert_eq!(proof.file_path, "tal.txt");
+        assert_eq!(proof.bytes_observed, 11);
+        assert_eq!(proof.smb_write_requests, 1);
+
+        state.record_completed_file_transfer(CompletedFileTransfer {
+            route_name: context.route_name.to_string(),
+            interface: context.interface.to_string(),
+            direction: context.direction,
+            peer_addr: context.peer_addr,
+            target_addr: context.target_addr,
+            destination_share: Some(context.route_name.to_string()),
+            source_user: None,
+            file_name: "tal.txt".to_string(),
+            extension: Some("txt".to_string()),
+            mime_type: Some("text/plain".to_string()),
+            file_size: 11,
+            creation_time: None,
+            upload_timestamp: unix_timestamp_seconds(),
+            sha256: "49bbb5aac03470e74bbb4f7d6183073b1220f44c089b1f566dc502f777de674e".to_string(),
+            md5: "a743c7623fdcc26a4e84a36707066ba5".to_string(),
+        });
+
+        let snapshot = state.snapshot();
+        let proof = snapshot
+            .inspection_proofs
+            .first()
+            .expect("inspection proof should still be retained");
+        assert_eq!(proof.state, SmbInspectionProofState::Hashed);
+        assert_eq!(
+            proof.sha256.as_deref(),
+            Some("49bbb5aac03470e74bbb4f7d6183073b1220f44c089b1f566dc502f777de674e")
+        );
+        assert_eq!(
+            proof.md5.as_deref(),
+            Some("a743c7623fdcc26a4e84a36707066ba5")
+        );
+        assert_eq!(proof.mime_type.as_deref(), Some("text/plain"));
     }
 
     #[test]

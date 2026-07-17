@@ -53,15 +53,20 @@ sudo ss -ltnp | egrep ':445|:9443'
 1. From Windows, browse to `\\<smb-node-ip>\<share>`.
 2. Copy a normal file larger than 40 MB.
 3. Confirm Overview -> SMB Protected Traffic increases by roughly that size.
-4. Confirm SMB Protection -> File transfer ledger shows the file.
-5. Add the file SHA256 as `known_bad` in Security -> Reputation Center.
-6. Set SMB reputation policy action to `block`.
-7. Copy the same file again.
+4. Confirm SMB Protection -> Live Inspection Proof shows the file with:
+   - `hashing` while data is flowing.
+   - `hashed` after the SMB close/finalization is observed.
+   - SHA256/MD5 populated for the file stream.
+5. Confirm SMB Protection -> File transfer ledger shows the file.
+6. Add the file SHA256 as `known_bad` in Security -> Reputation Center.
+7. Set SMB reputation policy action to `block`.
+8. Copy the same file again.
 
 Expected:
 
 - Windows copy is interrupted.
 - Global Audit Log shows `REPUTATION VERDICT` with action `BLOCK`.
+- SMB Protection -> Live Inspection Proof shows `blocked` for the file.
 - SMB node logs include `blocked SMB frame by known bad reputation hash`.
 
 ## Phase 3 - DNS Node
@@ -133,4 +138,3 @@ Before calling the build ready:
    - Security -> Reputation Center
    - Global Audit Log
    - Support -> Release Readiness
-

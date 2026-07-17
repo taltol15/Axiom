@@ -82,6 +82,11 @@ If counters stay at zero, verify clients connect to the SMB node IP, not the
 backend NAS IP. Also check for NAT or forwarding rules that bypass the user-space
 proxy.
 
+In the management UI, use SMB Protection -> Live Inspection Proof to confirm the
+proxy observed SMB CREATE/WRITE/CLOSE activity for the file. A healthy upload
+should move from `observed` to `hashing` and then `hashed`. A reputation block
+should show `blocked` with the matching SHA256.
+
 ## DNS Troubleshooting
 
 On the DNS node:
@@ -123,4 +128,3 @@ sudo ./install.sh --repair
 
 Use repair when the service binary, systemd unit, restart helper, or Linux
 capabilities need to be refreshed while preserving customer configuration.
-
