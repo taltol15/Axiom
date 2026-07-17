@@ -4,8 +4,8 @@ This guide describes the recommended production-style deployment for Axiom.
 
 ## Recommended Topology
 
-Axiom supports single-server lab mode, but production deployments should split
-roles across at least three servers:
+Axiom supports single-server evaluation mode, but production deployments should
+split roles across at least three servers:
 
 ```text
 Axiom Management Server  - Web UI, licensing, policies, reputation, node registry
@@ -55,6 +55,9 @@ internet access should stay on the DC or the organization's DNS egress path.
 7. Configure SMB and DNS policies.
 8. Activate the customer license under Settings -> License Activation.
 
+Use `docs/CUSTOMER_INSTALLATION_GUIDE.md` for the full installation walkthrough
+and `docs/VALIDATION_TEST_PLAN.md` for acceptance testing.
+
 ## Upgrade and Repair
 
 For a normal source update:
@@ -96,4 +99,3 @@ Remove service, binaries, configuration, logs, and state:
 ```bash
 sudo ./install.sh --uninstall --purge
 ```
-

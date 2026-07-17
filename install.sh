@@ -373,7 +373,7 @@ select_node_role() {
       "management" "Central Web UI, policy control plane, node registry" \
       "dns" "DNS Security data-plane node managed by a central server" \
       "smb_proxy" "SMB Reverse Proxy data-plane node managed by a central server" \
-      "standalone_lab" "Single-server lab mode: management + optional DNS + SMB" \
+      "standalone_lab" "Single-server evaluation mode: management + optional DNS + SMB" \
       3>&1 1>&2 2>&3)" || exit 1
     return
   fi
@@ -383,7 +383,7 @@ select_node_role() {
   echo "  1) management      Central Web UI and policy control plane"
   echo "  2) dns             DNS Security data-plane node"
   echo "  3) smb_proxy       SMB Reverse Proxy data-plane node"
-  echo "  4) standalone_lab  Single-server lab mode"
+  echo "  4) standalone_lab  Single-server evaluation mode"
   while true; do
     read -r -p "Select role [1-4]: " role_selection
     case "${role_selection}" in

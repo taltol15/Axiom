@@ -1,12 +1,13 @@
 # Axiom
 
-Axiom is an enterprise SMB reverse proxy and DNS security gateway MVP for Linux
-deployments with a dedicated management NIC, isolated SMB proxy NICs, and an
-optional DNS NIC that can sit in front of internal DC DNS resolvers.
+Axiom is an enterprise SMB reverse proxy and DNS security gateway for Linux
+deployments. It protects file-server traffic through inline SMB inspection,
+centralized reputation, policy enforcement, DNS filtering, and a dedicated
+management console.
 
 ## Deployment Roles
 
-The recommended production-style lab uses at least three Axiom servers:
+The recommended production deployment uses at least three Axiom servers:
 
 ```text
 Axiom Management Server  - Web UI, policy control plane, node registry
@@ -20,7 +21,7 @@ During installation, choose one of these roles:
 management      Central dashboard and policy server
 dns             DNS node enrolled to the management server
 smb_proxy       SMB proxy node enrolled to the management server
-standalone_lab  Single-machine lab mode
+standalone_lab  Single-machine evaluation mode
 ```
 
 The management server exposes the node enrollment token in the Management UI
@@ -39,18 +40,20 @@ cargo check --workspace
 cargo run -p axiom-daemon -- config/axiom.toml
 ```
 
-## Lab Install
+## Installation
 
-For an Ubuntu/Debian lab machine, copy and run the self-contained installer:
+For an Ubuntu/Debian server, copy and run the self-contained installer:
 
 ```bash
-chmod +x axiom-lab-installer.sh
-./axiom-lab-installer.sh
+chmod +x axiom-installer.sh
+./axiom-installer.sh
 ```
 
 The installer embeds the full Axiom source tree, extracts it to a temporary
 directory, discovers NICs interactively, writes `/etc/axiom/axiom.toml`, builds
 the release binary, applies Linux capabilities, and starts `axiom.service`.
+During management installation, the installer prompts for the initial Web UI
+administrator username and password. No default production password is created.
 
 For existing servers, use repair mode after pulling a new release. It preserves
 the installed configuration and refreshes the binary, systemd service, helper
@@ -78,8 +81,8 @@ During installation, the DNS Security Gateway can be enabled on a dedicated NIC.
 Axiom listens on UDP/TCP 53, checks domains against local policy and optional
 threat feeds, serves local DNS records, caches safe responses, and forwards
 allowed queries to the configured internal DC/upstream DNS servers. Threat feeds
-are opt-in during installation so a new lab does not start blocking domains
-before an explicit DNS policy is configured.
+are opt-in during installation so a new deployment does not start blocking
+domains before an explicit DNS policy is configured.
 
 Organizations without internal DNS can select public recursive upstreams during
 installation, including Cloudflare, Google, Quad9, or custom resolver IPs. The
@@ -87,12 +90,11 @@ installer also asks which NIC should be used for upstream resolver egress.
 When `whiptail` is available, the installer uses a terminal GUI/TUI; set
 `AXIOM_INSTALLER_CLI=1` to force the plain CLI wizard.
 
-The management role can enable HTTPS during installation. The installer can
-generate a local self-signed certificate for labs, while production deployments
-should replace it with an enterprise-issued certificate or trusted internal CA.
-If a DNS/SMB node points to an HTTPS management URL that uses a self-signed lab
-certificate, the installer asks whether that node should accept the private
-certificate for management heartbeat and policy recovery.
+The management role can enable HTTPS during installation. A self-signed
+certificate is available for evaluation, while production deployments should use
+an enterprise-issued certificate or trusted internal CA. If a DNS/SMB node points
+to an HTTPS management URL that uses a private certificate, the installer asks
+whether that node should trust it for management heartbeat and policy recovery.
 
 Management login supports the local admin account and optional LDAP/Active
 Directory authentication. Directory settings are written under
@@ -118,20 +120,21 @@ verification key. The installer accepts it without exposing any private signing
 material:
 
 ```bash
-AXIOM_LICENSE_PUBLIC_KEY_HEX="official_axiom_public_key_hex" ./axiom-lab-installer.sh
+AXIOM_LICENSE_PUBLIC_KEY_HEX="official_axiom_public_key_hex" ./axiom-installer.sh
 ```
 
 The installer writes that value to `[license].public_key_hex`. If the variable
 is omitted, Axiom uses its bundled public verification key.
 
-For lab issuance, generate an Ed25519 key pair on a trusted issuing workstation:
+For internal issuance testing, generate an Ed25519 key pair on a trusted issuing
+workstation:
 
 ```bash
 cargo run -p axiom-license --bin axiom-license-tool -- generate-key
 ```
 
-Keep the private key outside git and customer systems. For lab testing only,
-copy the generated `public_key_hex` into the management server config:
+Keep the private key outside git and customer systems. For controlled testing
+only, copy the generated `public_key_hex` into the management server config:
 
 ```toml
 [license]
@@ -151,7 +154,7 @@ signed `.axlic` license:
 export AXIOM_LICENSE_PRIVATE_KEY_HEX="generated_private_key_hex"
 cargo run -p axiom-license --bin axiom-license-tool -- issue \
   --request customer.axact \
-  --customer "Customer Lab" \
+  --customer "Customer Name" \
   --edition enterprise \
   --days 365 \
   --max-smb-nodes 5 \
@@ -170,7 +173,7 @@ For an internal Axiom staff host or the company customer portal backend, install
 the issuer explicitly:
 
 ```bash
-AXIOM_INSTALL_LICENSE_TOOL=1 ./axiom-lab-installer.sh
+AXIOM_INSTALL_LICENSE_TOOL=1 ./axiom-installer.sh
 # or, when running directly from a checked-out repository:
 AXIOM_INSTALL_LICENSE_TOOL=1 ./install.sh
 ```
@@ -185,8 +188,12 @@ Production deployment, support, and release readiness documents live under
 
 ```text
 docs/PRODUCTION_DEPLOYMENT.md
+docs/CUSTOMER_GETTING_STARTED.md
+docs/CUSTOMER_INSTALLATION_GUIDE.md
+docs/PRODUCT_OVERVIEW.md
 docs/OPERATIONS_RUNBOOK.md
 docs/RELEASE_CHECKLIST.md
+docs/VALIDATION_TEST_PLAN.md
 ```
 
 ## Policies
@@ -204,14 +211,7 @@ Axiom blocks SMB multichannel interface-discovery IOCTLs by default. This keeps
 Windows clients on the proxy path instead of learning backend file-server NICs
 and moving large file transfers around Axiom.
 
-The default MVP management login is:
-
-```text
-username: admin
-password: axiom-admin
-```
-
 On Linux, binding to TCP/445 and enforcing `SO_BINDTODEVICE` require network
 capabilities. For production-style systemd deployment, grant the daemon
 `CAP_NET_BIND_SERVICE` and the capability required by the kernel for device
-binding, or run as root only during early lab validation.
+binding, or run as root only during early controlled validation.

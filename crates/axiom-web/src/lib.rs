@@ -4865,7 +4865,7 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
                 <button id="disable-https" class="rounded-md border border-zinc-700 px-3 py-2 text-sm text-zinc-200 transition hover:border-amber-300 hover:text-amber-200">Disable HTTPS</button>
               </div>
               <a id="tls-next-url" href="#" class="hidden text-sm font-semibold text-emerald-300 hover:text-emerald-200">Open updated management URL</a>
-              <p class="text-xs text-zinc-500">Installer creates a lab self-signed certificate here by default. Browser trust warnings are expected until a trusted enterprise certificate is installed.</p>
+              <p class="text-xs text-zinc-500">Self-signed certificates are useful for evaluation. Production deployments should use a trusted enterprise certificate or internal CA.</p>
               <code id="tls-restart-command" class="block rounded-md border border-zinc-800 bg-zinc-950 px-3 py-2 text-xs text-zinc-400">sudo systemctl restart axiom.service</code>
             </div>
           </div>
@@ -4884,7 +4884,7 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
 
   <footer class="border-t border-zinc-800 bg-zinc-950 px-6 py-6 text-sm text-zinc-500">
     <div class="mx-auto flex max-w-7xl flex-col gap-2 md:flex-row md:items-center md:justify-between">
-      <p>© 2026 Axiom Security. Lab build for authorized defensive testing only.</p>
+      <p>© 2026 Axiom Security. Built for authorized enterprise security operations.</p>
       <div class="flex flex-wrap gap-4">
         <a class="hover:text-emerald-300" href="#">Documentation</a>
         <a class="hover:text-emerald-300" href="#">Support</a>

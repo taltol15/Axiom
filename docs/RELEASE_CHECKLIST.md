@@ -8,6 +8,8 @@ Use this checklist before shipping a customer build.
 - `cargo test --workspace`
 - `cargo build --release -p axiom-daemon`
 - `bash -n install.sh`
+- `./scripts/build-installer.sh`
+- `bash -n axiom-installer.sh`
 - `./scripts/build-lab-installer.sh`
 - `bash -n axiom-lab-installer.sh`
 
@@ -21,6 +23,10 @@ Use this checklist before shipping a customer build.
 - Support -> Built-in Smoke Tests passes.
 - Support -> Export Diagnostics downloads a JSON bundle.
 - Backup export and restore work on a lab configuration.
+- Customer-facing docs are current:
+  - `docs/PRODUCT_OVERVIEW.md`
+  - `docs/CUSTOMER_GETTING_STARTED.md`
+  - `docs/CUSTOMER_INSTALLATION_GUIDE.md`
 
 ## Node Control Plane
 
@@ -56,4 +62,12 @@ Use this checklist before shipping a customer build.
 - `sudo ./install.sh --repair` preserves configuration and restarts service.
 - `sudo ./install.sh --uninstall` removes service and binaries while keeping data.
 - `sudo ./install.sh --uninstall --purge` removes configuration, data, and logs.
+- `axiom-installer.sh` is the customer-facing installer artifact.
+- `axiom-lab-installer.sh` remains available only for compatibility and controlled lab use.
 
+## Customer Readiness
+
+- No customer-facing page describes the product as MVP.
+- No customer-facing page documents a default production password.
+- The management installer requires explicit admin credentials.
+- Release evidence is captured according to `docs/VALIDATION_TEST_PLAN.md`.
