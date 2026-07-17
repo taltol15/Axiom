@@ -3907,6 +3907,28 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
       width: 0.85rem;
     }
 
+    #dns-live-query-panel > summary {
+      position: relative;
+    }
+
+    #dns-live-query-panel > summary::after {
+      border-bottom: 2px solid currentColor;
+      border-right: 2px solid currentColor;
+      color: #94a3b8;
+      content: "";
+      height: 0.55rem;
+      position: absolute;
+      right: 1.5rem;
+      top: 50%;
+      transform: translateY(-65%) rotate(45deg);
+      transition: transform 160ms ease;
+      width: 0.55rem;
+    }
+
+    #dns-live-query-panel[open] > summary::after {
+      transform: translateY(-35%) rotate(225deg);
+    }
+
     @keyframes axiom-spin {
       to { transform: rotate(360deg); }
     }
@@ -4564,32 +4586,57 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
     </section>
 
     <section id="view-dns" class="dashboard-view">
-      <section class="rounded-lg border border-zinc-800 bg-zinc-900">
-      <div class="flex flex-col gap-2 border-b border-zinc-800 px-6 py-5 md:flex-row md:items-end md:justify-between">
-        <div>
-          <h2 class="text-xl font-semibold text-white">Live DNS Queries</h2>
-          <p id="dns-state" class="mt-1 text-sm text-zinc-400">Waiting for DNS telemetry</p>
-        </div>
-        <p id="dns-config" class="text-sm text-zinc-500"></p>
-      </div>
+      <section class="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
+        <article class="rounded-lg border border-zinc-800 bg-zinc-900 p-5">
+          <p class="text-sm text-zinc-400">Total Queries</p>
+          <p id="dns-metric-queries" class="mt-3 text-3xl font-semibold text-sky-200">0</p>
+          <p id="dns-metric-queries-detail" class="mt-2 text-xs text-zinc-500">Since service start</p>
+        </article>
+        <article class="rounded-lg border border-zinc-800 bg-zinc-900 p-5">
+          <p class="text-sm text-zinc-400">Active Clients</p>
+          <p id="dns-metric-clients" class="mt-3 text-3xl font-semibold text-cyan-200">0</p>
+          <p class="mt-2 text-xs text-zinc-500">Unique clients in the last 5 minutes</p>
+        </article>
+        <article class="rounded-lg border border-zinc-800 bg-zinc-900 p-5">
+          <p class="text-sm text-zinc-400">Blocked Queries</p>
+          <p id="dns-metric-blocked" class="mt-3 text-3xl font-semibold text-red-200">0</p>
+          <p id="dns-metric-blocked-detail" class="mt-2 text-xs text-zinc-500">No policy blocks recorded</p>
+        </article>
+        <article class="rounded-lg border border-zinc-800 bg-zinc-900 p-5">
+          <p class="text-sm text-zinc-400">Cache Hit Rate</p>
+          <p id="dns-metric-cache-rate" class="mt-3 text-3xl font-semibold text-emerald-200">0%</p>
+          <p id="dns-metric-cache-detail" class="mt-2 text-xs text-zinc-500">0 cache hits</p>
+        </article>
+      </section>
 
-      <div class="overflow-x-auto">
-        <table class="min-w-full divide-y divide-zinc-800">
-          <thead class="bg-zinc-950/60">
-            <tr>
-              <th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-zinc-400">Client</th>
-              <th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-zinc-400">Domain</th>
-              <th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-zinc-400">Type</th>
-              <th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-zinc-400">Action</th>
-              <th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-zinc-400">Upstream</th>
-              <th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-zinc-400">Latency</th>
-              <th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-zinc-400">Time</th>
-            </tr>
-          </thead>
-          <tbody id="dns-events-body" class="divide-y divide-zinc-800"></tbody>
-        </table>
-      </div>
-    </section>
+      <details id="dns-live-query-panel" class="mt-8 rounded-lg border border-zinc-800 bg-zinc-900" open>
+        <summary class="cursor-pointer list-none px-6 py-5 marker:content-none">
+          <div class="flex flex-col gap-2 pr-8 md:flex-row md:items-end md:justify-between">
+            <div>
+              <h2 class="text-xl font-semibold text-white">Live DNS Queries</h2>
+              <p id="dns-state" class="mt-1 text-sm text-zinc-400">Waiting for DNS telemetry</p>
+            </div>
+            <p id="dns-config" class="text-sm text-zinc-500"></p>
+          </div>
+        </summary>
+
+        <div class="overflow-x-auto border-t border-zinc-800">
+          <table class="min-w-full divide-y divide-zinc-800">
+            <thead class="bg-zinc-950/60">
+              <tr>
+                <th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-zinc-400">Client</th>
+                <th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-zinc-400">Domain</th>
+                <th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-zinc-400">Type</th>
+                <th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-zinc-400">Action</th>
+                <th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-zinc-400">Upstream</th>
+                <th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-zinc-400">Latency</th>
+                <th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-zinc-400">Time</th>
+              </tr>
+            </thead>
+            <tbody id="dns-events-body" class="divide-y divide-zinc-800"></tbody>
+          </table>
+        </div>
+      </details>
 
     <section class="mt-8 grid gap-6 lg:grid-cols-2">
       <section class="rounded-lg border border-zinc-800 bg-zinc-900">
@@ -4652,23 +4699,87 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
             <option value="sinkhole">sinkhole</option>
           </select>
         </label>
-        <label class="block">
+      </div>
+
+      <div class="border-t border-zinc-800 p-6">
+        <div>
+          <h3 class="text-base font-semibold text-white">Domain Rules</h3>
+          <p class="mt-1 text-sm text-zinc-500">One domain per line. Rules also match subdomains.</p>
+        </div>
+        <div class="mt-5 grid gap-6 lg:grid-cols-3">
+          <label class="block">
           <span class="text-sm text-zinc-300">Blocked Domains</span>
-          <textarea id="dns-blocked-domains" rows="6" spellcheck="false" class="mt-2 w-full rounded-md border border-zinc-700 bg-zinc-950 px-4 py-3 font-mono text-sm text-white"></textarea>
-        </label>
-        <label class="block">
-          <span class="text-sm text-zinc-300">Monitored Domains</span>
-          <textarea id="dns-monitored-domains" rows="6" spellcheck="false" class="mt-2 w-full rounded-md border border-zinc-700 bg-zinc-950 px-4 py-3 font-mono text-sm text-white"></textarea>
-        </label>
-        <label class="block">
-          <span class="text-sm text-zinc-300">Threat Feed URLs</span>
-          <textarea id="dns-threat-feeds" rows="6" spellcheck="false" class="mt-2 w-full rounded-md border border-zinc-700 bg-zinc-950 px-4 py-3 font-mono text-sm text-white"></textarea>
-        </label>
-        <label class="block lg:col-span-3">
-          <span class="text-sm text-zinc-300">Local DNS Records</span>
-          <textarea id="dns-local-records" rows="5" spellcheck="false" class="mt-2 w-full rounded-md border border-zinc-700 bg-zinc-950 px-4 py-3 font-mono text-sm text-white"></textarea>
-          <span class="mt-2 block text-xs text-zinc-500">Format: name|type|value|ttl. Example: intranet.local|a|10.0.0.5|300</span>
-        </label>
+            <textarea id="dns-blocked-domains" rows="6" spellcheck="false" placeholder="malware.example" class="mt-2 w-full rounded-md border border-zinc-700 bg-zinc-950 px-4 py-3 font-mono text-sm text-white"></textarea>
+          </label>
+          <label class="block">
+            <span class="text-sm text-zinc-300">Monitored Domains</span>
+            <textarea id="dns-monitored-domains" rows="6" spellcheck="false" placeholder="suspicious.example" class="mt-2 w-full rounded-md border border-zinc-700 bg-zinc-950 px-4 py-3 font-mono text-sm text-white"></textarea>
+          </label>
+          <label class="block">
+            <span class="text-sm text-zinc-300">Threat Feed URLs</span>
+            <textarea id="dns-threat-feeds" rows="6" spellcheck="false" placeholder="https://feed.example/domains.txt" class="mt-2 w-full rounded-md border border-zinc-700 bg-zinc-950 px-4 py-3 font-mono text-sm text-white"></textarea>
+          </label>
+        </div>
+      </div>
+
+      <div class="border-t border-zinc-800 p-6">
+        <div class="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+          <div>
+            <h3 class="text-base font-semibold text-white">Category Controls</h3>
+            <p class="mt-1 text-sm text-zinc-500">Category intelligence source is not configured.</p>
+          </div>
+          <span id="dns-category-count" class="w-fit rounded-full border border-zinc-700 bg-zinc-950 px-2.5 py-1 text-xs font-semibold text-zinc-400">0 categories</span>
+        </div>
+        <div id="dns-category-list" class="mt-5 rounded-md border border-dashed border-zinc-700 px-5 py-6 text-sm text-zinc-500">
+          No category database is connected. Category policies will remain inactive until a trusted provider is configured.
+        </div>
+      </div>
+
+      <div class="border-t border-zinc-800 p-6">
+        <div class="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+          <div>
+            <h3 class="text-base font-semibold text-white">Local DNS Records</h3>
+            <p id="dns-local-record-state" class="mt-1 text-sm text-zinc-500">No local records configured</p>
+          </div>
+        </div>
+
+        <div class="mt-5 overflow-x-auto rounded-md border border-zinc-800">
+          <table class="min-w-full divide-y divide-zinc-800">
+            <thead class="bg-zinc-950/60">
+              <tr>
+                <th class="px-4 py-3 text-left text-xs font-medium uppercase text-zinc-400">Name</th>
+                <th class="px-4 py-3 text-left text-xs font-medium uppercase text-zinc-400">Type</th>
+                <th class="px-4 py-3 text-left text-xs font-medium uppercase text-zinc-400">Address</th>
+                <th class="px-4 py-3 text-left text-xs font-medium uppercase text-zinc-400">TTL</th>
+                <th class="w-20 px-4 py-3 text-right text-xs font-medium uppercase text-zinc-400">Action</th>
+              </tr>
+            </thead>
+            <tbody id="dns-local-records-body" class="divide-y divide-zinc-800"></tbody>
+          </table>
+        </div>
+
+        <div class="mt-5 grid gap-3 lg:grid-cols-[minmax(0,2fr)_8rem_minmax(0,2fr)_8rem_auto] lg:items-end">
+          <label class="block">
+            <span class="text-sm text-zinc-300">DNS Name</span>
+            <input id="dns-local-name" type="text" spellcheck="false" placeholder="intranet.example.local" class="mt-2 w-full rounded-md border border-zinc-700 bg-zinc-950 px-3 py-2 text-white">
+          </label>
+          <label class="block">
+            <span class="text-sm text-zinc-300">Type</span>
+            <select id="dns-local-type" class="mt-2 w-full rounded-md border border-zinc-700 bg-zinc-950 px-3 py-2 text-white">
+              <option value="a">A</option>
+              <option value="aaaa">AAAA</option>
+            </select>
+          </label>
+          <label class="block">
+            <span class="text-sm text-zinc-300">IP Address</span>
+            <input id="dns-local-value" type="text" spellcheck="false" placeholder="10.0.0.25" class="mt-2 w-full rounded-md border border-zinc-700 bg-zinc-950 px-3 py-2 text-white">
+          </label>
+          <label class="block">
+            <span class="text-sm text-zinc-300">TTL</span>
+            <input id="dns-local-ttl" type="number" min="1" value="300" class="mt-2 w-full rounded-md border border-zinc-700 bg-zinc-950 px-3 py-2 text-white">
+          </label>
+          <button id="add-dns-local-record" type="button" class="rounded-md border border-emerald-400/50 px-4 py-2 text-sm font-semibold text-emerald-200 transition hover:bg-emerald-500/10">Add record</button>
+        </div>
       </div>
     </section>
     </section>
@@ -4968,6 +5079,7 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
     let latestAuditEvents = [];
     let latestAuditTotals = { smb: 0, dns: 0 };
     let enrollmentContext = { token: "", managementUrl: "" };
+    let localDnsRecords = [];
 
     function authHeaders(extra = {}) {
       return token ? { ...extra, Authorization: `Bearer ${token}` } : extra;
@@ -5066,6 +5178,12 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
       const ip = endpointIp(value);
       const hostname = clientIdentities[ip];
       return hostname ? `${hostname} (${text(value)})` : text(value);
+    }
+
+    function clientHostLabel(value) {
+      const ip = endpointIp(value);
+      const hostname = clientIdentities[ip];
+      return hostname ? `${hostname} (${ip})` : text(ip);
     }
 
     function formatTime(seconds) {
@@ -5888,7 +6006,7 @@ DNS node -> upstream resolvers: UDP/TCP 53`;
 
       renderList(
         "top-clients",
-        topCounts(dnsEvents, (event) => clientLabel(event.client_addr)),
+        topCounts(dnsEvents, (event) => clientHostLabel(event.client_addr)),
         "No DNS clients observed yet."
       );
 
@@ -5901,7 +6019,7 @@ DNS node -> upstream resolvers: UDP/TCP 53`;
           .slice(0, 10)
           .map((event) => ({
             title: event.query_name,
-            detail: `${clientLabel(event.client_addr)} · ${text(event.reason)}`,
+            detail: `${clientHostLabel(event.client_addr)} · ${text(event.reason)}`,
             value: "blocked",
             tone: "text-red-200"
           })),
@@ -6129,6 +6247,30 @@ DNS node -> upstream resolvers: UDP/TCP 53`;
 
       const dns = effectiveDnsStatus(data.dns || {}, fleetNodes);
       const dnsEvents = stats.recent_dns_events || [];
+      const activeClientCutoff = Math.floor(Date.now() / 1000) - 300;
+      const activeDnsClients = new Set(
+        dnsEvents
+          .filter((event) => Number(event.unix_timestamp_seconds || 0) >= activeClientCutoff)
+          .map((event) => endpointIp(event.client_addr))
+          .filter(Boolean)
+      ).size;
+      const dnsQueryCount = Number(stats.dns_queries || 0);
+      const dnsBlockedCount = Number(stats.dns_blocked_queries || 0);
+      const dnsCacheHits = Number(stats.dns_cache_hits || 0);
+      const dnsBlockedRate = dnsQueryCount ? (dnsBlockedCount / dnsQueryCount) * 100 : 0;
+      const dnsCacheRate = dnsQueryCount ? (dnsCacheHits / dnsQueryCount) * 100 : 0;
+
+      document.getElementById("dns-metric-queries").textContent = dnsQueryCount.toLocaleString();
+      document.getElementById("dns-metric-queries-detail").textContent =
+        `${Number(stats.dns_udp_queries || 0).toLocaleString()} UDP · ${Number(stats.dns_tcp_queries || 0).toLocaleString()} TCP`;
+      document.getElementById("dns-metric-clients").textContent = activeDnsClients.toLocaleString();
+      document.getElementById("dns-metric-blocked").textContent = dnsBlockedCount.toLocaleString();
+      document.getElementById("dns-metric-blocked-detail").textContent = dnsBlockedCount
+        ? `${dnsBlockedRate.toFixed(1)}% of all queries`
+        : "No policy blocks recorded";
+      document.getElementById("dns-metric-cache-rate").textContent = `${dnsCacheRate.toFixed(1)}%`;
+      document.getElementById("dns-metric-cache-detail").textContent =
+        `${dnsCacheHits.toLocaleString()} cache hits · ${Number(stats.dns_upstream_errors || 0).toLocaleString()} upstream errors`;
       document.getElementById("dns-state").textContent = dns.enabled
         ? `${stats.dns_queries || 0} queries · ${stats.dns_blocked_queries || 0} blocked · ${stats.dns_monitored_queries || 0} monitored`
         : "DNS Security Gateway is disabled";
@@ -6400,6 +6542,96 @@ DNS node -> upstream resolvers: UDP/TCP 53`;
         .filter(Boolean);
     }
 
+    function readLocalDnsRecords() {
+      return [...document.querySelectorAll("#dns-local-records-body tr[data-record-index]")]
+        .map((row) => ({
+          name: row.querySelector('[data-field="name"]').value.trim(),
+          type: row.querySelector('[data-field="type"]').value,
+          value: row.querySelector('[data-field="value"]').value.trim(),
+          ttl_seconds: Number(row.querySelector('[data-field="ttl_seconds"]').value || 300)
+        }))
+        .filter((record) => record.name && record.value);
+    }
+
+    function renderLocalDnsRecords() {
+      const body = document.getElementById("dns-local-records-body");
+      document.getElementById("dns-local-record-state").textContent = localDnsRecords.length
+        ? `${localDnsRecords.length} local record${localDnsRecords.length === 1 ? "" : "s"}`
+        : "No local records configured";
+
+      if (!localDnsRecords.length) {
+        body.innerHTML = `<tr><td colspan="5" class="px-4 py-6 text-sm text-zinc-500">No local DNS records configured.</td></tr>`;
+        return;
+      }
+
+      body.innerHTML = localDnsRecords.map((record, index) => `
+        <tr data-record-index="${index}" class="bg-zinc-950/20">
+          <td class="px-3 py-3">
+            <input data-field="name" type="text" spellcheck="false" value="${html(record.name || "")}" class="w-64 min-w-full rounded-md border border-zinc-700 bg-zinc-950 px-3 py-2 text-sm text-white">
+          </td>
+          <td class="px-3 py-3">
+            <select data-field="type" class="rounded-md border border-zinc-700 bg-zinc-950 px-3 py-2 text-sm text-white">
+              <option value="a" ${record.type === "a" ? "selected" : ""}>A</option>
+              <option value="aaaa" ${record.type === "aaaa" ? "selected" : ""}>AAAA</option>
+            </select>
+          </td>
+          <td class="px-3 py-3">
+            <input data-field="value" type="text" spellcheck="false" value="${html(record.value || "")}" class="w-52 rounded-md border border-zinc-700 bg-zinc-950 px-3 py-2 text-sm text-white">
+          </td>
+          <td class="px-3 py-3">
+            <input data-field="ttl_seconds" type="number" min="1" value="${Number(record.ttl_seconds || 300)}" class="w-24 rounded-md border border-zinc-700 bg-zinc-950 px-3 py-2 text-sm text-white">
+          </td>
+          <td class="px-3 py-3 text-right">
+            <button type="button" data-remove-local-record="${index}" aria-label="Remove ${html(record.name || "local DNS record")}" title="Remove record" class="rounded-md border border-red-400/30 px-3 py-2 text-sm font-semibold text-red-200 transition hover:bg-red-500/10">Remove</button>
+          </td>
+        </tr>
+      `).join("");
+
+      body.querySelectorAll("[data-remove-local-record]").forEach((button) => {
+        button.addEventListener("click", () => {
+          localDnsRecords = readLocalDnsRecords();
+          localDnsRecords.splice(Number(button.dataset.removeLocalRecord), 1);
+          renderLocalDnsRecords();
+          document.getElementById("dns-policy-state").textContent = "Local DNS record removed · save to apply";
+        });
+      });
+    }
+
+    function addLocalDnsRecord() {
+      localDnsRecords = readLocalDnsRecords();
+      const nameInput = document.getElementById("dns-local-name");
+      const typeInput = document.getElementById("dns-local-type");
+      const valueInput = document.getElementById("dns-local-value");
+      const ttlInput = document.getElementById("dns-local-ttl");
+      const record = {
+        name: nameInput.value.trim(),
+        type: typeInput.value,
+        value: valueInput.value.trim(),
+        ttl_seconds: Number(ttlInput.value || 300)
+      };
+
+      if (!record.name || !record.value || !Number.isInteger(record.ttl_seconds) || record.ttl_seconds < 1) {
+        showToast("Local DNS record incomplete", "Enter a DNS name, IP address, and a positive TTL.", "error");
+        return;
+      }
+      if ((record.type === "a" && record.value.includes(":")) || (record.type === "aaaa" && !record.value.includes(":"))) {
+        showToast("Address type mismatch", record.type === "a" ? "A records require an IPv4 address." : "AAAA records require an IPv6 address.", "error");
+        return;
+      }
+      if (localDnsRecords.some((existing) => existing.name.toLowerCase() === record.name.toLowerCase() && existing.type === record.type)) {
+        showToast("Record already exists", "Edit the existing record or remove it before adding a replacement.", "warning");
+        return;
+      }
+
+      localDnsRecords.push(record);
+      renderLocalDnsRecords();
+      nameInput.value = "";
+      valueInput.value = "";
+      ttlInput.value = "300";
+      document.getElementById("dns-policy-state").textContent = "Local DNS record added · save to apply";
+      showToast("Local DNS record added", `${record.name} is ready to be saved.`, "success");
+    }
+
     async function loadDnsPolicy() {
       const response = await fetch("/api/dns-policy", { headers: authHeaders() });
       if (response.status === 401) {
@@ -6415,9 +6647,13 @@ DNS node -> upstream resolvers: UDP/TCP 53`;
       document.getElementById("dns-blocked-domains").value = (policy.blocked_domains || []).join("\n");
       document.getElementById("dns-monitored-domains").value = (policy.monitored_domains || []).join("\n");
       document.getElementById("dns-threat-feeds").value = (policy.threat_feed_urls || []).join("\n");
-      document.getElementById("dns-local-records").value = (policy.local_records || [])
-        .map((record) => `${record.name}|${record.type}|${record.value}|${record.ttl_seconds || 300}`)
-        .join("\n");
+      localDnsRecords = (policy.local_records || []).map((record) => ({
+        name: record.name,
+        type: (record.type || "a").toLowerCase(),
+        value: record.value,
+        ttl_seconds: Number(record.ttl_seconds || 300)
+      }));
+      renderLocalDnsRecords();
       document.getElementById("dns-policy-state").textContent = "DNS policy loaded";
     }
 
@@ -6790,15 +7026,7 @@ DNS node -> upstream resolvers: UDP/TCP 53`;
     }
 
     function readDnsPolicyPayload() {
-      const localRecords = linesToArray("dns-local-records").map((line) => {
-        const [name, recordType, value, ttl] = line.split("|").map((part) => (part || "").trim());
-        return {
-          name,
-          type: (recordType || "a").toLowerCase(),
-          value,
-          ttl_seconds: Number(ttl || 300)
-        };
-      }).filter((record) => record.name && record.value);
+      localDnsRecords = readLocalDnsRecords();
 
       return {
         blocked_domain_action: document.getElementById("dns-blocked-action").value,
@@ -6808,7 +7036,7 @@ DNS node -> upstream resolvers: UDP/TCP 53`;
         threat_feed_urls: linesToArray("dns-threat-feeds"),
         block_response: document.getElementById("dns-block-response").value,
         sinkhole_ipv4: "0.0.0.0",
-        local_records: localRecords
+        local_records: localDnsRecords
       };
     }
 
@@ -7202,6 +7430,20 @@ DNS node -> upstream resolvers: UDP/TCP 53`;
     });
     document.getElementById("save-policies").addEventListener("click", savePolicies);
     document.getElementById("save-dns-policy").addEventListener("click", saveDnsPolicy);
+    document.getElementById("add-dns-local-record").addEventListener("click", addLocalDnsRecord);
+    document.getElementById("dns-local-records-body").addEventListener("input", () => {
+      document.getElementById("dns-policy-state").textContent = "Local DNS records changed · save to apply";
+    });
+    document.getElementById("dns-local-value").addEventListener("input", (event) => {
+      if (event.target.value.includes(":")) {
+        document.getElementById("dns-local-type").value = "aaaa";
+      }
+    });
+    const dnsLiveQueryPanel = document.getElementById("dns-live-query-panel");
+    dnsLiveQueryPanel.open = localStorage.getItem("axiomDnsQueriesCollapsed") !== "true";
+    dnsLiveQueryPanel.addEventListener("toggle", () => {
+      localStorage.setItem("axiomDnsQueriesCollapsed", dnsLiveQueryPanel.open ? "false" : "true");
+    });
     document.getElementById("run-policy-self-test").addEventListener("click", runPolicySelfTest);
     document.getElementById("first-run-smoke-test").addEventListener("click", runSmokeTests);
     document.getElementById("run-smoke-tests").addEventListener("click", runSmokeTests);
