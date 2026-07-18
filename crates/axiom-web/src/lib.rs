@@ -3907,11 +3907,11 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
       width: 0.85rem;
     }
 
-    #dns-live-query-panel > summary {
+    .collapsible-panel > summary {
       position: relative;
     }
 
-    #dns-live-query-panel > summary::after {
+    .collapsible-panel > summary::after {
       border-bottom: 2px solid currentColor;
       border-right: 2px solid currentColor;
       color: #94a3b8;
@@ -3925,7 +3925,7 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
       width: 0.55rem;
     }
 
-    #dns-live-query-panel[open] > summary::after {
+    .collapsible-panel[open] > summary::after {
       transform: translateY(-35%) rotate(225deg);
     }
 
@@ -4369,16 +4369,55 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
     </section>
 
     <section id="view-smb" class="dashboard-view">
-      <section class="rounded-lg border border-zinc-800 bg-zinc-900">
-        <div class="flex flex-col gap-2 border-b border-zinc-800 px-6 py-5 md:flex-row md:items-end md:justify-between">
-          <div>
-            <h2 class="text-xl font-semibold text-white">Live SMB Connections</h2>
-            <p id="live-connection-state" class="mt-1 text-sm text-zinc-400">Waiting for active SMB sessions</p>
-          </div>
-          <p id="live-connection-count" class="text-sm text-zinc-500">0 live connections</p>
-        </div>
+      <section class="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
+        <article class="rounded-lg border border-zinc-800 bg-zinc-900 p-5">
+          <p class="text-sm text-zinc-400">Protected Traffic</p>
+          <p id="smb-metric-traffic" class="mt-3 text-3xl font-semibold text-sky-200">0 B</p>
+          <p id="smb-metric-traffic-detail" class="mt-2 text-xs text-zinc-500">Waiting for SMB traffic</p>
+        </article>
+        <article class="rounded-lg border border-zinc-800 bg-zinc-900 p-5">
+          <p class="text-sm text-zinc-400">Active Connections</p>
+          <p id="smb-metric-connections" class="mt-3 text-3xl font-semibold text-cyan-200">0</p>
+          <p id="smb-metric-connections-detail" class="mt-2 text-xs text-zinc-500">No active SMB clients</p>
+        </article>
+        <article class="rounded-lg border border-zinc-800 bg-zinc-900 p-5">
+          <p class="text-sm text-zinc-400">Inspected Files</p>
+          <p id="smb-metric-files" class="mt-3 text-3xl font-semibold text-emerald-200">0</p>
+          <p id="smb-metric-files-detail" class="mt-2 text-xs text-zinc-500">No completed file hashes</p>
+        </article>
+        <article class="rounded-lg border border-zinc-800 bg-zinc-900 p-5">
+          <p class="text-sm text-zinc-400">Blocked Threats</p>
+          <p id="smb-metric-blocked" class="mt-3 text-3xl font-semibold text-red-200">0</p>
+          <p id="smb-metric-blocked-detail" class="mt-2 text-xs text-zinc-500">No policy blocks recorded</p>
+        </article>
+      </section>
 
-        <div class="overflow-x-auto">
+      <section class="mt-8 rounded-lg border border-emerald-400/25 bg-emerald-500/5 px-6 py-5">
+        <div class="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
+          <div>
+            <p class="text-sm font-semibold uppercase tracking-wider text-emerald-300">SMB Enforcement</p>
+            <h2 id="smb-runtime-state" class="mt-2 text-xl font-semibold text-white">Loading active inspection policy</h2>
+            <p id="smb-runtime-detail" class="mt-1 text-sm text-zinc-400">Waiting for node telemetry</p>
+          </div>
+          <div class="flex flex-wrap gap-2">
+            <span id="smb-runtime-routes" class="rounded-full border border-zinc-700 bg-zinc-950 px-3 py-1.5 text-xs font-semibold text-zinc-300">0 routes</span>
+            <span id="smb-runtime-reputation" class="rounded-full border border-zinc-700 bg-zinc-950 px-3 py-1.5 text-xs font-semibold text-zinc-300">0 known-bad hashes</span>
+          </div>
+        </div>
+      </section>
+
+      <details id="smb-live-connections-panel" class="collapsible-panel mt-8 rounded-lg border border-zinc-800 bg-zinc-900" open>
+        <summary class="cursor-pointer list-none px-6 py-5 marker:content-none">
+          <div class="flex flex-col gap-2 pr-8 md:flex-row md:items-end md:justify-between">
+            <div>
+              <h2 class="text-xl font-semibold text-white">Live SMB Connections</h2>
+              <p id="live-connection-state" class="mt-1 text-sm text-zinc-400">Waiting for active SMB sessions</p>
+            </div>
+            <p id="live-connection-count" class="text-sm text-zinc-500">0 live connections</p>
+          </div>
+        </summary>
+
+        <div class="overflow-x-auto border-t border-zinc-800">
           <table class="min-w-full divide-y divide-zinc-800">
             <thead class="bg-zinc-950/60">
               <tr>
@@ -4395,19 +4434,21 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
             <tbody id="live-connections-body" class="divide-y divide-zinc-800"></tbody>
           </table>
         </div>
-      </section>
+      </details>
 
-      <section class="mt-8 rounded-lg border border-emerald-400/30 bg-zinc-900">
-        <div class="flex flex-col gap-2 border-b border-zinc-800 px-6 py-5 md:flex-row md:items-end md:justify-between">
-          <div>
-            <p class="text-sm font-semibold uppercase tracking-wider text-emerald-300">Proxy Path Proof</p>
-            <h2 class="mt-2 text-xl font-semibold text-white">Live Inspection Proof</h2>
-            <p id="inspection-proof-state" class="mt-1 text-sm text-zinc-400">Waiting for SMB CREATE/WRITE/CLOSE evidence</p>
+      <details id="smb-inspection-proof-panel" class="collapsible-panel mt-8 rounded-lg border border-emerald-400/30 bg-zinc-900" open>
+        <summary class="cursor-pointer list-none px-6 py-5 marker:content-none">
+          <div class="flex flex-col gap-2 pr-8 md:flex-row md:items-end md:justify-between">
+            <div>
+              <p class="text-sm font-semibold uppercase tracking-wider text-emerald-300">Proxy Path Proof</p>
+              <h2 class="mt-2 text-xl font-semibold text-white">Live Inspection Proof</h2>
+              <p id="inspection-proof-state" class="mt-1 text-sm text-zinc-400">Waiting for SMB CREATE/WRITE/CLOSE evidence</p>
+            </div>
+            <p id="inspection-proof-count" class="text-sm text-zinc-500">0 proof records</p>
           </div>
-          <p id="inspection-proof-count" class="text-sm text-zinc-500">0 proof records</p>
-        </div>
+        </summary>
 
-        <div class="grid gap-4 border-b border-zinc-800 px-6 py-5 md:grid-cols-4">
+        <div class="grid gap-4 border-y border-zinc-800 px-6 py-5 sm:grid-cols-2 xl:grid-cols-4">
           <div class="rounded-md border border-zinc-800 bg-zinc-950/50 p-4">
             <p class="text-xs font-semibold uppercase tracking-wider text-zinc-500">Observed Files</p>
             <p id="proof-observed-count" class="mt-2 text-2xl font-semibold text-white">0</p>
@@ -4442,18 +4483,39 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
             <tbody id="inspection-proof-body" class="divide-y divide-zinc-800"></tbody>
           </table>
         </div>
-      </section>
+      </details>
 
-      <section class="mt-8 rounded-lg border border-zinc-800 bg-zinc-900">
-        <div class="flex flex-col gap-2 border-b border-zinc-800 px-6 py-5 md:flex-row md:items-end md:justify-between">
-          <div>
-            <h2 class="text-xl font-semibold text-white">File Transfer Ledger</h2>
-            <p id="file-activity-state" class="mt-1 text-sm text-zinc-400">Waiting for per-file SMB activity</p>
+      <details id="smb-file-ledger-panel" class="collapsible-panel mt-8 rounded-lg border border-zinc-800 bg-zinc-900">
+        <summary class="cursor-pointer list-none px-6 py-5 marker:content-none">
+          <div class="flex flex-col gap-2 pr-8 md:flex-row md:items-end md:justify-between">
+            <div>
+              <h2 class="text-xl font-semibold text-white">File Transfer Ledger</h2>
+              <p id="file-activity-state" class="mt-1 text-sm text-zinc-400">Waiting for per-file SMB activity</p>
+            </div>
+            <p id="file-activity-count" class="text-sm text-zinc-500">0 tracked files</p>
           </div>
-          <p id="file-activity-count" class="text-sm text-zinc-500">0 tracked files</p>
+        </summary>
+
+        <div class="flex flex-col gap-3 border-t border-zinc-800 px-6 py-4 md:flex-row md:items-center md:justify-between">
+          <div class="flex flex-1 flex-col gap-3 sm:flex-row">
+            <label class="block flex-1">
+              <span class="sr-only">Search file activity</span>
+              <input id="smb-file-search" type="search" spellcheck="false" placeholder="Search file, client, target, or rule" class="w-full rounded-md border border-zinc-700 bg-zinc-950 px-3 py-2 text-sm text-white outline-none focus:border-emerald-400">
+            </label>
+            <label class="block sm:w-44">
+              <span class="sr-only">Filter file activity by action</span>
+              <select id="smb-file-action-filter" class="w-full rounded-md border border-zinc-700 bg-zinc-950 px-3 py-2 text-sm text-white">
+                <option value="all">All actions</option>
+                <option value="block">Blocked</option>
+                <option value="monitor">Monitored</option>
+                <option value="allow">Allowed</option>
+              </select>
+            </label>
+          </div>
+          <p id="smb-file-filter-state" class="text-xs text-zinc-500">Showing all tracked files</p>
         </div>
 
-        <div class="overflow-x-auto">
+        <div class="overflow-x-auto border-t border-zinc-800">
           <table class="min-w-full divide-y divide-zinc-800">
             <thead class="bg-zinc-950/60">
               <tr>
@@ -4469,14 +4531,19 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
             <tbody id="file-activity-body" class="divide-y divide-zinc-800"></tbody>
           </table>
         </div>
-      </section>
+      </details>
 
-      <section class="mt-8 rounded-lg border border-zinc-800 bg-zinc-900">
-      <div class="flex flex-col gap-4 border-b border-zinc-800 px-6 py-5 md:flex-row md:items-center md:justify-between">
-        <div>
-          <h2 class="text-xl font-semibold text-white">SMB Policies</h2>
-          <p id="policy-state" class="mt-1 text-sm text-zinc-400">Loading policies</p>
-        </div>
+      <details id="smb-policy-panel" class="collapsible-panel mt-8 rounded-lg border border-zinc-800 bg-zinc-900">
+        <summary class="cursor-pointer list-none px-6 py-5 marker:content-none">
+          <div class="flex flex-col gap-2 pr-8 md:flex-row md:items-end md:justify-between">
+            <div>
+              <h2 class="text-xl font-semibold text-white">SMB Policies</h2>
+              <p id="policy-state" class="mt-1 text-sm text-zinc-400">Loading policies</p>
+            </div>
+            <p class="text-sm text-zinc-500">Inspection and enforcement configuration</p>
+          </div>
+        </summary>
+      <div class="border-t border-zinc-800 px-6 py-4">
         <div class="flex flex-wrap gap-2">
           <button id="run-policy-self-test" class="rounded-md border border-emerald-400/40 px-3 py-2 text-sm font-semibold text-emerald-100 transition hover:border-emerald-300 hover:bg-emerald-400/10">Run self-test</button>
           <button data-preset="monitor" class="policy-preset rounded-md border border-zinc-700 px-3 py-2 text-sm text-zinc-200 transition hover:border-cyan-300 hover:text-cyan-100">Monitor only</button>
@@ -4582,7 +4649,7 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
           <textarea id="policy-signatures" rows="5" spellcheck="false" class="mt-4 w-full rounded-md border border-zinc-700 bg-zinc-950 px-4 py-3 font-mono text-sm text-white outline-none focus:border-emerald-400"></textarea>
         </div>
       </div>
-    </section>
+    </details>
     </section>
 
     <section id="view-dns" class="dashboard-view">
@@ -4609,7 +4676,7 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
         </article>
       </section>
 
-      <details id="dns-live-query-panel" class="mt-8 rounded-lg border border-zinc-800 bg-zinc-900" open>
+      <details id="dns-live-query-panel" class="collapsible-panel mt-8 rounded-lg border border-zinc-800 bg-zinc-900" open>
         <summary class="cursor-pointer list-none px-6 py-5 marker:content-none">
           <div class="flex flex-col gap-2 pr-8 md:flex-row md:items-end md:justify-between">
             <div>
@@ -5080,6 +5147,7 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
     let latestAuditTotals = { smb: 0, dns: 0 };
     let enrollmentContext = { token: "", managementUrl: "" };
     let localDnsRecords = [];
+    let latestSmbFileActivity = [];
 
     function authHeaders(extra = {}) {
       return token ? { ...extra, Authorization: `Bearer ${token}` } : extra;
@@ -6200,6 +6268,74 @@ DNS node -> upstream resolvers: UDP/TCP 53`;
       showToast("Audit exported", `${events.length} events exported.`, "success");
     }
 
+    function smbFileActivityAction(activity) {
+      if (Number(activity.blocked_events || 0) > 0 || activity.last_action === "block") return "block";
+      if (Number(activity.monitored_events || 0) > 0 || activity.last_action === "monitor") return "monitor";
+      return "allow";
+    }
+
+    function renderSmbFileActivity() {
+      const body = document.getElementById("file-activity-body");
+      const search = document.getElementById("smb-file-search").value.trim().toLowerCase();
+      const actionFilter = document.getElementById("smb-file-action-filter").value;
+      const filtered = latestSmbFileActivity.filter((activity) => {
+        const action = smbFileActivityAction(activity);
+        const haystack = [
+          activity.file_path,
+          clientLabel(activity.peer_addr),
+          activity.target_addr,
+          activity.route_name,
+          activity.interface,
+          activity.last_reason,
+          activity.last_rule_name
+        ].map((value) => String(value || "").toLowerCase()).join(" ");
+        return (!search || haystack.includes(search)) && (actionFilter === "all" || action === actionFilter);
+      });
+
+      document.getElementById("file-activity-count").textContent = `${latestSmbFileActivity.length} tracked files`;
+      document.getElementById("file-activity-state").textContent = latestSmbFileActivity.length
+        ? `Latest file update ${formatTime(latestSmbFileActivity[0].last_activity_unix_timestamp_seconds)}`
+        : "Waiting for per-file SMB activity";
+      document.getElementById("smb-file-filter-state").textContent = search || actionFilter !== "all"
+        ? `Showing ${filtered.length} of ${latestSmbFileActivity.length} files`
+        : `Showing all ${latestSmbFileActivity.length} tracked files`;
+
+      if (!latestSmbFileActivity.length) {
+        body.innerHTML = `<tr><td colspan="7" class="px-6 py-6 text-sm text-zinc-400">No file-level SMB activity recorded.</td></tr>`;
+        return;
+      }
+      if (!filtered.length) {
+        body.innerHTML = `<tr><td colspan="7" class="px-6 py-6 text-sm text-zinc-400">No file activity matches the current filters.</td></tr>`;
+        return;
+      }
+
+      body.innerHTML = filtered.slice(0, 80).map((activity) => {
+        const action = smbFileActivityAction(activity);
+        const resultClass = action === "block"
+          ? "border-red-400/40 bg-red-500/10 text-red-100"
+          : action === "monitor"
+            ? "border-amber-400/40 bg-amber-500/10 text-amber-100"
+            : "border-emerald-400/40 bg-emerald-500/10 text-emerald-100";
+        return `
+          <tr class="hover:bg-zinc-800/40">
+            <td class="max-w-xs px-6 py-4 text-sm font-medium text-white">
+              <p class="truncate">${text(activity.file_path)}</p>
+              <p class="mt-1 text-xs text-zinc-500">${text(activity.route_name)} · ${text(activity.interface)}</p>
+            </td>
+            <td class="whitespace-nowrap px-6 py-4 text-sm text-zinc-300">${clientLabel(activity.peer_addr)}</td>
+            <td class="whitespace-nowrap px-6 py-4 text-sm text-cyan-200">${text(activity.target_addr)}</td>
+            <td class="whitespace-nowrap px-6 py-4 text-sm text-lime-200">${formatBytes(activity.smb_write_bytes || 0)} · ${text(activity.smb_write_requests || 0)} writes</td>
+            <td class="whitespace-nowrap px-6 py-4 text-sm text-zinc-300">${text(activity.observed_events || 0)} seen · ${text(activity.blocked_events || 0)} blocked · ${text(activity.monitored_events || 0)} monitored</td>
+            <td class="min-w-72 px-6 py-4 text-sm text-zinc-300">
+              <span class="rounded-full border px-2.5 py-1 text-xs font-semibold uppercase ${resultClass}">${text(action)}</span>
+              <p class="mt-2 line-clamp-2 text-zinc-400">${text(activity.last_reason)}${activity.last_rule_name ? ` · ${text(activity.last_rule_name)}` : ""}</p>
+            </td>
+            <td class="whitespace-nowrap px-6 py-4 text-xs text-zinc-500">${formatTime(activity.last_activity_unix_timestamp_seconds)}</td>
+          </tr>
+        `;
+      }).join("");
+    }
+
     async function refresh() {
       const response = await fetch("/api/status", {
         headers: authHeaders()
@@ -6220,6 +6356,15 @@ DNS node -> upstream resolvers: UDP/TCP 53`;
       renderFleetNodes(data.node || {}, fleetNodes);
       const forwardedBytes = Number(stats.bytes_client_to_server || 0) + Number(stats.bytes_server_to_client || 0);
       const streamBytes = Number(stats.stream_bytes_client_to_server || 0) + Number(stats.stream_bytes_server_to_client || 0);
+      const smbConnections = stats.active_connection_details || [];
+      const activeSmbClients = new Set(smbConnections.map((connection) => endpointIp(connection.peer_addr)).filter(Boolean)).size;
+      const completedFileHashes = Number(stats.completed_file_hashes || 0);
+      const blockedSmbThreats = Number(stats.blocked_threats || 0);
+      const smbRouteStats = stats.route_stats || [];
+      const readySmbRoutes = smbRouteStats.filter((route) => route.listener_ready).length;
+      const smbRuntime = stats.policy_runtime || {};
+      const smbBlockingRules = smbRuntime.blocking_rules || [];
+      const smbMonitoringRules = smbRuntime.monitoring_rules || [];
 
       document.getElementById("overview-smb-traffic").textContent = formatBytes(streamBytes);
       document.getElementById("overview-smb-detail").textContent =
@@ -6233,6 +6378,29 @@ DNS node -> upstream resolvers: UDP/TCP 53`;
       document.getElementById("overview-blocked-dns").textContent = stats.dns_blocked_queries || 0;
       document.getElementById("overview-dns-policy-detail").textContent =
         `${stats.dns_monitored_queries || 0} monitored · ${stats.dns_udp_queries || 0} UDP · ${stats.dns_tcp_queries || 0} TCP`;
+      document.getElementById("smb-metric-traffic").textContent = formatBytes(streamBytes);
+      document.getElementById("smb-metric-traffic-detail").textContent =
+        `${formatBytes(forwardedBytes)} forwarded · ${formatBytes(stats.smb_write_bytes || 0)} uploaded`;
+      document.getElementById("smb-metric-connections").textContent = Number(stats.active_connections || 0).toLocaleString();
+      document.getElementById("smb-metric-connections-detail").textContent = activeSmbClients
+        ? `${activeSmbClients} active client${activeSmbClients === 1 ? "" : "s"} · ${Number(stats.total_connections || 0).toLocaleString()} sessions since start`
+        : `${Number(stats.total_connections || 0).toLocaleString()} sessions since start`;
+      document.getElementById("smb-metric-files").textContent = completedFileHashes.toLocaleString();
+      document.getElementById("smb-metric-files-detail").textContent =
+        `${Number(stats.observed_file_events || 0).toLocaleString()} observed · ${formatBytes(stats.inspected_bytes || 0)} inspected`;
+      document.getElementById("smb-metric-blocked").textContent = blockedSmbThreats.toLocaleString();
+      document.getElementById("smb-metric-blocked-detail").textContent = blockedSmbThreats
+        ? `${Number(stats.monitored_threats || 0).toLocaleString()} monitored · ${Number(stats.blocked_chunks || 0).toLocaleString()} blocked chunks`
+        : "No policy blocks recorded";
+      document.getElementById("smb-runtime-state").textContent = smbRouteStats.length
+        ? `${readySmbRoutes} of ${smbRouteStats.length} SMB proxy routes ready`
+        : "Waiting for an SMB proxy node";
+      document.getElementById("smb-runtime-detail").textContent = smbRuntime.generation
+        ? `Policy generation ${smbRuntime.generation} · ${smbBlockingRules.length} blocking rules · ${smbMonitoringRules.length} monitor rules · applied ${formatTime(smbRuntime.last_updated_unix_timestamp_seconds)}`
+        : "No active SMB policy telemetry received";
+      document.getElementById("smb-runtime-routes").textContent = `${readySmbRoutes}/${smbRouteStats.length} routes ready`;
+      document.getElementById("smb-runtime-reputation").textContent =
+        `${Number(stats.known_bad_reputation_hashes_loaded || 0).toLocaleString()} known-bad hashes`;
       document.getElementById("management-info").textContent = `${data.management_interface} at ${data.management_bind_addr}`;
       document.getElementById("refresh-state").textContent = `PID ${data.process_id} · ${data.config_path} · updated ${new Date().toLocaleTimeString()}`;
       updateTlsSettingsUi(data.security || {}, data.management_bind_addr);
@@ -6310,7 +6478,7 @@ DNS node -> upstream resolvers: UDP/TCP 53`;
         }).join("");
       }
 
-      const liveConnections = stats.active_connection_details || [];
+      const liveConnections = smbConnections;
       const liveConnectionsBody = document.getElementById("live-connections-body");
       document.getElementById("live-connection-count").textContent = `${liveConnections.length} live connections`;
       document.getElementById("live-connection-state").textContent = liveConnections.length
@@ -6440,39 +6608,8 @@ DNS node -> upstream resolvers: UDP/TCP 53`;
         })()}
       `).join("");
 
-      const fileActivity = stats.file_activity || [];
-      const fileActivityBody = document.getElementById("file-activity-body");
-      document.getElementById("file-activity-count").textContent = `${fileActivity.length} tracked files`;
-      document.getElementById("file-activity-state").textContent = fileActivity.length
-        ? `Latest file update ${formatTime(fileActivity[0].last_activity_unix_timestamp_seconds)}`
-        : "Waiting for per-file SMB activity";
-
-      if (!fileActivity.length) {
-        fileActivityBody.innerHTML = `<tr><td colspan="7" class="px-6 py-6 text-sm text-zinc-400">No file-level SMB activity recorded.</td></tr>`;
-      } else {
-        fileActivityBody.innerHTML = fileActivity.slice(0, 80).map((activity) => {
-          const isBlocked = Number(activity.blocked_events || 0) > 0 || activity.last_action === "block";
-          const isMonitored = Number(activity.monitored_events || 0) > 0 || activity.last_action === "monitor";
-          const resultClass = isBlocked ? "border-red-400/40 bg-red-500/10 text-red-100" : isMonitored ? "border-amber-400/40 bg-amber-500/10 text-amber-100" : "border-emerald-400/40 bg-emerald-500/10 text-emerald-100";
-          return `
-            <tr class="hover:bg-zinc-800/40">
-              <td class="max-w-xs px-6 py-4 text-sm font-medium text-white">
-                <p class="truncate">${text(activity.file_path)}</p>
-                <p class="mt-1 text-xs text-zinc-500">${text(activity.route_name)} · ${text(activity.interface)}</p>
-              </td>
-              <td class="whitespace-nowrap px-6 py-4 text-sm text-zinc-300">${clientLabel(activity.peer_addr)}</td>
-              <td class="whitespace-nowrap px-6 py-4 text-sm text-cyan-200">${text(activity.target_addr)}</td>
-              <td class="whitespace-nowrap px-6 py-4 text-sm text-lime-200">${formatBytes(activity.smb_write_bytes || 0)} · ${text(activity.smb_write_requests || 0)} writes</td>
-              <td class="whitespace-nowrap px-6 py-4 text-sm text-zinc-300">${text(activity.observed_events || 0)} seen · ${text(activity.blocked_events || 0)} blocked · ${text(activity.monitored_events || 0)} monitored</td>
-              <td class="min-w-72 px-6 py-4 text-sm text-zinc-300">
-                <span class="rounded-full border px-2.5 py-1 text-xs font-semibold uppercase ${resultClass}">${text(activity.last_action)}</span>
-                <p class="mt-2 line-clamp-2 text-zinc-400">${text(activity.last_reason)}${activity.last_rule_name ? ` · ${text(activity.last_rule_name)}` : ""}</p>
-              </td>
-              <td class="whitespace-nowrap px-6 py-4 text-xs text-zinc-500">${formatTime(activity.last_activity_unix_timestamp_seconds)}</td>
-            </tr>
-          `;
-        }).join("");
-      }
+      latestSmbFileActivity = stats.file_activity || [];
+      renderSmbFileActivity();
 
       latestAuditEvents = normalizeAuditEvents(stats, dnsEvents);
       latestAuditTotals = {
@@ -7439,11 +7576,22 @@ DNS node -> upstream resolvers: UDP/TCP 53`;
         document.getElementById("dns-local-type").value = "aaaa";
       }
     });
-    const dnsLiveQueryPanel = document.getElementById("dns-live-query-panel");
-    dnsLiveQueryPanel.open = localStorage.getItem("axiomDnsQueriesCollapsed") !== "true";
-    dnsLiveQueryPanel.addEventListener("toggle", () => {
-      localStorage.setItem("axiomDnsQueriesCollapsed", dnsLiveQueryPanel.open ? "false" : "true");
-    });
+    function bindCollapsiblePanel(id, storageKey, defaultOpen) {
+      const panel = document.getElementById(id);
+      const savedState = localStorage.getItem(storageKey);
+      panel.open = savedState === null ? defaultOpen : savedState === "open";
+      panel.addEventListener("toggle", () => {
+        localStorage.setItem(storageKey, panel.open ? "open" : "closed");
+      });
+    }
+
+    bindCollapsiblePanel("dns-live-query-panel", "axiomPanelDnsQueries", true);
+    bindCollapsiblePanel("smb-live-connections-panel", "axiomPanelSmbConnections", true);
+    bindCollapsiblePanel("smb-inspection-proof-panel", "axiomPanelSmbInspection", true);
+    bindCollapsiblePanel("smb-file-ledger-panel", "axiomPanelSmbLedger", false);
+    bindCollapsiblePanel("smb-policy-panel", "axiomPanelSmbPolicies", false);
+    document.getElementById("smb-file-search").addEventListener("input", renderSmbFileActivity);
+    document.getElementById("smb-file-action-filter").addEventListener("change", renderSmbFileActivity);
     document.getElementById("run-policy-self-test").addEventListener("click", runPolicySelfTest);
     document.getElementById("first-run-smoke-test").addEventListener("click", runSmokeTests);
     document.getElementById("run-smoke-tests").addEventListener("click", runSmokeTests);
