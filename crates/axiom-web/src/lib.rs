@@ -1,7 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     fs,
-    net::IpAddr,
+    net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
     process::Command,
     sync::{Arc, Mutex},
@@ -10,9 +10,11 @@ use std::{
 };
 
 use anyhow::Context;
+use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier, password_hash::SaltString};
 use axiom_config::{
-    AdminCredentials, AxiomConfig, DirectoryConfig, DnsPolicyConfig, NodeRole, PolicyConfig,
-    ProxyListenerConfig,
+    AdminCredentials, AxiomConfig, ClusterGroupConfig, ClusterMemberCredential,
+    ClusterServiceTemplate, ClusterTrafficMode, DirectoryConfig, DnsPolicyConfig, NodeRole,
+    PolicyConfig, ProxyListenerConfig,
 };
 use axiom_control::{
     ControlApplyResponse, ControlPolicyBundle, EncryptedEnvelope, decrypt_payload, encrypt_payload,
@@ -21,7 +23,9 @@ use axiom_core::{
     DnsPolicyRuntimeSnapshot, InspectionContext, InspectionResult, PolicyRuntimeSnapshot,
     RuntimeState, StatusSnapshot, TrafficDirection,
 };
-use axiom_license::{LicenseStatus, LicenseUsage, evaluate_license, install_license_text};
+use axiom_license::{
+    LicenseState, LicenseStatus, LicenseUsage, evaluate_license, install_license_text,
+};
 use axiom_net::bind_tcp_listener_to_interface;
 use axiom_reputation::{
     FileReputationReport, ReputationBulkImportRequest, ReputationBulkImportResponse,
@@ -31,7 +35,7 @@ use axiom_reputation::{
 use axum::{
     Json, Router,
     body::Body,
-    extract::{Path as AxumPath, State},
+    extract::{ConnectInfo, Path as AxumPath, State},
     http::{HeaderMap, HeaderValue, Request, StatusCode, header},
     middleware::{self, Next},
     response::{Html, IntoResponse, Redirect, Response},
@@ -48,6 +52,9 @@ const SESSION_MAX_AGE_SECONDS: u64 = 8 * 60 * 60;
 const DEFAULT_MANAGEMENT_TLS_CERT_PATH: &str = "/etc/axiom/tls/axiom.crt";
 const DEFAULT_MANAGEMENT_TLS_KEY_PATH: &str = "/etc/axiom/tls/axiom.key";
 const AXIOM_RESTART_HELPER_PATH: &str = "/usr/local/sbin/axiom-restart-service";
+const CLUSTER_JOIN_FAILURE_LIMIT: u32 = 5;
+const CLUSTER_JOIN_WINDOW_SECONDS: u64 = 60;
+const CLUSTER_JOIN_LOCKOUT_SECONDS: u64 = 120;
 
 struct WebState {
     runtime: Arc<RuntimeState>,
@@ -56,12 +63,20 @@ struct WebState {
     reputation: Arc<ReputationStore>,
     fleet_nodes: Mutex<HashMap<String, FleetNodeStatus>>,
     client_identities: Mutex<HashMap<String, ClientIdentityCacheEntry>>,
+    cluster_join_attempts: Mutex<HashMap<String, ClusterJoinThrottle>>,
 }
 
 #[derive(Debug, Clone)]
 struct ClientIdentityCacheEntry {
     hostname: String,
     expires_unix_timestamp_seconds: u64,
+}
+
+#[derive(Debug, Clone)]
+struct ClusterJoinThrottle {
+    window_started_unix_timestamp_seconds: u64,
+    failed_attempts: u32,
+    blocked_until_unix_timestamp_seconds: u64,
 }
 
 pub async fn run_management_server(
@@ -92,6 +107,7 @@ pub async fn run_management_server(
         reputation,
         fleet_nodes: Mutex::new(HashMap::new()),
         client_identities: Mutex::new(HashMap::new()),
+        cluster_join_attempts: Mutex::new(HashMap::new()),
     });
 
     let app = Router::new()
@@ -105,6 +121,17 @@ pub async fn run_management_server(
         .route("/api/backup/restore", post(api_backup_restore))
         .route("/api/nodes/report", post(api_node_report))
         .route("/api/nodes/runtime-config", get(api_node_runtime_config))
+        .route("/api/clusters", get(api_clusters).post(api_create_cluster))
+        .route("/api/clusters/join", post(api_join_cluster))
+        .route(
+            "/api/clusters/{name}",
+            put(api_update_cluster).delete(api_delete_cluster),
+        )
+        .route("/api/clusters/{name}/sync", post(api_sync_cluster))
+        .route(
+            "/api/clusters/{name}/members/{node_id}",
+            axum::routing::delete(api_remove_cluster_member),
+        )
         .route(
             "/api/management/tls",
             get(api_management_tls).put(api_update_management_tls),
@@ -153,7 +180,7 @@ pub async fn run_management_server(
                     "management GUI server started"
                 );
                 axum_server::from_tcp_rustls(listener.into_std()?, tls_config)
-                    .serve(app.into_make_service())
+                    .serve(app.into_make_service_with_connect_info::<SocketAddr>())
                     .await?;
             }
             Err(error) => {
@@ -170,7 +197,11 @@ pub async fn run_management_server(
                     tls_fallback = true,
                     "management GUI server started"
                 );
-                axum::serve(listener, app).await?;
+                axum::serve(
+                    listener,
+                    app.into_make_service_with_connect_info::<SocketAddr>(),
+                )
+                .await?;
             }
         }
     } else {
@@ -180,7 +211,11 @@ pub async fn run_management_server(
             tls_enabled = false,
             "management GUI server started"
         );
-        axum::serve(listener, app).await?;
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await?;
     }
     Ok(())
 }
@@ -539,7 +574,7 @@ async fn api_node_report(
     State(state): State<Arc<WebState>>,
     Json(report): Json<NodeReport>,
 ) -> Response {
-    if !is_node_authorized(&headers, &state) {
+    let Some(node_authorization) = node_authorization(&headers, &state) else {
         return (
             StatusCode::UNAUTHORIZED,
             Json(ErrorResponse {
@@ -547,7 +582,7 @@ async fn api_node_report(
             }),
         )
             .into_response();
-    }
+    };
 
     let node_id = report.node_id.trim().to_string();
     if node_id.is_empty() {
@@ -567,6 +602,32 @@ async fn api_node_report(
         .get(&node_id)
         .and_then(|node| node.last_control_push.clone());
 
+    let cluster_name = match node_authorization {
+        NodeAuthorization::Legacy => None,
+        NodeAuthorization::Cluster {
+            name,
+            role,
+            node_id: authorized_node_id,
+        } => {
+            if report.role != role
+                || node_id != authorized_node_id
+                || !report
+                    .cluster_name
+                    .as_deref()
+                    .is_some_and(|reported| reported.eq_ignore_ascii_case(&name))
+            {
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json(ErrorResponse {
+                        message: "node role or cluster identity does not match its credential",
+                    }),
+                )
+                    .into_response();
+            }
+            Some(name)
+        }
+    };
+
     let status = FleetNodeStatus {
         node_id: node_id.clone(),
         display_name: report.display_name,
@@ -576,6 +637,8 @@ async fn api_node_report(
         last_seen_unix_timestamp_seconds: unix_timestamp_seconds(),
         management_url: report.management_url,
         control_url: report.control_url,
+        cluster_name,
+        service_template: report.service_template,
         proxy_listeners: report.proxy_listeners,
         dns: report.dns,
         stats: report.stats,
@@ -615,6 +678,681 @@ async fn api_node_runtime_config(
         known_bad_reputation_hashes: state.reputation.known_bad_sha256s(),
     })
     .into_response()
+}
+
+async fn api_clusters(headers: HeaderMap, State(state): State<Arc<WebState>>) -> Response {
+    if !is_authorized(&headers, &state) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(ApiErrorResponse::new("authentication required")),
+        )
+            .into_response();
+    }
+
+    Json(cluster_summaries(&state)).into_response()
+}
+
+async fn api_create_cluster(
+    headers: HeaderMap,
+    State(state): State<Arc<WebState>>,
+    Json(request): Json<ClusterCreateRequest>,
+) -> Response {
+    if !is_authorized(&headers, &state) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(ApiErrorResponse::new("authentication required")),
+        )
+            .into_response();
+    }
+
+    let name = request.name.trim().to_string();
+    if let Err(message) = validate_cluster_password(&request.password) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ApiErrorResponse::new(message)),
+        )
+            .into_response();
+    }
+
+    let source = fleet_node_snapshots(&state)
+        .into_iter()
+        .find(|node| node.node_id == request.source_node_id);
+    let Some(source) = source else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ApiErrorResponse::new(
+                "source node is not currently reporting",
+            )),
+        )
+            .into_response();
+    };
+    if source.role != request.role || !matches!(request.role, NodeRole::Dns | NodeRole::SmbProxy) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ApiErrorResponse::new(
+                "source node role must match a dns or smb_proxy cluster",
+            )),
+        )
+            .into_response();
+    }
+    if (request.role == NodeRole::Dns && source.service_template.dns.is_none())
+        || (request.role == NodeRole::SmbProxy && source.service_template.smb_routes.is_empty())
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ApiErrorResponse::new(
+                "source node has not reported a usable service template yet",
+            )),
+        )
+            .into_response();
+    }
+
+    let password_hash = match hash_cluster_password(request.password).await {
+        Ok(hash) => hash,
+        Err(error) => {
+            warn!(?error, "failed hashing cluster join password");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiErrorResponse::new("failed securing cluster password")),
+            )
+                .into_response();
+        }
+    };
+    let service_endpoint = request
+        .service_endpoint
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let group = ClusterGroupConfig {
+        name: name.clone(),
+        role: request.role,
+        password_hash,
+        source_node_id: source.node_id,
+        members: Vec::new(),
+        traffic_mode: request.traffic_mode,
+        service_endpoint,
+        created_unix_timestamp_seconds: unix_timestamp_seconds(),
+        service_template: source.service_template,
+    };
+
+    let persisted = {
+        let mut config = state.config.lock().expect("web config mutex poisoned");
+        if config
+            .clusters
+            .groups
+            .iter()
+            .any(|existing| existing.name.eq_ignore_ascii_case(&name))
+        {
+            return (
+                StatusCode::CONFLICT,
+                Json(ApiErrorResponse::new("cluster name already exists")),
+            )
+                .into_response();
+        }
+        if config.clusters.groups.iter().any(|existing| {
+            existing.source_node_id == group.source_node_id
+                || existing
+                    .members
+                    .iter()
+                    .any(|member| member.node_id == group.source_node_id)
+        }) {
+            return (
+                StatusCode::CONFLICT,
+                Json(ApiErrorResponse::new(
+                    "source node is already assigned to another cluster",
+                )),
+            )
+                .into_response();
+        }
+        let mut candidate = config.clone();
+        candidate.clusters.groups.push(group);
+        if let Err(error) = candidate.validate() {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ApiErrorResponse::new(error.to_string())),
+            )
+                .into_response();
+        }
+        let result = persist_config(&state.config_path, &candidate);
+        if result.is_ok() {
+            *config = candidate;
+        }
+        result
+    };
+
+    match persisted {
+        Ok(()) => {
+            info!(
+                cluster = name,
+                role = request.role.as_str(),
+                "cluster created"
+            );
+            Json(ClusterMutationResponse {
+                message: "cluster created",
+                clusters: cluster_summaries(&state),
+            })
+            .into_response()
+        }
+        Err(error) => {
+            warn!(?error, "failed persisting cluster");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiErrorResponse::new("failed saving cluster configuration")),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn api_update_cluster(
+    headers: HeaderMap,
+    State(state): State<Arc<WebState>>,
+    AxumPath(name): AxumPath<String>,
+    Json(request): Json<ClusterUpdateRequest>,
+) -> Response {
+    if !is_authorized(&headers, &state) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(ApiErrorResponse::new("authentication required")),
+        )
+            .into_response();
+    }
+
+    let password_hash = if let Some(password) = request.password {
+        if let Err(message) = validate_cluster_password(&password) {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ApiErrorResponse::new(message)),
+            )
+                .into_response();
+        }
+        match hash_cluster_password(password).await {
+            Ok(hash) => Some(hash),
+            Err(error) => {
+                warn!(?error, "failed rotating cluster join password");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ApiErrorResponse::new("failed securing cluster password")),
+                )
+                    .into_response();
+            }
+        }
+    } else {
+        None
+    };
+
+    let persisted = {
+        let mut config = state.config.lock().expect("web config mutex poisoned");
+        let mut candidate = config.clone();
+        let Some(group) = candidate
+            .clusters
+            .groups
+            .iter_mut()
+            .find(|group| group.name.eq_ignore_ascii_case(&name))
+        else {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(ApiErrorResponse::new("cluster not found")),
+            )
+                .into_response();
+        };
+        if let Some(password_hash) = password_hash {
+            group.password_hash = password_hash;
+        }
+        if let Some(traffic_mode) = request.traffic_mode {
+            group.traffic_mode = traffic_mode;
+        }
+        if let Some(endpoint) = request.service_endpoint {
+            group.service_endpoint =
+                Some(endpoint.trim().to_string()).filter(|value| !value.is_empty());
+        }
+        let result = candidate
+            .validate()
+            .map_err(anyhow::Error::from)
+            .and_then(|_| persist_config(&state.config_path, &candidate));
+        if result.is_ok() {
+            *config = candidate;
+        }
+        result
+    };
+
+    match persisted {
+        Ok(()) => Json(ClusterMutationResponse {
+            message: "cluster updated",
+            clusters: cluster_summaries(&state),
+        })
+        .into_response(),
+        Err(error) => {
+            warn!(?error, "failed updating cluster");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiErrorResponse::new(
+                    "failed updating cluster configuration",
+                )),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn api_delete_cluster(
+    headers: HeaderMap,
+    State(state): State<Arc<WebState>>,
+    AxumPath(name): AxumPath<String>,
+) -> Response {
+    if !is_authorized(&headers, &state) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(ApiErrorResponse::new("authentication required")),
+        )
+            .into_response();
+    }
+    if fleet_node_snapshots(&state).iter().any(|node| {
+        node.cluster_name
+            .as_deref()
+            .is_some_and(|cluster| cluster.eq_ignore_ascii_case(&name))
+    }) {
+        return (
+            StatusCode::CONFLICT,
+            Json(ApiErrorResponse::new(
+                "remove or re-enroll replica nodes before deleting this cluster",
+            )),
+        )
+            .into_response();
+    }
+
+    let persisted = {
+        let mut config = state.config.lock().expect("web config mutex poisoned");
+        let mut candidate = config.clone();
+        let before = candidate.clusters.groups.len();
+        candidate
+            .clusters
+            .groups
+            .retain(|group| !group.name.eq_ignore_ascii_case(&name));
+        if before == candidate.clusters.groups.len() {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(ApiErrorResponse::new("cluster not found")),
+            )
+                .into_response();
+        }
+        let result = persist_config(&state.config_path, &candidate);
+        if result.is_ok() {
+            *config = candidate;
+        }
+        result
+    };
+
+    match persisted {
+        Ok(()) => Json(ClusterMutationResponse {
+            message: "cluster deleted",
+            clusters: cluster_summaries(&state),
+        })
+        .into_response(),
+        Err(error) => {
+            warn!(?error, "failed deleting cluster");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiErrorResponse::new("failed deleting cluster")),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn api_join_cluster(
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    State(state): State<Arc<WebState>>,
+    Json(request): Json<ClusterJoinRequest>,
+) -> Response {
+    let node_id = request.node_id.trim().to_string();
+    let cluster_name = request.name.trim().to_ascii_lowercase();
+    let throttle_key = format!("{}|{cluster_name}", peer_addr.ip());
+    if cluster_join_is_throttled(&state, &throttle_key) {
+        warn!(peer = %peer_addr.ip(), cluster = cluster_name, "cluster join temporarily rate limited");
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(ApiErrorResponse::new(
+                "too many failed cluster enrollment attempts; retry later",
+            )),
+        )
+            .into_response();
+    }
+    let group = {
+        let config = state.config.lock().expect("web config mutex poisoned");
+        config
+            .clusters
+            .groups
+            .iter()
+            .find(|group| group.name.eq_ignore_ascii_case(request.name.trim()))
+            .cloned()
+    };
+    let Some(group) = group else {
+        record_failed_cluster_join(&state, &throttle_key);
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(ApiErrorResponse::new("cluster credentials are invalid")),
+        )
+            .into_response();
+    };
+    if node_id.is_empty() || request.role != group.role {
+        record_failed_cluster_join(&state, &throttle_key);
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(ApiErrorResponse::new("cluster credentials are invalid")),
+        )
+            .into_response();
+    }
+    match verify_cluster_password(request.password, group.password_hash.clone()).await {
+        Ok(true) => {}
+        Ok(false) => {
+            record_failed_cluster_join(&state, &throttle_key);
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(ApiErrorResponse::new("cluster credentials are invalid")),
+            )
+                .into_response();
+        }
+        Err(error) => {
+            warn!(
+                ?error,
+                cluster = group.name,
+                "cluster password verification failed"
+            );
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiErrorResponse::new("cluster verification failed")),
+            )
+                .into_response();
+        }
+    }
+    clear_cluster_join_failures(&state, &throttle_key);
+
+    let enrollment_token = generate_enrollment_token();
+    let fleet_nodes = fleet_node_snapshots(&state);
+    let client_identities: HashMap<_, _> = state
+        .client_identities
+        .lock()
+        .expect("client identity mutex poisoned")
+        .iter()
+        .map(|(address, entry)| (address.clone(), entry.hostname.clone()))
+        .collect();
+    let persisted = {
+        let mut config = state.config.lock().expect("web config mutex poisoned");
+        let mut candidate = config.clone();
+        if candidate.clusters.groups.iter().any(|candidate_group| {
+            !candidate_group.name.eq_ignore_ascii_case(&group.name)
+                && (candidate_group.source_node_id == node_id
+                    || candidate_group
+                        .members
+                        .iter()
+                        .any(|member| member.node_id == node_id))
+        }) {
+            return (
+                StatusCode::CONFLICT,
+                Json(ApiErrorResponse::new(
+                    "node ID is already assigned to another cluster",
+                )),
+            )
+                .into_response();
+        }
+        let Some(candidate_group) = candidate
+            .clusters
+            .groups
+            .iter_mut()
+            .find(|candidate| candidate.name.eq_ignore_ascii_case(&group.name))
+        else {
+            return (
+                StatusCode::CONFLICT,
+                Json(ApiErrorResponse::new("cluster changed during enrollment")),
+            )
+                .into_response();
+        };
+        candidate_group
+            .members
+            .retain(|member| member.node_id != node_id);
+        candidate_group.members.push(ClusterMemberCredential {
+            node_id: node_id.clone(),
+            token: enrollment_token.clone(),
+            issued_unix_timestamp_seconds: unix_timestamp_seconds(),
+        });
+        let usage = build_license_usage(
+            &candidate,
+            &fleet_nodes,
+            &state.reputation,
+            &client_identities,
+        );
+        let license = evaluate_license(&candidate.license, usage);
+        if license.state == LicenseState::LimitExceeded {
+            return (
+                StatusCode::PAYMENT_REQUIRED,
+                Json(ApiErrorResponse::new(license.message)),
+            )
+                .into_response();
+        }
+        let result = candidate
+            .validate()
+            .map_err(anyhow::Error::from)
+            .and_then(|_| persist_config(&state.config_path, &candidate));
+        if result.is_ok() {
+            *config = candidate;
+        }
+        result
+    };
+    if let Err(error) = persisted {
+        warn!(
+            ?error,
+            cluster = group.name,
+            node_id,
+            "failed saving cluster member credential"
+        );
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiErrorResponse::new("failed registering cluster member")),
+        )
+            .into_response();
+    }
+
+    let management_url = {
+        let config = state.config.lock().expect("web config mutex poisoned");
+        current_management_url(&config)
+    };
+    info!(
+        cluster = group.name,
+        node_id,
+        role = request.role.as_str(),
+        "cluster node enrollment approved"
+    );
+    Json(ClusterJoinResponse {
+        accepted: true,
+        cluster_name: group.name,
+        role: group.role,
+        source_node_id: group.source_node_id,
+        management_url,
+        enrollment_token,
+        traffic_mode: group.traffic_mode,
+        service_endpoint: group.service_endpoint,
+        service_template: group.service_template,
+    })
+    .into_response()
+}
+
+async fn api_sync_cluster(
+    headers: HeaderMap,
+    State(state): State<Arc<WebState>>,
+    AxumPath(name): AxumPath<String>,
+) -> Response {
+    if !is_authorized(&headers, &state) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(ApiErrorResponse::new("authentication required")),
+        )
+            .into_response();
+    }
+    let group = {
+        let config = state.config.lock().expect("web config mutex poisoned");
+        config
+            .clusters
+            .groups
+            .iter()
+            .find(|group| group.name.eq_ignore_ascii_case(&name))
+            .cloned()
+    };
+    let Some(mut group) = group else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(ApiErrorResponse::new("cluster not found")),
+        )
+            .into_response();
+    };
+
+    if let Some(source) = fleet_node_snapshots(&state)
+        .into_iter()
+        .find(|node| node.node_id == group.source_node_id && node.role == group.role)
+    {
+        let source_template_is_usable = match group.role {
+            NodeRole::Dns => source.service_template.dns.is_some(),
+            NodeRole::SmbProxy => !source.service_template.smb_routes.is_empty(),
+            _ => false,
+        };
+        if source_template_is_usable && source.service_template != group.service_template {
+            let persisted = {
+                let mut config = state.config.lock().expect("web config mutex poisoned");
+                let mut candidate = config.clone();
+                let Some(candidate_group) = candidate
+                    .clusters
+                    .groups
+                    .iter_mut()
+                    .find(|candidate| candidate.name.eq_ignore_ascii_case(&group.name))
+                else {
+                    return (
+                        StatusCode::CONFLICT,
+                        Json(ApiErrorResponse::new(
+                            "cluster changed during synchronization",
+                        )),
+                    )
+                        .into_response();
+                };
+                candidate_group.service_template = source.service_template.clone();
+                let result = candidate
+                    .validate()
+                    .map_err(anyhow::Error::from)
+                    .and_then(|_| persist_config(&state.config_path, &candidate));
+                if result.is_ok() {
+                    *config = candidate;
+                }
+                result
+            };
+            if let Err(error) = persisted {
+                warn!(
+                    ?error,
+                    cluster = group.name,
+                    "failed refreshing cluster service template"
+                );
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ApiErrorResponse::new(
+                        "failed refreshing cluster service template",
+                    )),
+                )
+                    .into_response();
+            }
+            group.service_template = source.service_template;
+        }
+    }
+    let (policy, dns_policy, reputation) = match group.role {
+        NodeRole::SmbProxy => (
+            Some(state.runtime.policy_config()),
+            None,
+            Some(state.reputation.known_bad_sha256s()),
+        ),
+        NodeRole::Dns => (None, Some(state.runtime.dns_policy_config()), None),
+        _ => unreachable!(),
+    };
+    let results =
+        push_policy_bundle_to_cluster(&state, &group, policy, dns_policy, reputation).await;
+    Json(ClusterSyncResponse {
+        message: "cluster synchronization completed",
+        node_push_results: results,
+    })
+    .into_response()
+}
+
+async fn api_remove_cluster_member(
+    headers: HeaderMap,
+    State(state): State<Arc<WebState>>,
+    AxumPath((name, node_id)): AxumPath<(String, String)>,
+) -> Response {
+    if !is_authorized(&headers, &state) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(ApiErrorResponse::new("authentication required")),
+        )
+            .into_response();
+    }
+
+    let persisted = {
+        let mut config = state.config.lock().expect("web config mutex poisoned");
+        let mut candidate = config.clone();
+        let Some(group) = candidate
+            .clusters
+            .groups
+            .iter_mut()
+            .find(|group| group.name.eq_ignore_ascii_case(&name))
+        else {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(ApiErrorResponse::new("cluster not found")),
+            )
+                .into_response();
+        };
+        if group.source_node_id == node_id {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ApiErrorResponse::new(
+                    "the source node cannot be removed from its cluster",
+                )),
+            )
+                .into_response();
+        }
+        let before = group.members.len();
+        group.members.retain(|member| member.node_id != node_id);
+        if before == group.members.len() {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(ApiErrorResponse::new("cluster member not found")),
+            )
+                .into_response();
+        }
+        let result = persist_config(&state.config_path, &candidate);
+        if result.is_ok() {
+            *config = candidate;
+        }
+        result
+    };
+
+    match persisted {
+        Ok(()) => {
+            state
+                .fleet_nodes
+                .lock()
+                .expect("fleet nodes mutex poisoned")
+                .remove(&node_id);
+            info!(cluster = name, node_id, "cluster member credential revoked");
+            Json(ClusterMutationResponse {
+                message: "cluster member removed",
+                clusters: cluster_summaries(&state),
+            })
+            .into_response()
+        }
+        Err(error) => {
+            warn!(?error, "failed removing cluster member");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiErrorResponse::new("failed removing cluster member")),
+            )
+                .into_response()
+        }
+    }
 }
 
 async fn api_reputation(headers: HeaderMap, State(state): State<Arc<WebState>>) -> Response {
@@ -1407,6 +2145,7 @@ fn build_status_response(state: &WebState) -> StatusResponse {
     let stats = state.runtime.snapshot();
     let deployment_warnings = build_deployment_warnings(&config, &stats);
     let fleet_nodes = fleet_node_snapshots(state);
+    let clusters = cluster_summaries(state);
     let client_identities =
         resolve_client_identities(state, &config.management.directory, &stats, &fleet_nodes);
     let license =
@@ -1429,6 +2168,7 @@ fn build_status_response(state: &WebState) -> StatusResponse {
         dns: DnsStatus::from(&config.dns),
         deployment_warnings,
         fleet_nodes,
+        clusters,
         client_identities,
         stats,
     }
@@ -1465,25 +2205,44 @@ fn build_license_usage(
     reputation: &ReputationStore,
     client_identities: &HashMap<String, String>,
 ) -> LicenseUsage {
-    let mut smb_nodes = u32::from(config.node.role.runs_smb_proxy());
-    let mut dns_nodes = u32::from(config.node.role.runs_dns() && config.dns.enabled);
+    let mut smb_node_ids = HashSet::new();
+    let mut dns_node_ids = HashSet::new();
+    if config.node.role.runs_smb_proxy() {
+        smb_node_ids.insert(config.node.node_id.clone());
+    }
+    if config.node.role.runs_dns() && config.dns.enabled {
+        dns_node_ids.insert(config.node.node_id.clone());
+    }
 
     for node in fleet_nodes {
         match node.role {
-            NodeRole::SmbProxy => smb_nodes = smb_nodes.saturating_add(1),
-            NodeRole::Dns => dns_nodes = dns_nodes.saturating_add(1),
+            NodeRole::SmbProxy => {
+                smb_node_ids.insert(node.node_id.clone());
+            }
+            NodeRole::Dns => {
+                dns_node_ids.insert(node.node_id.clone());
+            }
             NodeRole::StandaloneLab => {
-                smb_nodes = smb_nodes.saturating_add(1);
-                dns_nodes = dns_nodes.saturating_add(1);
+                smb_node_ids.insert(node.node_id.clone());
+                dns_node_ids.insert(node.node_id.clone());
             }
             NodeRole::Management => {}
         }
     }
+    for group in &config.clusters.groups {
+        let target = match group.role {
+            NodeRole::SmbProxy => &mut smb_node_ids,
+            NodeRole::Dns => &mut dns_node_ids,
+            _ => continue,
+        };
+        target.insert(group.source_node_id.clone());
+        target.extend(group.members.iter().map(|member| member.node_id.clone()));
+    }
 
     LicenseUsage {
         management_nodes: u32::from(config.node.role.runs_management()),
-        smb_nodes,
-        dns_nodes,
+        smb_nodes: smb_node_ids.len() as u32,
+        dns_nodes: dns_node_ids.len() as u32,
         protected_clients: client_identities.len() as u32,
         reputation_entries: reputation.list().summary.total_entries as u32,
     }
@@ -1829,27 +2588,240 @@ fn is_authorized(headers: &HeaderMap, state: &WebState) -> bool {
     false
 }
 
-fn is_node_authorized(headers: &HeaderMap, state: &WebState) -> bool {
-    let expected_token = {
-        let config = state.config.lock().expect("web config mutex poisoned");
-        config.node.enrollment_token.clone()
-    };
-    let Some(expected_token) = expected_token else {
-        return false;
-    };
+#[derive(Debug, Clone)]
+enum NodeAuthorization {
+    Legacy,
+    Cluster {
+        name: String,
+        role: NodeRole,
+        node_id: String,
+    },
+}
 
-    if expected_token.is_empty() {
-        return false;
-    }
+fn bearer_token(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(header::AUTHORIZATION)?
+        .to_str()
+        .ok()?
+        .strip_prefix("Bearer ")
+}
 
-    if let Some(header_value) = headers.get(header::AUTHORIZATION)
-        && let Ok(value) = header_value.to_str()
-        && let Some(token) = value.strip_prefix("Bearer ")
+fn node_authorization(headers: &HeaderMap, state: &WebState) -> Option<NodeAuthorization> {
+    let supplied_token = bearer_token(headers)?;
+    let config = state.config.lock().expect("web config mutex poisoned");
+
+    if config
+        .node
+        .enrollment_token
+        .as_deref()
+        .is_some_and(|token| {
+            !token.is_empty() && constant_time_eq(supplied_token.as_bytes(), token.as_bytes())
+        })
     {
-        return constant_time_eq(token.as_bytes(), expected_token.as_bytes());
+        return Some(NodeAuthorization::Legacy);
     }
 
-    false
+    config.clusters.groups.iter().find_map(|group| {
+        group.members.iter().find_map(|member| {
+            constant_time_eq(supplied_token.as_bytes(), member.token.as_bytes()).then(|| {
+                NodeAuthorization::Cluster {
+                    name: group.name.clone(),
+                    role: group.role,
+                    node_id: member.node_id.clone(),
+                }
+            })
+        })
+    })
+}
+
+fn is_node_authorized(headers: &HeaderMap, state: &WebState) -> bool {
+    node_authorization(headers, state).is_some()
+}
+
+fn validate_cluster_password(password: &str) -> Result<(), &'static str> {
+    if password.len() < 12 {
+        return Err("cluster password must contain at least 12 characters");
+    }
+    if password.len() > 256 {
+        return Err("cluster password must not exceed 256 characters");
+    }
+    Ok(())
+}
+
+fn cluster_join_is_throttled(state: &WebState, key: &str) -> bool {
+    let now = unix_timestamp_seconds();
+    let mut attempts = state
+        .cluster_join_attempts
+        .lock()
+        .expect("cluster join attempts mutex poisoned");
+    attempts.retain(|_, entry| {
+        entry.blocked_until_unix_timestamp_seconds > now
+            || now.saturating_sub(entry.window_started_unix_timestamp_seconds)
+                <= CLUSTER_JOIN_WINDOW_SECONDS
+    });
+    attempts
+        .get(key)
+        .is_some_and(|entry| entry.blocked_until_unix_timestamp_seconds > now)
+}
+
+fn record_failed_cluster_join(state: &WebState, key: &str) {
+    let now = unix_timestamp_seconds();
+    let mut attempts = state
+        .cluster_join_attempts
+        .lock()
+        .expect("cluster join attempts mutex poisoned");
+    let entry = attempts
+        .entry(key.to_string())
+        .or_insert(ClusterJoinThrottle {
+            window_started_unix_timestamp_seconds: now,
+            failed_attempts: 0,
+            blocked_until_unix_timestamp_seconds: 0,
+        });
+    if now.saturating_sub(entry.window_started_unix_timestamp_seconds) > CLUSTER_JOIN_WINDOW_SECONDS
+    {
+        entry.window_started_unix_timestamp_seconds = now;
+        entry.failed_attempts = 0;
+        entry.blocked_until_unix_timestamp_seconds = 0;
+    }
+    entry.failed_attempts = entry.failed_attempts.saturating_add(1);
+    if entry.failed_attempts >= CLUSTER_JOIN_FAILURE_LIMIT {
+        entry.blocked_until_unix_timestamp_seconds = now + CLUSTER_JOIN_LOCKOUT_SECONDS;
+    }
+}
+
+fn clear_cluster_join_failures(state: &WebState, key: &str) {
+    state
+        .cluster_join_attempts
+        .lock()
+        .expect("cluster join attempts mutex poisoned")
+        .remove(key);
+}
+
+async fn hash_cluster_password(password: String) -> anyhow::Result<String> {
+    tokio::task::spawn_blocking(move || {
+        let mut salt_bytes = [0_u8; 16];
+        getrandom::fill(&mut salt_bytes)
+            .map_err(|error| anyhow::anyhow!("failed generating cluster password salt: {error}"))?;
+        let salt = SaltString::encode_b64(&salt_bytes)
+            .map_err(|error| anyhow::anyhow!("failed encoding cluster password salt: {error}"))?;
+        Argon2::default()
+            .hash_password(password.as_bytes(), &salt)
+            .map(|hash| hash.to_string())
+            .map_err(|error| anyhow::anyhow!("failed hashing cluster password: {error}"))
+    })
+    .await
+    .context("cluster password hashing task failed")?
+}
+
+async fn verify_cluster_password(password: String, password_hash: String) -> anyhow::Result<bool> {
+    tokio::task::spawn_blocking(move || {
+        let parsed = PasswordHash::new(&password_hash)
+            .map_err(|error| anyhow::anyhow!("invalid cluster password hash: {error}"))?;
+        Ok(Argon2::default()
+            .verify_password(password.as_bytes(), &parsed)
+            .is_ok())
+    })
+    .await
+    .context("cluster password verification task failed")?
+}
+
+fn cluster_summaries(state: &WebState) -> Vec<ClusterSummary> {
+    let groups = {
+        let config = state.config.lock().expect("web config mutex poisoned");
+        config.clusters.groups.clone()
+    };
+    let nodes = fleet_node_snapshots(state);
+    let now = unix_timestamp_seconds();
+    let mut summaries: Vec<_> = groups
+        .into_iter()
+        .map(|group| {
+            let mut members: Vec<_> = nodes
+                .iter()
+                .filter(|node| {
+                    node.node_id == group.source_node_id
+                        || node
+                            .cluster_name
+                            .as_deref()
+                            .is_some_and(|name| name.eq_ignore_ascii_case(&group.name))
+                })
+                .map(|node| {
+                    let age = now.saturating_sub(node.last_seen_unix_timestamp_seconds);
+                    let health = if age <= 15 {
+                        "online"
+                    } else if age <= 45 {
+                        "degraded"
+                    } else {
+                        "offline"
+                    };
+                    ClusterMemberSummary {
+                        node_id: node.node_id.clone(),
+                        display_name: node.display_name.clone(),
+                        role: node.role,
+                        source: node.node_id == group.source_node_id,
+                        health,
+                        last_seen_unix_timestamp_seconds: node.last_seen_unix_timestamp_seconds,
+                        control_url: node.control_url.clone(),
+                        configuration_in_sync: Some(
+                            node.service_template == group.service_template,
+                        ),
+                        last_control_push: node.last_control_push.clone(),
+                    }
+                })
+                .collect();
+            for registered in &group.members {
+                if !members
+                    .iter()
+                    .any(|member| member.node_id == registered.node_id)
+                {
+                    members.push(ClusterMemberSummary {
+                        node_id: registered.node_id.clone(),
+                        display_name: registered.node_id.clone(),
+                        role: group.role,
+                        source: false,
+                        health: "offline",
+                        last_seen_unix_timestamp_seconds: 0,
+                        control_url: None,
+                        configuration_in_sync: None,
+                        last_control_push: None,
+                    });
+                }
+            }
+            members.sort_by(|left, right| {
+                right
+                    .source
+                    .cmp(&left.source)
+                    .then_with(|| left.node_id.cmp(&right.node_id))
+            });
+            let online_count = members
+                .iter()
+                .filter(|member| member.health == "online")
+                .count();
+            let degraded_count = members
+                .iter()
+                .filter(|member| member.health == "degraded")
+                .count();
+            let offline_count = members
+                .iter()
+                .filter(|member| member.health == "offline")
+                .count();
+            let replica_count = members.iter().filter(|member| !member.source).count();
+            ClusterSummary {
+                name: group.name,
+                role: group.role,
+                source_node_id: group.source_node_id,
+                traffic_mode: group.traffic_mode,
+                service_endpoint: group.service_endpoint,
+                created_unix_timestamp_seconds: group.created_unix_timestamp_seconds,
+                replica_count,
+                online_count,
+                degraded_count,
+                offline_count,
+                members,
+            }
+        })
+        .collect();
+    summaries.sort_by(|left, right| left.name.cmp(&right.name));
+    summaries
 }
 
 fn cookie_value<'a>(cookie_header: &'a str, name: &str) -> Option<&'a str> {
@@ -2337,32 +3309,53 @@ async fn push_policy_bundle_to_nodes(
         })
         .collect();
 
+    push_policy_bundle_to_selected_nodes(
+        state,
+        target_nodes,
+        policy,
+        dns_policy,
+        known_bad_reputation_hashes,
+    )
+    .await
+}
+
+async fn push_policy_bundle_to_cluster(
+    state: &WebState,
+    group: &ClusterGroupConfig,
+    policy: Option<PolicyConfig>,
+    dns_policy: Option<DnsPolicyConfig>,
+    known_bad_reputation_hashes: Option<Vec<String>>,
+) -> Vec<NodePushResult> {
+    let target_nodes = fleet_node_snapshots(state)
+        .into_iter()
+        .filter(|node| {
+            node.node_id == group.source_node_id
+                || node
+                    .cluster_name
+                    .as_deref()
+                    .is_some_and(|name| name.eq_ignore_ascii_case(&group.name))
+        })
+        .collect();
+    push_policy_bundle_to_selected_nodes(
+        state,
+        target_nodes,
+        policy,
+        dns_policy,
+        known_bad_reputation_hashes,
+    )
+    .await
+}
+
+async fn push_policy_bundle_to_selected_nodes(
+    state: &WebState,
+    target_nodes: Vec<FleetNodeStatus>,
+    policy: Option<PolicyConfig>,
+    dns_policy: Option<DnsPolicyConfig>,
+    known_bad_reputation_hashes: Option<Vec<String>>,
+) -> Vec<NodePushResult> {
     if target_nodes.is_empty() {
         return Vec::new();
     }
-
-    let shared_secret = {
-        let config = state.config.lock().expect("web config mutex poisoned");
-        config.node.enrollment_token.clone()
-    };
-    let Some(shared_secret) = shared_secret.filter(|token| !token.trim().is_empty()) else {
-        let results: Vec<_> = target_nodes
-            .into_iter()
-            .map(|node| {
-                node_push_failure(
-                    node.node_id,
-                    node.role,
-                    node.control_url,
-                    None,
-                    "management enrollment token is not configured",
-                )
-            })
-            .collect();
-        for result in &results {
-            record_node_push_result(state, result);
-        }
-        return results;
-    };
 
     let client = match reqwest::Client::builder()
         .timeout(Duration::from_secs(6))
@@ -2392,6 +3385,38 @@ async fn push_policy_bundle_to_nodes(
 
     let mut results = Vec::with_capacity(target_nodes.len());
     for node in target_nodes {
+        let shared_secret = {
+            let config = state.config.lock().expect("web config mutex poisoned");
+            node.cluster_name
+                .as_deref()
+                .and_then(|cluster_name| {
+                    config
+                        .clusters
+                        .groups
+                        .iter()
+                        .find(|group| group.name.eq_ignore_ascii_case(cluster_name))
+                        .and_then(|group| {
+                            group
+                                .members
+                                .iter()
+                                .find(|member| member.node_id == node.node_id)
+                                .map(|member| member.token.clone())
+                        })
+                })
+                .or_else(|| config.node.enrollment_token.clone())
+        };
+        let Some(shared_secret) = shared_secret.filter(|secret| !secret.trim().is_empty()) else {
+            let result = node_push_failure(
+                node.node_id,
+                node.role,
+                node.control_url,
+                None,
+                "no control credential is available for this node",
+            );
+            record_node_push_result(state, &result);
+            results.push(result);
+            continue;
+        };
         let result = push_policy_bundle_to_node(
             &client,
             &shared_secret,
@@ -2661,6 +3686,7 @@ struct StatusResponse {
     dns: DnsStatus,
     deployment_warnings: DeploymentWarnings,
     fleet_nodes: Vec<FleetNodeStatus>,
+    clusters: Vec<ClusterSummary>,
     client_identities: HashMap<String, String>,
     stats: StatusSnapshot,
 }
@@ -2690,6 +3716,8 @@ struct NodeInfo {
     role: NodeRole,
     management_url: Option<String>,
     heartbeat_interval_seconds: u64,
+    #[serde(default)]
+    cluster_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2762,6 +3790,7 @@ impl NodeInfo {
             role: config.node.role,
             management_url: config.node.management_url.clone(),
             heartbeat_interval_seconds: config.node.heartbeat_interval_seconds,
+            cluster_name: config.node.cluster.name.clone(),
         }
     }
 }
@@ -2816,6 +3845,8 @@ struct FleetNodeStatus {
     last_seen_unix_timestamp_seconds: u64,
     management_url: Option<String>,
     control_url: Option<String>,
+    cluster_name: Option<String>,
+    service_template: ClusterServiceTemplate,
     proxy_listeners: Vec<ProxyListenerStatus>,
     dns: DnsStatus,
     stats: serde_json::Value,
@@ -2831,6 +3862,10 @@ struct NodeReport {
     version: String,
     management_url: Option<String>,
     control_url: Option<String>,
+    #[serde(default)]
+    cluster_name: Option<String>,
+    #[serde(default)]
+    service_template: ClusterServiceTemplate,
     proxy_listeners: Vec<ProxyListenerStatus>,
     dns: DnsStatus,
     stats: serde_json::Value,
@@ -2847,6 +3882,89 @@ struct NodeRuntimeConfigResponse {
     policy_runtime: PolicyRuntimeSnapshot,
     dns_policy_runtime: DnsPolicyRuntimeSnapshot,
     known_bad_reputation_hashes: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ClusterCreateRequest {
+    name: String,
+    password: String,
+    role: NodeRole,
+    source_node_id: String,
+    #[serde(default)]
+    traffic_mode: ClusterTrafficMode,
+    #[serde(default)]
+    service_endpoint: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ClusterUpdateRequest {
+    #[serde(default)]
+    password: Option<String>,
+    #[serde(default)]
+    traffic_mode: Option<ClusterTrafficMode>,
+    #[serde(default)]
+    service_endpoint: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ClusterJoinRequest {
+    name: String,
+    password: String,
+    node_id: String,
+    role: NodeRole,
+}
+
+#[derive(Debug, Serialize)]
+struct ClusterJoinResponse {
+    accepted: bool,
+    cluster_name: String,
+    role: NodeRole,
+    source_node_id: String,
+    management_url: String,
+    enrollment_token: String,
+    traffic_mode: ClusterTrafficMode,
+    service_endpoint: Option<String>,
+    service_template: ClusterServiceTemplate,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ClusterSummary {
+    name: String,
+    role: NodeRole,
+    source_node_id: String,
+    traffic_mode: ClusterTrafficMode,
+    service_endpoint: Option<String>,
+    created_unix_timestamp_seconds: u64,
+    replica_count: usize,
+    online_count: usize,
+    degraded_count: usize,
+    offline_count: usize,
+    members: Vec<ClusterMemberSummary>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ClusterMemberSummary {
+    node_id: String,
+    display_name: String,
+    role: NodeRole,
+    source: bool,
+    health: &'static str,
+    last_seen_unix_timestamp_seconds: u64,
+    control_url: Option<String>,
+    configuration_in_sync: Option<bool>,
+    last_control_push: Option<NodeControlPushStatus>,
+}
+
+#[derive(Debug, Serialize)]
+struct ClusterMutationResponse {
+    message: &'static str,
+    clusters: Vec<ClusterSummary>,
+}
+
+#[derive(Debug, Serialize)]
+struct ClusterSyncResponse {
+    message: &'static str,
+    node_push_results: Vec<NodePushResult>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3254,6 +4372,33 @@ mod tests {
         assert_eq!(
             token_preview(Some("abcdef1234567890")),
             "abcdef...567890".to_string()
+        );
+    }
+
+    #[test]
+    fn cluster_password_policy_rejects_short_values() {
+        assert!(validate_cluster_password("short").is_err());
+        assert!(validate_cluster_password("twelve-chars").is_ok());
+    }
+
+    #[tokio::test]
+    async fn cluster_password_hash_verifies_without_storing_plaintext() {
+        let password = "Axiom-Cluster-Secret-2026".to_string();
+        let hash = hash_cluster_password(password.clone())
+            .await
+            .expect("cluster password should hash");
+
+        assert!(hash.starts_with("$argon2"));
+        assert!(!hash.contains(&password));
+        assert!(
+            verify_cluster_password(password, hash.clone())
+                .await
+                .expect("correct password verification should run")
+        );
+        assert!(
+            !verify_cluster_password("wrong-password".to_string(), hash)
+                .await
+                .expect("wrong password verification should run")
         );
     }
 }
@@ -4007,6 +5152,7 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
       <nav class="mx-auto flex max-w-7xl flex-wrap gap-2 px-6 py-3" aria-label="Dashboard sections">
         <button data-view="overview" class="top-nav-button active rounded-md border border-zinc-700 px-4 py-2 text-sm font-medium text-zinc-200 transition hover:border-emerald-300 hover:text-emerald-100">Overview</button>
         <button data-view="nodes" class="top-nav-button rounded-md border border-zinc-700 px-4 py-2 text-sm font-medium text-zinc-200 transition hover:border-emerald-300 hover:text-emerald-100">Nodes</button>
+        <button data-view="clusters" class="top-nav-button rounded-md border border-zinc-700 px-4 py-2 text-sm font-medium text-zinc-200 transition hover:border-emerald-300 hover:text-emerald-100">Clusters</button>
         <button data-view="smb" class="top-nav-button rounded-md border border-zinc-700 px-4 py-2 text-sm font-medium text-zinc-200 transition hover:border-emerald-300 hover:text-emerald-100">SMB Protection</button>
         <button data-view="dns" class="top-nav-button rounded-md border border-zinc-700 px-4 py-2 text-sm font-medium text-zinc-200 transition hover:border-emerald-300 hover:text-emerald-100">DNS Security</button>
         <button data-view="security" class="top-nav-button rounded-md border border-zinc-700 px-4 py-2 text-sm font-medium text-zinc-200 transition hover:border-emerald-300 hover:text-emerald-100">Security</button>
@@ -4365,6 +5511,85 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
             <tbody id="fleet-nodes-body" class="divide-y divide-zinc-800"></tbody>
           </table>
         </div>
+      </section>
+    </section>
+
+    <section id="view-clusters" class="dashboard-view">
+      <section class="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
+        <article class="rounded-lg border border-zinc-800 bg-zinc-900 p-5">
+          <p class="text-sm text-zinc-400">Cluster Groups</p>
+          <p id="cluster-metric-groups" class="mt-3 text-3xl font-semibold text-white">0</p>
+          <p class="mt-2 text-xs text-zinc-500">DNS and SMB configuration groups</p>
+        </article>
+        <article class="rounded-lg border border-zinc-800 bg-zinc-900 p-5">
+          <p class="text-sm text-zinc-400">Cluster Nodes</p>
+          <p id="cluster-metric-replicas" class="mt-3 text-3xl font-semibold text-sky-200">0</p>
+          <p class="mt-2 text-xs text-zinc-500">Source and replica nodes</p>
+        </article>
+        <article class="rounded-lg border border-zinc-800 bg-zinc-900 p-5">
+          <p class="text-sm text-zinc-400">Online Nodes</p>
+          <p id="cluster-metric-online" class="mt-3 text-3xl font-semibold text-emerald-200">0</p>
+          <p class="mt-2 text-xs text-zinc-500">Heartbeat received within 15 seconds</p>
+        </article>
+        <article class="rounded-lg border border-zinc-800 bg-zinc-900 p-5">
+          <p class="text-sm text-zinc-400">Needs Attention</p>
+          <p id="cluster-metric-unhealthy" class="mt-3 text-3xl font-semibold text-amber-200">0</p>
+          <p class="mt-2 text-xs text-zinc-500">Degraded or offline nodes</p>
+        </article>
+      </section>
+
+      <section class="mt-8 rounded-lg border border-zinc-800 bg-zinc-900">
+        <div class="border-b border-zinc-800 px-6 py-5">
+          <h2 class="text-xl font-semibold text-white">Create Cluster Group</h2>
+          <p class="mt-1 text-sm text-zinc-400">Choose a reporting source node. New replicas will inherit its service template and the active central policy.</p>
+        </div>
+        <form id="cluster-create-form" class="grid gap-4 p-6 md:grid-cols-2 xl:grid-cols-3">
+          <label class="block">
+            <span class="text-sm text-zinc-300">Cluster Name</span>
+            <input id="cluster-name" required minlength="3" maxlength="64" pattern="[A-Za-z0-9_-]+" placeholder="smb-production" class="mt-2 w-full rounded-md border border-zinc-700 bg-zinc-950 px-3 py-2 text-white">
+          </label>
+          <label class="block">
+            <span class="text-sm text-zinc-300">Service Role</span>
+            <select id="cluster-role" class="mt-2 w-full rounded-md border border-zinc-700 bg-zinc-950 px-3 py-2 text-white">
+              <option value="smb_proxy">SMB Proxy</option>
+              <option value="dns">DNS Security</option>
+            </select>
+          </label>
+          <label class="block">
+            <span class="text-sm text-zinc-300">Source Node</span>
+            <select id="cluster-source-node" required class="mt-2 w-full rounded-md border border-zinc-700 bg-zinc-950 px-3 py-2 text-white"></select>
+          </label>
+          <label class="block">
+            <span class="text-sm text-zinc-300">Join Password</span>
+            <input id="cluster-password" required minlength="12" maxlength="256" type="password" autocomplete="new-password" placeholder="At least 12 characters" class="mt-2 w-full rounded-md border border-zinc-700 bg-zinc-950 px-3 py-2 text-white">
+          </label>
+          <label class="block">
+            <span class="text-sm text-zinc-300">Traffic HA Mode</span>
+            <select id="cluster-traffic-mode" class="mt-2 w-full rounded-md border border-zinc-700 bg-zinc-950 px-3 py-2 text-white">
+              <option value="external_load_balancer">External Load Balancer / VIP</option>
+              <option value="dns_multiple_addresses">Multiple addresses through DNS/DHCP</option>
+              <option value="direct">Direct node addresses</option>
+            </select>
+          </label>
+          <label class="block">
+            <span class="text-sm text-zinc-300">Service Endpoint</span>
+            <input id="cluster-service-endpoint" placeholder="Optional VIP or DNS name" class="mt-2 w-full rounded-md border border-zinc-700 bg-zinc-950 px-3 py-2 text-white">
+          </label>
+          <div class="flex items-end md:col-span-2 xl:col-span-3">
+            <button id="create-cluster" type="submit" class="rounded-md bg-emerald-400 px-4 py-2 text-sm font-semibold text-zinc-950 transition hover:bg-emerald-300">Create cluster</button>
+          </div>
+        </form>
+      </section>
+
+      <section class="mt-8 rounded-lg border border-zinc-800 bg-zinc-900">
+        <div class="flex flex-col gap-2 border-b border-zinc-800 px-6 py-5 md:flex-row md:items-end md:justify-between">
+          <div>
+            <h2 class="text-xl font-semibold text-white">Cluster Topology</h2>
+            <p id="cluster-state" class="mt-1 text-sm text-zinc-400">No cluster groups configured</p>
+          </div>
+          <button id="refresh-clusters" class="rounded-md border border-zinc-700 px-3 py-2 text-sm text-zinc-200 transition hover:border-sky-300 hover:text-sky-100">Refresh</button>
+        </div>
+        <div id="cluster-list" class="divide-y divide-zinc-800"></div>
       </section>
     </section>
 
@@ -5139,6 +6364,7 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
     const modes = ["disabled", "monitor", "block"];
     let clientIdentities = {};
     let lastFleetNodes = [];
+    let lastClusters = [];
     let reputationEntries = [];
     let latestLicenseStatus = null;
     let latestDiagnosticsBundle = null;
@@ -5366,7 +6592,7 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
 
     function setActiveView(name) {
       if (name === "readiness") name = "support";
-      const knownViews = new Set(["overview", "nodes", "smb", "dns", "security", "audit", "support", "settings"]);
+      const knownViews = new Set(["overview", "nodes", "clusters", "smb", "dns", "security", "audit", "support", "settings"]);
       if (!knownViews.has(name)) name = "overview";
       document.querySelectorAll(".dashboard-view").forEach((section) => {
         section.classList.toggle("active", section.id === `view-${name}`);
@@ -6052,6 +7278,196 @@ DNS node -> upstream resolvers: UDP/TCP 53`;
       }).join("");
     }
 
+    function updateClusterSourceOptions() {
+      const role = document.getElementById("cluster-role").value;
+      const select = document.getElementById("cluster-source-node");
+      const candidates = lastFleetNodes.filter((node) => node.role === role);
+      select.innerHTML = candidates.length
+        ? candidates.map((node) => `<option value="${html(node.node_id)}">${html(node.display_name)} · ${html(node.node_id)}</option>`).join("")
+        : `<option value="">No reporting ${role === "dns" ? "DNS" : "SMB"} node available</option>`;
+      document.getElementById("create-cluster").disabled = !candidates.length;
+    }
+
+    function clusterTrafficModeLabel(mode) {
+      if (mode === "dns_multiple_addresses") return "Multiple DNS/DHCP addresses";
+      if (mode === "direct") return "Direct node addresses";
+      return "External Load Balancer / VIP";
+    }
+
+    function renderClusters(clusters) {
+      lastClusters = clusters || [];
+      const totalReplicas = lastClusters.reduce((sum, cluster) => sum + Number((cluster.members || []).length), 0);
+      const online = lastClusters.reduce((sum, cluster) => sum + Number(cluster.online_count || 0), 0);
+      const unhealthy = lastClusters.reduce((sum, cluster) => sum + Number(cluster.degraded_count || 0) + Number(cluster.offline_count || 0), 0);
+      document.getElementById("cluster-metric-groups").textContent = lastClusters.length.toLocaleString();
+      document.getElementById("cluster-metric-replicas").textContent = totalReplicas.toLocaleString();
+      document.getElementById("cluster-metric-online").textContent = online.toLocaleString();
+      document.getElementById("cluster-metric-unhealthy").textContent = unhealthy.toLocaleString();
+      document.getElementById("cluster-state").textContent = lastClusters.length
+        ? `${lastClusters.length} groups · ${online}/${totalReplicas} nodes online`
+        : "No cluster groups configured";
+
+      const container = document.getElementById("cluster-list");
+      if (!lastClusters.length) {
+        container.innerHTML = `<p class="px-6 py-8 text-sm text-zinc-400">Create a group from a reporting DNS or SMB source node. Existing nodes continue operating normally.</p>`;
+        return;
+      }
+
+      container.innerHTML = lastClusters.map((cluster) => {
+        const healthClass = cluster.offline_count
+          ? "border-red-400/40 bg-red-500/10 text-red-100"
+          : cluster.degraded_count
+            ? "border-amber-400/40 bg-amber-500/10 text-amber-100"
+            : "border-emerald-400/40 bg-emerald-500/10 text-emerald-100";
+        const healthLabel = cluster.offline_count
+          ? `${cluster.offline_count} offline`
+          : cluster.degraded_count
+            ? `${cluster.degraded_count} degraded`
+            : "healthy";
+        const members = (cluster.members || []).map((member) => {
+          const memberClass = member.health === "online"
+            ? "text-emerald-300"
+            : member.health === "degraded" ? "text-amber-300" : "text-red-300";
+          const push = member.last_control_push;
+          const configuration = member.configuration_in_sync === true
+            ? `<span class="text-emerald-300">Synced</span>`
+            : member.configuration_in_sync === false
+              ? `<span class="text-amber-300">Drift detected</span>`
+              : `<span class="text-zinc-500">Unavailable</span>`;
+          return `
+            <tr class="border-t border-zinc-800">
+              <td class="px-6 py-3 text-sm text-white">${html(member.display_name)}${member.source ? ` <span class="ml-2 rounded-full border border-sky-400/30 px-2 py-0.5 text-[11px] font-semibold uppercase text-sky-200">source</span>` : ""}<p class="mt-1 text-xs text-zinc-500">${html(member.node_id)}</p></td>
+              <td class="px-6 py-3 text-sm font-semibold ${memberClass}">${html(member.health)}</td>
+              <td class="px-6 py-3 text-sm">${configuration}</td>
+              <td class="px-6 py-3 text-sm text-zinc-400">${formatTime(member.last_seen_unix_timestamp_seconds)}</td>
+              <td class="px-6 py-3 text-sm ${push?.accepted ? "text-emerald-300" : push ? "text-red-300" : "text-zinc-500"}">${push ? html(push.message) : "No push acknowledgement yet"}</td>
+              <td class="px-6 py-3 text-right">${member.source ? "" : `<button data-cluster-action="remove-member" data-cluster-name="${html(cluster.name)}" data-node-id="${html(member.node_id)}" class="rounded-md border border-red-400/30 px-2.5 py-1.5 text-xs text-red-200 hover:bg-red-500/10">Remove</button>`}</td>
+            </tr>`;
+        }).join("");
+        return `
+          <article class="px-6 py-6">
+            <div class="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
+              <div>
+                <div class="flex flex-wrap items-center gap-2">
+                  <h3 class="text-lg font-semibold text-white">${html(cluster.name)}</h3>
+                  <span class="rounded-full border border-zinc-700 px-2.5 py-1 text-xs font-semibold uppercase text-zinc-300">${html(cluster.role)}</span>
+                  <span class="rounded-full border px-2.5 py-1 text-xs font-semibold uppercase ${healthClass}">${healthLabel}</span>
+                </div>
+                <p class="mt-2 text-sm text-zinc-400">Source ${html(cluster.source_node_id)} · ${cluster.replica_count} enrolled replicas · ${clusterTrafficModeLabel(cluster.traffic_mode)}</p>
+                <p class="mt-1 text-xs text-zinc-500">Endpoint: ${html(cluster.service_endpoint || "not defined")} · created ${formatTime(cluster.created_unix_timestamp_seconds)}</p>
+              </div>
+              <div class="flex flex-wrap gap-2">
+                <button data-cluster-action="sync" data-cluster-name="${html(cluster.name)}" class="rounded-md bg-emerald-400 px-3 py-2 text-sm font-semibold text-zinc-950 transition hover:bg-emerald-300">Sync now</button>
+                <button data-cluster-action="password" data-cluster-name="${html(cluster.name)}" class="rounded-md border border-zinc-700 px-3 py-2 text-sm text-zinc-200 transition hover:border-sky-300 hover:text-sky-100">Change join password</button>
+                <button data-cluster-action="delete" data-cluster-name="${html(cluster.name)}" class="rounded-md border border-red-400/40 px-3 py-2 text-sm text-red-200 transition hover:bg-red-500/10">Delete</button>
+              </div>
+            </div>
+            <div class="mt-5 overflow-x-auto rounded-md border border-zinc-800">
+              <table class="min-w-full">
+                <thead class="bg-zinc-950/60"><tr><th class="px-6 py-3 text-left text-xs uppercase text-zinc-500">Node</th><th class="px-6 py-3 text-left text-xs uppercase text-zinc-500">Health</th><th class="px-6 py-3 text-left text-xs uppercase text-zinc-500">Configuration</th><th class="px-6 py-3 text-left text-xs uppercase text-zinc-500">Last Seen</th><th class="px-6 py-3 text-left text-xs uppercase text-zinc-500">Last Policy Push</th><th class="px-6 py-3 text-right text-xs uppercase text-zinc-500">Action</th></tr></thead>
+                <tbody>${members || `<tr><td colspan="6" class="px-6 py-4 text-sm text-zinc-500">Waiting for the source node heartbeat.</td></tr>`}</tbody>
+              </table>
+            </div>
+          </article>`;
+      }).join("");
+    }
+
+    async function createCluster(event) {
+      event.preventDefault();
+      const button = document.getElementById("create-cluster");
+      button.disabled = true;
+      button.textContent = "Creating...";
+      try {
+        const response = await fetch("/api/clusters", {
+          method: "POST",
+          headers: authHeaders({ "Content-Type": "application/json" }),
+          body: JSON.stringify({
+            name: document.getElementById("cluster-name").value.trim(),
+            password: document.getElementById("cluster-password").value,
+            role: document.getElementById("cluster-role").value,
+            source_node_id: document.getElementById("cluster-source-node").value,
+            traffic_mode: document.getElementById("cluster-traffic-mode").value,
+            service_endpoint: document.getElementById("cluster-service-endpoint").value.trim() || null
+          })
+        });
+        const payload = await response.json().catch(() => ({ message: "cluster creation failed" }));
+        if (!response.ok) throw new Error(payload.message || "cluster creation failed");
+        document.getElementById("cluster-create-form").reset();
+        renderClusters(payload.clusters || []);
+        updateClusterSourceOptions();
+        showToast("Cluster created", "Replica nodes can now join with the cluster name and password.", "success");
+      } catch (error) {
+        showToast("Cluster creation failed", error.message, "error");
+      } finally {
+        button.textContent = "Create cluster";
+        updateClusterSourceOptions();
+      }
+    }
+
+    async function syncCluster(name) {
+      beginPushProgress(`Synchronizing ${name}`, lastFleetNodes);
+      const response = await fetch(`/api/clusters/${encodeURIComponent(name)}/sync`, {
+        method: "POST",
+        headers: authHeaders()
+      });
+      const payload = await response.json().catch(() => ({ message: "cluster sync failed" }));
+      if (!response.ok) {
+        failPushProgress(payload.message || "cluster sync failed");
+        showToast("Cluster sync failed", payload.message || "Request rejected", "error");
+        return;
+      }
+      completePushProgress(payload.node_push_results || [], payload.message);
+      showToast("Cluster synchronized", `${(payload.node_push_results || []).filter((result) => result.accepted).length} nodes acknowledged the update.`, "success");
+      await refresh();
+    }
+
+    async function changeClusterPassword(name) {
+      const password = window.prompt(`Enter a new join password for ${name} (minimum 12 characters):`);
+      if (password === null) return;
+      const response = await fetch(`/api/clusters/${encodeURIComponent(name)}`, {
+        method: "PUT",
+        headers: authHeaders({ "Content-Type": "application/json" }),
+        body: JSON.stringify({ password })
+      });
+      const payload = await response.json().catch(() => ({ message: "password update failed" }));
+      if (!response.ok) {
+        showToast("Password update failed", payload.message || "Request rejected", "error");
+        return;
+      }
+      renderClusters(payload.clusters || []);
+      showToast("Join password changed", "Existing replicas remain connected; only future joins use the new password.", "success");
+    }
+
+    async function deleteCluster(name) {
+      if (!window.confirm(`Delete cluster ${name}? Reporting replica nodes must be removed first.`)) return;
+      const response = await fetch(`/api/clusters/${encodeURIComponent(name)}`, {
+        method: "DELETE",
+        headers: authHeaders()
+      });
+      const payload = await response.json().catch(() => ({ message: "cluster deletion failed" }));
+      if (!response.ok) {
+        showToast("Cluster deletion failed", payload.message || "Request rejected", "error");
+        return;
+      }
+      renderClusters(payload.clusters || []);
+      showToast("Cluster deleted", "The source node continues as a standalone managed node.", "success");
+    }
+
+    async function removeClusterMember(name, nodeId) {
+      if (!window.confirm(`Remove ${nodeId} from ${name}? Its credential will stop working immediately.`)) return;
+      const response = await fetch(`/api/clusters/${encodeURIComponent(name)}/members/${encodeURIComponent(nodeId)}`, {
+        method: "DELETE",
+        headers: authHeaders()
+      });
+      const payload = await response.json().catch(() => ({ message: "member removal failed" }));
+      if (!response.ok) {
+        showToast("Replica removal failed", payload.message || "Request rejected", "error");
+        return;
+      }
+      renderClusters(payload.clusters || []);
+      showToast("Replica removed", `${nodeId} must be re-enrolled before it can report or receive policy.`, "warning");
+    }
+
     function topCounts(items, keyFn, limit = 10) {
       const counts = new Map();
       items.forEach((item) => {
@@ -6351,6 +7767,8 @@ DNS node -> upstream resolvers: UDP/TCP 53`;
       clientIdentities = data.client_identities || {};
       const fleetNodes = data.fleet_nodes || [];
       lastFleetNodes = fleetNodes;
+      renderClusters(data.clusters || []);
+      updateClusterSourceOptions();
       const stats = aggregateStats(data.stats, fleetNodes);
       updateLicenseUi(data.license);
       renderFleetNodes(data.node || {}, fleetNodes);
@@ -7566,6 +8984,18 @@ DNS node -> upstream resolvers: UDP/TCP 53`;
       window.location.href = "/login";
     });
     document.getElementById("save-policies").addEventListener("click", savePolicies);
+    document.getElementById("cluster-create-form").addEventListener("submit", createCluster);
+    document.getElementById("cluster-role").addEventListener("change", updateClusterSourceOptions);
+    document.getElementById("refresh-clusters").addEventListener("click", refresh);
+    document.getElementById("cluster-list").addEventListener("click", (event) => {
+      const button = event.target.closest("[data-cluster-action]");
+      if (!button) return;
+      const name = button.dataset.clusterName;
+      if (button.dataset.clusterAction === "sync") syncCluster(name);
+      if (button.dataset.clusterAction === "password") changeClusterPassword(name);
+      if (button.dataset.clusterAction === "delete") deleteCluster(name);
+      if (button.dataset.clusterAction === "remove-member") removeClusterMember(name, button.dataset.nodeId);
+    });
     document.getElementById("save-dns-policy").addEventListener("click", saveDnsPolicy);
     document.getElementById("add-dns-local-record").addEventListener("click", addLocalDnsRecord);
     document.getElementById("dns-local-records-body").addEventListener("input", () => {

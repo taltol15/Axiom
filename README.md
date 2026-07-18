@@ -33,6 +33,31 @@ actively pushes the updated policy to the relevant DNS or SMB node. Control
 payloads and replies are encrypted with ChaCha20-Poly1305 and authenticated with
 the enrollment token; periodic pull remains as a recovery fallback.
 
+## DNS and SMB Clusters
+
+The Management Server can organize reporting DNS and SMB nodes into independent
+cluster groups. Open `Clusters`, select an existing source node, define a unique
+cluster name and join password, and then run the normal installer on each new
+replica. Choose the cluster enrollment path and enter the same name and password.
+
+The replica receives the source node's shared service template automatically:
+
+- SMB backend targets, ports, VLAN metadata, and listener backlog
+- DNS upstream resolvers, ports, cache limits, and timeout settings
+- the current centrally managed policy and reputation feed
+
+Local NIC names and listener IP addresses are deliberately not copied. The
+installer asks for those values on every replica because they belong to that
+specific Linux server. The join password is stored only as an Argon2 hash on the
+Management Server. A successful join issues a unique node credential, so one
+replica can be revoked without rotating the entire cluster.
+
+Cluster membership provides centralized configuration and policy consistency.
+Client traffic high availability is configured separately: publish several DNS
+node addresses through DHCP, or place SMB nodes behind a TCP/445-aware external
+load balancer/VIP with session affinity. Axiom records the intended HA mode and
+service endpoint but does not take ownership of an external VIP.
+
 ## Run
 
 ```bash

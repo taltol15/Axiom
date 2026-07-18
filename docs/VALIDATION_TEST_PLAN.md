@@ -123,7 +123,38 @@ Expected:
 - No node is `degraded`.
 - Policy generation changes in Runtime Enforcement.
 
-## Phase 5 - Release Evidence
+## Phase 5 - DNS and SMB Cluster Enrollment
+
+Run this phase once the original DNS and SMB nodes are online.
+
+1. Open `Clusters` and create `smb-test-cluster` from the reporting SMB node.
+2. Create `dns-test-cluster` from the reporting DNS node.
+3. Install one fresh replica for each role and select cluster enrollment.
+4. Enter a unique Node ID, the Management Server URL, cluster name, and join
+   password.
+5. For SMB, select only the replica's local listener NIC/IP.
+6. For DNS, select only the replica's local listener IP and upstream egress NIC.
+7. Open `Clusters` and click `Sync now` for both groups.
+
+Expected:
+
+- Both replicas appear without manually re-entering the NAS targets or DNS
+  upstream resolvers.
+- Source and replicas show `online` and `Configuration: Synced`.
+- Every reachable node acknowledges the policy push.
+- An SMB policy change reaches both SMB nodes.
+- A DNS policy change reaches both DNS nodes.
+- Removing a replica revokes its credential; its next heartbeat is rejected.
+- Rotating the join password does not disconnect already enrolled replicas.
+- Cluster enrollment is rejected when the customer license node limit is
+  exceeded.
+- Existing data-plane traffic continues with the last local policy during a
+  temporary Management Server outage.
+
+Traffic HA validation is separate: test client distribution across all published
+DNS addresses, or through the external SMB TCP/445 VIP/load balancer.
+
+## Phase 6 - Release Evidence
 
 Before calling the build ready:
 

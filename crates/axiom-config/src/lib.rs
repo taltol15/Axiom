@@ -14,6 +14,8 @@ use thiserror::Error;
 pub struct AxiomConfig {
     #[serde(default)]
     pub node: NodeConfig,
+    #[serde(default)]
+    pub clusters: ClusterManagementConfig,
     pub management: ManagementNicConfig,
     #[serde(default)]
     pub dns: DnsConfig,
@@ -40,6 +42,7 @@ impl AxiomConfig {
 
     pub fn validate(&self) -> Result<(), ConfigError> {
         self.node.validate()?;
+        self.clusters.validate()?;
         self.management.validate()?;
         self.policy.validate()?;
         self.license
@@ -124,6 +127,8 @@ pub struct NodeConfig {
     #[serde(default = "default_heartbeat_interval_seconds")]
     pub heartbeat_interval_seconds: u64,
     #[serde(default)]
+    pub cluster: NodeClusterConfig,
+    #[serde(default)]
     pub control: NodeControlConfig,
 }
 
@@ -137,6 +142,7 @@ impl Default for NodeConfig {
             enrollment_token: None,
             allow_invalid_management_tls: false,
             heartbeat_interval_seconds: default_heartbeat_interval_seconds(),
+            cluster: NodeClusterConfig::default(),
             control: NodeControlConfig::default(),
         }
     }
@@ -161,6 +167,8 @@ impl NodeConfig {
                 "node.heartbeat_interval_seconds must be greater than zero".to_string(),
             ));
         }
+
+        self.cluster.validate(self.role)?;
 
         if let Some(url) = &self.management_url
             && !(url.starts_with("http://") || url.starts_with("https://"))
@@ -208,6 +216,224 @@ impl NodeConfig {
         }
 
         Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct NodeClusterConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+impl NodeClusterConfig {
+    fn validate(&self, role: NodeRole) -> Result<(), ConfigError> {
+        if !self.enabled {
+            return Ok(());
+        }
+
+        if !role.runs_agent() {
+            return Err(ConfigError::Invalid(
+                "node.cluster can only be enabled for dns or smb_proxy roles".to_string(),
+            ));
+        }
+
+        let name = self.name.as_deref().unwrap_or_default();
+        validate_cluster_name(name)
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct ClusterManagementConfig {
+    #[serde(default)]
+    pub groups: Vec<ClusterGroupConfig>,
+}
+
+impl ClusterManagementConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        let mut names = HashSet::new();
+        let mut assigned_node_ids = HashSet::new();
+        for group in &self.groups {
+            group.validate()?;
+            if !names.insert(group.name.to_ascii_lowercase()) {
+                return Err(ConfigError::Invalid(format!(
+                    "duplicate cluster name '{}'",
+                    group.name
+                )));
+            }
+            if !assigned_node_ids.insert(group.source_node_id.clone()) {
+                return Err(ConfigError::Invalid(format!(
+                    "node '{}' is assigned to more than one cluster",
+                    group.source_node_id
+                )));
+            }
+            for member in &group.members {
+                if !assigned_node_ids.insert(member.node_id.clone()) {
+                    return Err(ConfigError::Invalid(format!(
+                        "node '{}' is assigned to more than one cluster",
+                        member.node_id
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ClusterGroupConfig {
+    pub name: String,
+    pub role: NodeRole,
+    pub password_hash: String,
+    pub source_node_id: String,
+    #[serde(default)]
+    pub members: Vec<ClusterMemberCredential>,
+    #[serde(default)]
+    pub traffic_mode: ClusterTrafficMode,
+    #[serde(default)]
+    pub service_endpoint: Option<String>,
+    #[serde(default)]
+    pub created_unix_timestamp_seconds: u64,
+    #[serde(default)]
+    pub service_template: ClusterServiceTemplate,
+}
+
+impl ClusterGroupConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        validate_cluster_name(&self.name)?;
+        if !matches!(self.role, NodeRole::Dns | NodeRole::SmbProxy) {
+            return Err(ConfigError::Invalid(format!(
+                "cluster '{}' role must be dns or smb_proxy",
+                self.name
+            )));
+        }
+        if !self.password_hash.starts_with("$argon2") {
+            return Err(ConfigError::Invalid(format!(
+                "cluster '{}' password_hash must use Argon2",
+                self.name
+            )));
+        }
+        if self.source_node_id.trim().is_empty() {
+            return Err(ConfigError::Invalid(format!(
+                "cluster '{}' source_node_id must not be empty",
+                self.name
+            )));
+        }
+        if self
+            .service_endpoint
+            .as_deref()
+            .is_some_and(|endpoint| endpoint.trim().is_empty())
+        {
+            return Err(ConfigError::Invalid(format!(
+                "cluster '{}' service_endpoint must not be blank",
+                self.name
+            )));
+        }
+        let mut member_ids = HashSet::new();
+        let mut member_tokens = HashSet::new();
+        for member in &self.members {
+            if member.node_id.trim().is_empty() || member.token.len() < 32 {
+                return Err(ConfigError::Invalid(format!(
+                    "cluster '{}' contains an invalid member credential",
+                    self.name
+                )));
+            }
+            if !member_ids.insert(member.node_id.clone())
+                || !member_tokens.insert(member.token.clone())
+            {
+                return Err(ConfigError::Invalid(format!(
+                    "cluster '{}' contains duplicate member credentials",
+                    self.name
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ClusterMemberCredential {
+    pub node_id: String,
+    pub token: String,
+    #[serde(default)]
+    pub issued_unix_timestamp_seconds: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ClusterTrafficMode {
+    #[default]
+    ExternalLoadBalancer,
+    DnsMultipleAddresses,
+    Direct,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ClusterServiceTemplate {
+    #[serde(default)]
+    pub smb_routes: Vec<ClusterSmbRouteTemplate>,
+    #[serde(default)]
+    pub dns: Option<ClusterDnsTemplate>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ClusterSmbRouteTemplate {
+    pub name: String,
+    #[serde(default)]
+    pub client_vlan: Option<u16>,
+    #[serde(default = "default_smb_port")]
+    pub listen_port: u16,
+    pub target_file_server_ip: IpAddr,
+    #[serde(default = "default_smb_port")]
+    pub target_file_server_port: u16,
+    #[serde(default = "default_backlog")]
+    pub backlog: i32,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ClusterDnsTemplate {
+    #[serde(default = "default_dns_port")]
+    pub udp_port: u16,
+    #[serde(default = "default_dns_port")]
+    pub tcp_port: u16,
+    #[serde(default)]
+    pub upstreams: Vec<SocketAddr>,
+    #[serde(default = "default_dns_cache_ttl_seconds")]
+    pub cache_ttl_seconds: u64,
+    #[serde(default = "default_dns_cache_max_entries")]
+    pub cache_max_entries: usize,
+    #[serde(default = "default_dns_query_timeout_millis")]
+    pub query_timeout_millis: u64,
+    #[serde(default = "default_dns_threat_feed_refresh_seconds")]
+    pub threat_feed_refresh_seconds: u64,
+}
+
+impl ClusterServiceTemplate {
+    pub fn from_config(config: &AxiomConfig) -> Self {
+        let smb_routes = config
+            .proxy_listeners
+            .iter()
+            .map(|listener| ClusterSmbRouteTemplate {
+                name: listener.name.clone(),
+                client_vlan: listener.client_vlan,
+                listen_port: listener.listen_port,
+                target_file_server_ip: listener.target_file_server_ip,
+                target_file_server_port: listener.target_file_server_port,
+                backlog: listener.backlog,
+            })
+            .collect();
+        let dns = config.dns.enabled.then(|| ClusterDnsTemplate {
+            udp_port: config.dns.udp_port,
+            tcp_port: config.dns.tcp_port,
+            upstreams: config.dns.upstreams.clone(),
+            cache_ttl_seconds: config.dns.cache_ttl_seconds,
+            cache_max_entries: config.dns.cache_max_entries,
+            query_timeout_millis: config.dns.query_timeout_millis,
+            threat_feed_refresh_seconds: config.dns.threat_feed_refresh_seconds,
+        });
+
+        Self { smb_routes, dns }
     }
 }
 
@@ -1006,6 +1232,24 @@ fn validate_interface_name(interface: &str, label: &str) -> Result<(), ConfigErr
     Ok(())
 }
 
+fn validate_cluster_name(name: &str) -> Result<(), ConfigError> {
+    let name = name.trim();
+    if name.len() < 3 || name.len() > 64 {
+        return Err(ConfigError::Invalid(
+            "cluster name must contain between 3 and 64 characters".to_string(),
+        ));
+    }
+    if !name
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Err(ConfigError::Invalid(
+            "cluster name may only contain letters, numbers, '-' and '_'".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 fn validate_dns_domain(domain: &str) -> Result<(), ConfigError> {
     let normalized = domain.trim().trim_end_matches('.');
     if normalized.is_empty() || normalized.len() > 253 {
@@ -1156,4 +1400,109 @@ fn default_signatures() -> Vec<SignaturePolicyConfig> {
             mode: PolicyMode::Block,
         },
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn example_config() -> AxiomConfig {
+        toml::from_str(include_str!("../../../config/axiom.example.toml"))
+            .expect("example config must parse")
+    }
+
+    #[test]
+    fn existing_config_defaults_to_no_cluster_membership() {
+        let mut source = include_str!("../../../config/axiom.example.toml").to_string();
+        source = source.replace("[node.cluster]\nenabled = false\n\n", "");
+
+        let config: AxiomConfig = toml::from_str(&source).expect("legacy config must parse");
+
+        assert!(!config.node.cluster.enabled);
+        assert!(config.node.cluster.name.is_none());
+        assert!(config.clusters.groups.is_empty());
+        config.validate().expect("legacy config must remain valid");
+    }
+
+    #[test]
+    fn service_template_contains_shared_settings_only() {
+        let config = example_config();
+
+        let template = ClusterServiceTemplate::from_config(&config);
+
+        assert_eq!(template.smb_routes.len(), config.proxy_listeners.len());
+        assert_eq!(
+            template.smb_routes[0].target_file_server_ip,
+            config.proxy_listeners[0].target_file_server_ip
+        );
+        assert_eq!(
+            template.dns.as_ref().expect("DNS template").upstreams,
+            config.dns.upstreams
+        );
+    }
+
+    #[test]
+    fn cluster_membership_is_rejected_for_management_or_lab_roles() {
+        let mut config = example_config();
+        config.node.cluster = NodeClusterConfig {
+            enabled: true,
+            name: Some("smb-production".to_string()),
+        };
+
+        let error = config
+            .validate()
+            .expect_err("standalone role cannot join a cluster");
+
+        assert!(
+            error
+                .to_string()
+                .contains("node.cluster can only be enabled")
+        );
+    }
+
+    #[test]
+    fn cluster_member_credentials_must_be_unique() {
+        let credential = ClusterMemberCredential {
+            node_id: "smb-replica-02".to_string(),
+            token: "0123456789abcdef0123456789abcdef".to_string(),
+            issued_unix_timestamp_seconds: 1,
+        };
+        let group = ClusterGroupConfig {
+            name: "smb-production".to_string(),
+            role: NodeRole::SmbProxy,
+            password_hash: "$argon2id$test".to_string(),
+            source_node_id: "smb-source-01".to_string(),
+            members: vec![credential.clone(), credential],
+            traffic_mode: ClusterTrafficMode::ExternalLoadBalancer,
+            service_endpoint: Some("smb.example.internal".to_string()),
+            created_unix_timestamp_seconds: 1,
+            service_template: ClusterServiceTemplate::default(),
+        };
+
+        assert!(group.validate().is_err());
+    }
+
+    #[test]
+    fn node_id_cannot_belong_to_multiple_clusters() {
+        let first = ClusterGroupConfig {
+            name: "smb-production-a".to_string(),
+            role: NodeRole::SmbProxy,
+            password_hash: "$argon2id$test-a".to_string(),
+            source_node_id: "smb-source-01".to_string(),
+            members: Vec::new(),
+            traffic_mode: ClusterTrafficMode::ExternalLoadBalancer,
+            service_endpoint: None,
+            created_unix_timestamp_seconds: 1,
+            service_template: ClusterServiceTemplate::default(),
+        };
+        let mut second = first.clone();
+        second.name = "smb-production-b".to_string();
+        second.password_hash = "$argon2id$test-b".to_string();
+
+        let clusters = ClusterManagementConfig {
+            groups: vec![first, second],
+        };
+
+        assert!(clusters.validate().is_err());
+    }
 }

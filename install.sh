@@ -132,6 +132,7 @@ install_missing_dependencies() {
     ["sha256sum"]="coreutils"
     ["sysctl"]="procps"
     ["curl"]="curl"
+    ["python3"]="python3"
     ["tar"]="tar"
     ["gzip"]="gzip"
     ["sudo"]="sudo"
@@ -164,7 +165,7 @@ install_missing_dependencies() {
     sudo \
     whiptail
 
-  for command_name in ip cmake systemctl setcap sha256sum sysctl curl tar gzip cc ld.bfd openssl sudo visudo; do
+  for command_name in ip cmake systemctl setcap sha256sum sysctl curl python3 tar gzip cc ld.bfd openssl sudo visudo; do
     if ! command -v "${command_name}" >/dev/null 2>&1; then
       echo "Required command '${command_name}' is still unavailable after dependency installation." >&2
       exit 1
@@ -893,6 +894,19 @@ configure_agent_management_stub() {
 }
 
 configure_agent_registration() {
+  NODE_CLUSTER_ENABLED="false"
+  NODE_CLUSTER_NAME=""
+  CLUSTER_JOIN_RESPONSE_PATH=""
+
+  if prompt_yes_no "Join this node to an existing Axiom cluster" "no"; then
+    configure_cluster_registration
+    return
+  fi
+
+  configure_direct_agent_registration
+}
+
+configure_direct_agent_registration() {
   NODE_ENROLLMENT_VALIDATED="false"
 
   while true; do
@@ -916,6 +930,111 @@ configure_agent_registration() {
     fi
 
     echo "Retrying Management enrollment settings."
+  done
+}
+
+configure_cluster_registration() {
+  local cluster_password
+  local response_path
+  local request_path
+  local curl_error_path
+  local http_code
+  local curl_args=()
+  local response_preview
+
+  while true; do
+    NODE_MANAGEMENT_URL="$(prompt_nonempty "Management server URL, for example https://10.0.0.5:8443")"
+    NODE_MANAGEMENT_URL="${NODE_MANAGEMENT_URL%/}"
+    NODE_ALLOW_INVALID_MANAGEMENT_TLS="false"
+    if [[ "${NODE_MANAGEMENT_URL}" == https://* ]] \
+      && prompt_yes_no "Allow this node to trust a self-signed Management HTTPS certificate" "no"; then
+      NODE_ALLOW_INVALID_MANAGEMENT_TLS="true"
+    fi
+    if [[ "${NODE_MANAGEMENT_URL}" == http://* ]] \
+      && ! prompt_yes_no "This will send the cluster join password over HTTP. Continue only in an isolated lab" "no"; then
+      echo "Use an HTTPS Management URL for production cluster enrollment."
+      continue
+    fi
+    NODE_CLUSTER_NAME="$(prompt_nonempty "Cluster name from Axiom Cluster Center")"
+    if use_tui; then
+      cluster_password="$(ui_password "Cluster join password")" || exit 1
+    else
+      read -r -s -p "Cluster join password: " cluster_password
+      echo
+    fi
+
+    request_path="$(mktemp)"
+    response_path="$(mktemp)"
+    curl_error_path="$(mktemp)"
+    python3 - "${NODE_CLUSTER_NAME}" "${cluster_password}" "${NODE_ID}" "${NODE_ROLE}" > "${request_path}" <<'PY'
+import json
+import sys
+
+print(json.dumps({
+    "name": sys.argv[1],
+    "password": sys.argv[2],
+    "node_id": sys.argv[3],
+    "role": sys.argv[4],
+}))
+PY
+    unset cluster_password
+
+    curl_args=(
+      -sS
+      --connect-timeout 5
+      --max-time 20
+      -o "${response_path}"
+      -w "%{http_code}"
+      -H "Content-Type: application/json"
+      --data-binary "@${request_path}"
+      "${NODE_MANAGEMENT_URL}/api/clusters/join"
+    )
+    if [[ "${NODE_ALLOW_INVALID_MANAGEMENT_TLS}" == "true" ]]; then
+      curl_args=(-k "${curl_args[@]}")
+    fi
+
+    if ! http_code="$(curl "${curl_args[@]}" 2>"${curl_error_path}")"; then
+      response_preview="$(head -c 220 "${curl_error_path}" 2>/dev/null || true)"
+      rm -f "${request_path}" "${response_path}" "${curl_error_path}"
+      ui_error "Could not reach Management server at ${NODE_MANAGEMENT_URL}: ${response_preview}"
+    elif [[ "${http_code}" != "200" ]]; then
+      response_preview="$(python3 - "${response_path}" <<'PY'
+import json
+import sys
+try:
+    payload = json.load(open(sys.argv[1], encoding="utf-8"))
+    print(payload.get("message") or payload.get("error") or "cluster join rejected")
+except Exception:
+    print("cluster join rejected")
+PY
+)"
+      rm -f "${request_path}" "${response_path}" "${curl_error_path}"
+      ui_error "Cluster enrollment failed with HTTP ${http_code}: ${response_preview}"
+    else
+      NODE_ENROLLMENT_TOKEN="$(python3 - "${response_path}" <<'PY'
+import json
+import sys
+payload = json.load(open(sys.argv[1], encoding="utf-8"))
+print(payload.get("enrollment_token", ""))
+PY
+)"
+      if [[ ! "${NODE_ENROLLMENT_TOKEN}" =~ ^[A-Fa-f0-9]{32,128}$ ]]; then
+        rm -f "${request_path}" "${response_path}" "${curl_error_path}"
+        ui_error "Management returned an invalid cluster credential."
+      else
+        rm -f "${request_path}" "${curl_error_path}"
+        NODE_CLUSTER_ENABLED="true"
+        CLUSTER_JOIN_RESPONSE_PATH="${response_path}"
+        NODE_ENROLLMENT_VALIDATED="true"
+        echo "Cluster enrollment validated. Shared service settings will be imported from ${NODE_CLUSTER_NAME}."
+        return
+      fi
+    fi
+
+    if ! prompt_yes_no "Retry cluster enrollment" "yes"; then
+      echo "Cluster enrollment is required for a cluster replica." >&2
+      exit 1
+    fi
   done
 }
 
@@ -1051,6 +1170,7 @@ configure_proxy_listeners() {
   PROXY_LISTEN_PORTS=()
   PROXY_TARGET_IPS=()
   PROXY_TARGET_PORTS=()
+  PROXY_BACKLOGS=()
 
   for proxy_interface in "${SELECTED_PROXY_INTERFACES[@]}"; do
     echo
@@ -1081,6 +1201,99 @@ configure_proxy_listeners() {
     PROXY_LISTEN_PORTS+=("${listen_port}")
     PROXY_TARGET_IPS+=("${target_ip}")
     PROXY_TARGET_PORTS+=("${target_port}")
+    PROXY_BACKLOGS+=("4096")
+  done
+}
+
+select_cluster_route_interface() {
+  local route_name="$1"
+  local selection
+
+  if use_tui; then
+    select_interface_tui "Select the local interface for replicated SMB route ${route_name}"
+    return
+  fi
+
+  while true; do
+    print_interfaces
+    read -r -p "Select the local interface for SMB route ${route_name} [number]: " selection
+    if [[ "${selection}" =~ ^[0-9]+$ ]] && ((selection >= 1 && selection <= ${#INTERFACES[@]})); then
+      printf "%s" "${INTERFACES[$((selection - 1))]}"
+      return
+    fi
+    echo "Invalid interface selection."
+  done
+}
+
+configure_proxy_listeners_from_cluster() {
+  local route_count
+  local index
+  local template_row
+  local template_name
+  local vlan
+  local listen_port
+  local target_ip
+  local target_port
+  local backlog
+  local proxy_interface
+  local discovered_proxy_ip
+  local listen_ip
+
+  route_count="$(python3 - "${CLUSTER_JOIN_RESPONSE_PATH}" <<'PY'
+import json
+import sys
+payload = json.load(open(sys.argv[1], encoding="utf-8"))
+print(len(payload.get("service_template", {}).get("smb_routes", [])))
+PY
+)"
+  if [[ ! "${route_count}" =~ ^[0-9]+$ ]] || ((route_count == 0)); then
+    ui_error "The selected SMB cluster does not contain a usable proxy route template."
+    exit 1
+  fi
+
+  PROXY_NAMES=()
+  PROXY_INTERFACES=()
+  PROXY_VLANS=()
+  PROXY_LISTEN_IPS=()
+  PROXY_LISTEN_PORTS=()
+  PROXY_TARGET_IPS=()
+  PROXY_TARGET_PORTS=()
+  PROXY_BACKLOGS=()
+
+  for ((index = 0; index < route_count; index++)); do
+    template_row="$(python3 - "${CLUSTER_JOIN_RESPONSE_PATH}" "${index}" <<'PY'
+import json
+import sys
+payload = json.load(open(sys.argv[1], encoding="utf-8"))
+route = payload["service_template"]["smb_routes"][int(sys.argv[2])]
+values = [
+    route.get("name", "cluster-route"),
+    "" if route.get("client_vlan") is None else str(route["client_vlan"]),
+    str(route.get("listen_port", 445)),
+    str(route["target_file_server_ip"]),
+    str(route.get("target_file_server_port", 445)),
+    str(route.get("backlog", 4096)),
+]
+print("|".join(values))
+PY
+)"
+    IFS='|' read -r template_name vlan listen_port target_ip target_port backlog <<< "${template_row}"
+    proxy_interface="$(select_cluster_route_interface "${template_name}")"
+    discovered_proxy_ip="$(get_interface_ipv4 "${proxy_interface}")"
+    if [[ -z "${discovered_proxy_ip}" ]]; then
+      discovered_proxy_ip="${LISTEN_DEFAULT_IP}"
+    fi
+    listen_ip="$(prompt_ipv4 "Local SMB listen IPv4 for ${proxy_interface}" "${discovered_proxy_ip}")"
+
+    PROXY_NAMES+=("$(safe_route_name "${proxy_interface}" "${vlan}")")
+    PROXY_INTERFACES+=("${proxy_interface}")
+    PROXY_VLANS+=("${vlan}")
+    PROXY_LISTEN_IPS+=("${listen_ip}")
+    PROXY_LISTEN_PORTS+=("${listen_port}")
+    PROXY_TARGET_IPS+=("${target_ip}")
+    PROXY_TARGET_PORTS+=("${target_port}")
+    PROXY_BACKLOGS+=("${backlog}")
+    echo "Imported SMB route ${template_name}: ${listen_ip}:${listen_port} -> ${target_ip}:${target_port}"
   done
 }
 
@@ -1103,6 +1316,56 @@ configure_dns_gateway() {
   if prompt_yes_no "Enable the built-in URLhaus DNS threat feed (can block domains immediately)" "no"; then
     DNS_THREAT_FEED_URLS=("${DNS_DEFAULT_THREAT_FEED_URL}")
   fi
+}
+
+configure_dns_gateway_from_cluster() {
+  DNS_ENABLED="true"
+  select_dns_interface
+
+  local discovered_dns_ip
+  local dns_values
+  discovered_dns_ip="$(get_interface_ipv4 "${DNS_INTERFACE}")"
+  if [[ -z "${discovered_dns_ip}" ]]; then
+    discovered_dns_ip="${LISTEN_DEFAULT_IP}"
+  fi
+  DNS_BIND_IP="$(prompt_ipv4 "Local DNS listen IPv4 for ${DNS_INTERFACE}" "${discovered_dns_ip}")"
+  select_dns_upstream_interface
+
+  dns_values="$(python3 - "${CLUSTER_JOIN_RESPONSE_PATH}" <<'PY'
+import json
+import sys
+payload = json.load(open(sys.argv[1], encoding="utf-8"))
+dns = payload.get("service_template", {}).get("dns")
+if not dns:
+    raise SystemExit("missing DNS template")
+print("|".join(str(value) for value in [
+    dns.get("udp_port", 53),
+    dns.get("tcp_port", 53),
+    dns.get("cache_ttl_seconds", 300),
+    dns.get("cache_max_entries", 100000),
+    dns.get("query_timeout_millis", 1500),
+    dns.get("threat_feed_refresh_seconds", 3600),
+]))
+PY
+)" || {
+    ui_error "The selected DNS cluster does not contain a usable DNS service template."
+    exit 1
+  }
+  IFS='|' read -r DNS_UDP_PORT DNS_TCP_PORT DNS_CACHE_TTL_SECONDS DNS_CACHE_MAX_ENTRIES DNS_QUERY_TIMEOUT_MILLIS DNS_THREAT_FEED_REFRESH_SECONDS <<< "${dns_values}"
+  mapfile -t DNS_UPSTREAMS < <(python3 - "${CLUSTER_JOIN_RESPONSE_PATH}" <<'PY'
+import json
+import sys
+payload = json.load(open(sys.argv[1], encoding="utf-8"))
+for upstream in payload["service_template"]["dns"].get("upstreams", []):
+    print(upstream)
+PY
+)
+  if ((${#DNS_UPSTREAMS[@]} == 0)); then
+    ui_error "The selected DNS cluster template does not contain upstream resolvers."
+    exit 1
+  fi
+  DNS_THREAT_FEED_URLS=()
+  echo "Imported DNS service template: UDP ${DNS_UDP_PORT}, TCP ${DNS_TCP_PORT}, upstreams ${DNS_UPSTREAMS[*]}"
 }
 
 sha256_password_hash() {
@@ -1147,6 +1410,9 @@ collect_configuration() {
   NODE_DISPLAY_NAME=""
   NODE_CONTROL_ENABLED="false"
   NODE_ALLOW_INVALID_MANAGEMENT_TLS="false"
+  NODE_CLUSTER_ENABLED="false"
+  NODE_CLUSTER_NAME=""
+  CLUSTER_JOIN_RESPONSE_PATH=""
   NODE_CONTROL_INTERFACE=""
   NODE_CONTROL_BIND_IP=""
   NODE_CONTROL_PORT="${NODE_CONTROL_DEFAULT_PORT}"
@@ -1169,6 +1435,7 @@ collect_configuration() {
   PROXY_LISTEN_PORTS=()
   PROXY_TARGET_IPS=()
   PROXY_TARGET_PORTS=()
+  PROXY_BACKLOGS=()
   DNS_ENABLED="false"
   DNS_INTERFACE=""
   DNS_BIND_IP="${LISTEN_DEFAULT_IP}"
@@ -1177,6 +1444,10 @@ collect_configuration() {
   DNS_UPSTREAM_INTERFACE=""
   DNS_UPSTREAMS=()
   DNS_THREAT_FEED_URLS=()
+  DNS_CACHE_TTL_SECONDS="300"
+  DNS_CACHE_MAX_ENTRIES="100000"
+  DNS_QUERY_TIMEOUT_MILLIS="1500"
+  DNS_THREAT_FEED_REFRESH_SECONDS="3600"
 
   case "${NODE_ROLE}" in
     management)
@@ -1187,17 +1458,25 @@ collect_configuration() {
       ;;
     dns)
       configure_agent_management_stub
-      configure_agent_registration
       configure_node_identity
+      configure_agent_registration
       configure_node_control_listener
-      configure_dns_gateway
+      if [[ "${NODE_CLUSTER_ENABLED}" == "true" ]]; then
+        configure_dns_gateway_from_cluster
+      else
+        configure_dns_gateway
+      fi
       ;;
     smb_proxy)
       configure_agent_management_stub
-      configure_agent_registration
       configure_node_identity
+      configure_agent_registration
       configure_node_control_listener
-      configure_proxy_listeners
+      if [[ "${NODE_CLUSTER_ENABLED}" == "true" ]]; then
+        configure_proxy_listeners_from_cluster
+      else
+        configure_proxy_listeners
+      fi
       ;;
     standalone_lab)
       configure_management_ui
@@ -1274,6 +1553,12 @@ write_config() {
     echo "allow_invalid_management_tls = ${NODE_ALLOW_INVALID_MANAGEMENT_TLS}"
     echo "heartbeat_interval_seconds = 5"
     echo
+    echo "[node.cluster]"
+    echo "enabled = ${NODE_CLUSTER_ENABLED}"
+    if [[ "${NODE_CLUSTER_ENABLED}" == "true" ]]; then
+      echo "name = \"$(toml_escape "${NODE_CLUSTER_NAME}")\""
+    fi
+    echo
     echo "[node.control]"
     echo "enabled = ${NODE_CONTROL_ENABLED}"
     if [[ "${NODE_CONTROL_ENABLED}" == "true" ]]; then
@@ -1341,10 +1626,10 @@ write_config() {
         printf "\"%s\"" "$(toml_escape "${DNS_UPSTREAMS[${index}]}")"
       done
       printf "]\n"
-      echo "cache_ttl_seconds = 300"
-      echo "cache_max_entries = 100000"
-      echo "query_timeout_millis = 1000"
-      echo "threat_feed_refresh_seconds = 3600"
+      echo "cache_ttl_seconds = ${DNS_CACHE_TTL_SECONDS}"
+      echo "cache_max_entries = ${DNS_CACHE_MAX_ENTRIES}"
+      echo "query_timeout_millis = ${DNS_QUERY_TIMEOUT_MILLIS}"
+      echo "threat_feed_refresh_seconds = ${DNS_THREAT_FEED_REFRESH_SECONDS}"
       echo
       echo "[dns.policy]"
       echo "blocked_domain_action = \"block\""
@@ -1415,7 +1700,7 @@ write_config() {
       echo "listen_port = ${PROXY_LISTEN_PORTS[${index}]}"
       echo "target_file_server_ip = \"$(toml_escape "${PROXY_TARGET_IPS[${index}]}")\""
       echo "target_file_server_port = ${PROXY_TARGET_PORTS[${index}]}"
-      echo "backlog = 4096"
+      echo "backlog = ${PROXY_BACKLOGS[${index}]}"
     done
   } > "${temp_config}"
 
@@ -1695,6 +1980,11 @@ print_summary() {
   else
     echo "Management server: ${NODE_MANAGEMENT_URL}"
     echo "Node ID: ${NODE_ID}"
+    if [[ "${NODE_CLUSTER_ENABLED:-false}" == "true" ]]; then
+      echo "Cluster: ${NODE_CLUSTER_NAME} (service template imported)"
+    else
+      echo "Cluster: standalone managed node"
+    fi
     if [[ "${NODE_ENROLLMENT_VALIDATED:-false}" == "true" ]]; then
       echo "Enrollment validation: passed"
     else
@@ -1813,6 +2103,10 @@ main() {
   write_service_restart_helper
   backup_existing_config
   write_config
+  if [[ -n "${CLUSTER_JOIN_RESPONSE_PATH:-}" ]]; then
+    rm -f "${CLUSTER_JOIN_RESPONSE_PATH}"
+    CLUSTER_JOIN_RESPONSE_PATH=""
+  fi
   build_and_install_binary
   if ((${#PROXY_INTERFACES[@]} > 0)); then
     configure_reverse_proxy_network_mode

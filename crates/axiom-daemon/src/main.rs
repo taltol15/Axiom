@@ -7,7 +7,7 @@ use std::{
 };
 
 use anyhow::Context;
-use axiom_config::{AxiomConfig, DnsConfig, NodeRole, ProxyListenerConfig};
+use axiom_config::{AxiomConfig, ClusterServiceTemplate, DnsConfig, NodeRole, ProxyListenerConfig};
 use axiom_control::{
     ControlApplyResponse, ControlPolicyBundle, EncryptedEnvelope, decrypt_payload, encrypt_payload,
 };
@@ -716,6 +716,8 @@ async fn post_node_report(
         "version": env!("CARGO_PKG_VERSION"),
         "management_url": config.node.management_url,
         "control_url": node_control_url(config),
+        "cluster_name": config.node.cluster.name,
+        "service_template": ClusterServiceTemplate::from_config(config),
         "proxy_listeners": config.proxy_listeners.iter().map(proxy_listener_status).collect::<Vec<_>>(),
         "dns": dns_status(&config.dns),
         "stats": runtime.snapshot(),

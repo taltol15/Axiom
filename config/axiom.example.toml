@@ -6,6 +6,9 @@ enrollment_token = "replace-with-random-token-for-lab-child-nodes"
 allow_invalid_management_tls = false
 heartbeat_interval_seconds = 5
 
+[node.cluster]
+enabled = false
+
 [node.control]
 enabled = false
 
