@@ -7,8 +7,11 @@ use std::{
 
 use axiom_license::LicenseConfig;
 use axiom_reputation::KnownBadAction;
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+const DNS_BLOCK_PAGE_LOGO_MAX_BYTES: usize = 256 * 1024;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AxiomConfig {
@@ -659,6 +662,8 @@ pub struct DnsPolicyConfig {
     #[serde(default = "default_dns_sinkhole_ipv4")]
     pub sinkhole_ipv4: Ipv4Addr,
     #[serde(default)]
+    pub block_page: DnsBlockPageConfig,
+    #[serde(default)]
     pub local_records: Vec<DnsLocalRecordConfig>,
 }
 
@@ -670,8 +675,9 @@ impl Default for DnsPolicyConfig {
             blocked_domains: Vec::new(),
             monitored_domains: Vec::new(),
             threat_feed_urls: Vec::new(),
-            block_response: DnsBlockResponse::Nxdomain,
+            block_response: DnsBlockResponse::Sinkhole,
             sinkhole_ipv4: default_dns_sinkhole_ipv4(),
+            block_page: DnsBlockPageConfig::default(),
             local_records: Vec::new(),
         }
     }
@@ -697,6 +703,117 @@ impl DnsPolicyConfig {
 
         for record in &self.local_records {
             record.validate()?;
+        }
+
+        self.block_page.validate()?;
+
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct DnsBlockPageConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_dns_block_page_organization")]
+    pub organization_name: String,
+    #[serde(default = "default_dns_block_page_title")]
+    pub title: String,
+    #[serde(default = "default_dns_block_page_message")]
+    pub message: String,
+    #[serde(default = "default_dns_block_page_primary_color")]
+    pub primary_color: String,
+    #[serde(default = "default_dns_block_page_support_text")]
+    pub support_text: String,
+    #[serde(default)]
+    pub support_url: String,
+    #[serde(default)]
+    pub logo_data_url: String,
+}
+
+impl Default for DnsBlockPageConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            organization_name: default_dns_block_page_organization(),
+            title: default_dns_block_page_title(),
+            message: default_dns_block_page_message(),
+            primary_color: default_dns_block_page_primary_color(),
+            support_text: default_dns_block_page_support_text(),
+            support_url: String::new(),
+            logo_data_url: String::new(),
+        }
+    }
+}
+
+impl DnsBlockPageConfig {
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        validate_text_field(
+            "dns.policy.block_page.organization_name",
+            &self.organization_name,
+            120,
+            false,
+        )?;
+        validate_text_field("dns.policy.block_page.title", &self.title, 200, false)?;
+        validate_text_field("dns.policy.block_page.message", &self.message, 2_000, false)?;
+        validate_text_field(
+            "dns.policy.block_page.support_text",
+            &self.support_text,
+            500,
+            true,
+        )?;
+
+        let color = self.primary_color.as_bytes();
+        if color.len() != 7
+            || color.first() != Some(&b'#')
+            || !color[1..].iter().all(u8::is_ascii_hexdigit)
+        {
+            return Err(ConfigError::Invalid(
+                "dns.policy.block_page.primary_color must use #RRGGBB format".to_string(),
+            ));
+        }
+
+        if !(self.support_url.is_empty()
+            || self.support_url.starts_with("https://")
+            || self.support_url.starts_with("http://")
+            || self.support_url.starts_with("mailto:"))
+        {
+            return Err(ConfigError::Invalid(
+                "dns.policy.block_page.support_url must start with https://, http://, or mailto:"
+                    .to_string(),
+            ));
+        }
+        if self.support_url.chars().count() > 2_048 {
+            return Err(ConfigError::Invalid(
+                "dns.policy.block_page.support_url must not exceed 2048 characters".to_string(),
+            ));
+        }
+
+        if !self.logo_data_url.is_empty() {
+            let encoded = [
+                "data:image/png;base64,",
+                "data:image/jpeg;base64,",
+                "data:image/webp;base64,",
+            ]
+            .iter()
+            .find_map(|prefix| self.logo_data_url.strip_prefix(prefix))
+            .ok_or_else(|| {
+                ConfigError::Invalid(
+                    "dns.policy.block_page.logo_data_url must be a PNG, JPEG, or WebP base64 data URL"
+                        .to_string(),
+                )
+            })?;
+            let decoded = STANDARD.decode(encoded).map_err(|_| {
+                ConfigError::Invalid(
+                    "dns.policy.block_page.logo_data_url contains invalid base64 data".to_string(),
+                )
+            })?;
+            if decoded.is_empty() || decoded.len() > DNS_BLOCK_PAGE_LOGO_MAX_BYTES {
+                return Err(ConfigError::Invalid(format!(
+                    "dns.policy.block_page.logo_data_url must contain between 1 and {} decoded bytes",
+                    DNS_BLOCK_PAGE_LOGO_MAX_BYTES
+                )));
+            }
         }
 
         Ok(())
@@ -754,8 +871,8 @@ pub enum DnsRecordType {
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum DnsBlockResponse {
-    #[default]
     Nxdomain,
+    #[default]
     Sinkhole,
     Refused,
 }
@@ -1280,6 +1397,22 @@ fn validate_dns_domain(domain: &str) -> Result<(), ConfigError> {
     Ok(())
 }
 
+fn validate_text_field(
+    field_name: &str,
+    value: &str,
+    maximum_characters: usize,
+    allow_empty: bool,
+) -> Result<(), ConfigError> {
+    let length = value.chars().count();
+    if (!allow_empty && value.trim().is_empty()) || length > maximum_characters {
+        return Err(ConfigError::Invalid(format!(
+            "{field_name} must contain {} to {maximum_characters} characters",
+            usize::from(!allow_empty)
+        )));
+    }
+    Ok(())
+}
+
 fn default_smb_port() -> u16 {
     445
 }
@@ -1338,6 +1471,30 @@ fn default_dns_threat_feed_refresh_seconds() -> u64 {
 
 fn default_dns_sinkhole_ipv4() -> Ipv4Addr {
     Ipv4Addr::new(0, 0, 0, 0)
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_dns_block_page_organization() -> String {
+    "Axiom Security".to_string()
+}
+
+fn default_dns_block_page_title() -> String {
+    "Access to this site has been blocked".to_string()
+}
+
+fn default_dns_block_page_message() -> String {
+    "This domain was blocked by your organization's DNS security policy.".to_string()
+}
+
+fn default_dns_block_page_primary_color() -> String {
+    "#34f5c5".to_string()
+}
+
+fn default_dns_block_page_support_text() -> String {
+    "Contact your IT or security team if you believe this is an error.".to_string()
 }
 
 fn default_dns_local_record_ttl_seconds() -> u32 {
@@ -1422,6 +1579,46 @@ mod tests {
         assert!(config.node.cluster.name.is_none());
         assert!(config.clusters.groups.is_empty());
         config.validate().expect("legacy config must remain valid");
+    }
+
+    #[test]
+    fn legacy_dns_policy_receives_default_axiom_block_page() {
+        let source = r#"
+blocked_domain_action = "block"
+monitored_domain_action = "monitor"
+block_response = "nxdomain"
+sinkhole_ipv4 = "0.0.0.0"
+"#;
+
+        let policy: DnsPolicyConfig = toml::from_str(source).expect("legacy policy must parse");
+
+        assert!(policy.block_page.enabled);
+        assert_eq!(policy.block_page.organization_name, "Axiom Security");
+        assert_eq!(policy.block_page.primary_color, "#34f5c5");
+        policy.validate().expect("default block page must validate");
+    }
+
+    #[test]
+    fn dns_block_page_accepts_hebrew_and_embedded_png() {
+        let mut policy = DnsPolicyConfig::default();
+        policy.block_page.organization_name = "אקסיום אבטחת מידע".to_string();
+        policy.block_page.title = "הגישה לאתר נחסמה".to_string();
+        policy.block_page.message = "הדומיין נחסם בהתאם למדיניות הארגון.".to_string();
+        policy.block_page.logo_data_url = "data:image/png;base64,iVBORw0KGgo=".to_string();
+
+        policy.validate().expect("Hebrew block page must validate");
+    }
+
+    #[test]
+    fn dns_block_page_rejects_unsafe_logo_and_support_url() {
+        let mut policy = DnsPolicyConfig::default();
+        policy.block_page.logo_data_url =
+            "data:image/svg+xml;base64,PHN2ZyBvbmxvYWQ9YWxlcnQoMSk+".to_string();
+        assert!(policy.validate().is_err());
+
+        policy.block_page.logo_data_url.clear();
+        policy.block_page.support_url = "javascript:alert(1)".to_string();
+        assert!(policy.validate().is_err());
     }
 
     #[test]

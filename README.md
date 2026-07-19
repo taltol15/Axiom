@@ -56,7 +56,10 @@ Cluster membership provides centralized configuration and policy consistency.
 Client traffic high availability is configured separately: publish several DNS
 node addresses through DHCP, or place SMB nodes behind a TCP/445-aware external
 load balancer/VIP with session affinity. Axiom records the intended HA mode and
-service endpoint but does not take ownership of an external VIP.
+service endpoint but does not take ownership of an external VIP. See
+`docs/CLUSTER_AND_HIGH_AVAILABILITY_KB.md` for field-by-field behavior, exact LB
+requirements, failure scenarios, firewall rules, and production acceptance
+tests.
 
 ## Run
 
@@ -108,6 +111,13 @@ threat feeds, serves local DNS records, caches safe responses, and forwards
 allowed queries to the configured internal DC/upstream DNS servers. Threat feeds
 are opt-in during installation so a new deployment does not start blocking
 domains before an explicit DNS policy is configured.
+
+New DNS installations use the built-in Axiom block page for blocked domains.
+Administrators can customize its logo, UTF-8 text, color and support link under
+DNS Security. The page is served locally on TCP 80 and works without internet
+access. HTTP can display the page directly; HTTPS normally shows a certificate
+warning before HTTP content because Axiom does not impersonate the blocked
+domain. See `docs/DNS_BLOCK_PAGE_KB.md` for design and validation details.
 
 Organizations without internal DNS can select public recursive upstreams during
 installation, including Cloudflare, Google, Quad9, or custom resolver IPs. The
@@ -219,6 +229,8 @@ docs/PRODUCT_OVERVIEW.md
 docs/OPERATIONS_RUNBOOK.md
 docs/RELEASE_CHECKLIST.md
 docs/VALIDATION_TEST_PLAN.md
+docs/CLUSTER_AND_HIGH_AVAILABILITY_KB.md
+docs/DNS_BLOCK_PAGE_KB.md
 ```
 
 ## Policies

@@ -57,11 +57,21 @@ monitored_domain_action = "monitor"
 blocked_domains = ["malware.test"]
 monitored_domains = ["suspicious.test"]
 threat_feed_urls = []
-block_response = "nxdomain"
+block_response = "sinkhole"
 sinkhole_ipv4 = "0.0.0.0"
 local_records = [
   { name = "intranet.local", type = "a", value = "10.10.0.50", ttl_seconds = 300 },
 ]
+
+[dns.policy.block_page]
+enabled = true
+organization_name = "Axiom Security"
+title = "Access to this site has been blocked"
+message = "This domain was blocked by your organization's DNS security policy."
+primary_color = "#34f5c5"
+support_text = "Contact your IT or security team if you believe this is an error."
+support_url = ""
+logo_data_url = ""
 
 [policy.smb]
 encrypted_payload = "monitor"

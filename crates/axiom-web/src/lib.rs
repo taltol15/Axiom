@@ -1911,13 +1911,8 @@ async fn api_update_dns_policy(
 
     if let Err(error) = policy.validate() {
         warn!(?error, "invalid DNS policy update rejected");
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse {
-                message: "invalid DNS policy configuration",
-            }),
-        )
-            .into_response();
+        let message = format!("invalid DNS policy configuration: {error}");
+        return (StatusCode::BAD_REQUEST, Json(ApiErrorResponse { message })).into_response();
     }
 
     let persisted = {
@@ -4381,6 +4376,30 @@ mod tests {
         assert!(validate_cluster_password("twelve-chars").is_ok());
     }
 
+    #[test]
+    fn dashboard_contains_complete_dns_block_page_editor() {
+        for required_id in [
+            "dns-block-response",
+            "dns-sinkhole-ipv4",
+            "dns-block-page-enabled",
+            "dns-block-page-organization",
+            "dns-block-page-title",
+            "dns-block-page-message",
+            "dns-block-page-color",
+            "dns-block-page-support-text",
+            "dns-block-page-support-url",
+            "dns-block-page-logo",
+            "dns-block-page-preview",
+        ] {
+            assert!(
+                DASHBOARD_HTML.contains(&format!("id=\"{required_id}\"")),
+                "dashboard is missing {required_id}"
+            );
+        }
+        assert!(DASHBOARD_HTML.contains("HTTPS certificate validation"));
+        assert!(DASHBOARD_HTML.contains("Reset Axiom defaults"));
+    }
+
     #[tokio::test]
     async fn cluster_password_hash_verifies_without_storing_plaintext() {
         let password = "Axiom-Cluster-Secret-2026".to_string();
@@ -5974,7 +5993,7 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
         </div>
         <button id="save-dns-policy" class="rounded-md bg-emerald-400 px-4 py-2 text-sm font-semibold text-zinc-950 transition hover:bg-emerald-300">Save and apply</button>
       </div>
-      <div class="grid gap-6 p-6 lg:grid-cols-3">
+      <div class="grid gap-6 p-6 lg:grid-cols-4">
         <label class="block">
           <span class="text-sm text-zinc-300">Blocked Domain Action</span>
           <select id="dns-blocked-action" class="mt-2 w-full rounded-md border border-zinc-700 bg-zinc-950 px-3 py-2 text-white"></select>
@@ -5986,11 +6005,88 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
         <label class="block">
           <span class="text-sm text-zinc-300">Block Response</span>
           <select id="dns-block-response" class="mt-2 w-full rounded-md border border-zinc-700 bg-zinc-950 px-3 py-2 text-white">
-            <option value="nxdomain">nxdomain</option>
-            <option value="refused">refused</option>
-            <option value="sinkhole">sinkhole</option>
+            <option value="nxdomain">NXDOMAIN</option>
+            <option value="refused">REFUSED</option>
+            <option value="sinkhole">Branded block page</option>
           </select>
         </label>
+        <label class="block">
+          <span class="text-sm text-zinc-300">Block Page IPv4</span>
+          <input id="dns-sinkhole-ipv4" type="text" spellcheck="false" placeholder="Automatic: each DNS node IP" class="mt-2 w-full rounded-md border border-zinc-700 bg-zinc-950 px-3 py-2 font-mono text-sm text-white">
+        </label>
+      </div>
+
+      <div id="dns-block-page-panel" class="border-t border-zinc-800 p-6">
+        <div class="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
+          <div>
+            <h3 class="text-base font-semibold text-white">DNS Block Page</h3>
+            <p class="mt-1 max-w-3xl text-sm leading-6 text-zinc-500">Blocked HTTP sites are redirected to a page served by each DNS node on TCP 80. HTTPS certificate validation happens before a page can be shown, so HTTPS sites may display a browser certificate error unless the organization operates approved TLS inspection.</p>
+          </div>
+          <label class="flex items-center gap-3 text-sm text-zinc-300">
+            <input id="dns-block-page-enabled" type="checkbox" class="h-4 w-4 accent-emerald-400">
+            Serve block page
+          </label>
+        </div>
+
+        <div class="mt-6 grid gap-6 xl:grid-cols-[minmax(0,1fr)_minmax(360px,0.9fr)]">
+          <div class="grid gap-4 sm:grid-cols-2">
+            <label class="block">
+              <span class="text-sm text-zinc-300">Organization Name</span>
+              <input id="dns-block-page-organization" type="text" maxlength="120" dir="auto" class="mt-2 w-full rounded-md border border-zinc-700 bg-zinc-950 px-3 py-2 text-white">
+            </label>
+            <label class="block">
+              <span class="text-sm text-zinc-300">Accent Color</span>
+              <input id="dns-block-page-color" type="color" value="#34f5c5" class="mt-2 h-10 w-full rounded-md border border-zinc-700 bg-zinc-950 p-1">
+            </label>
+            <label class="block sm:col-span-2">
+              <span class="text-sm text-zinc-300">Title</span>
+              <input id="dns-block-page-title" type="text" maxlength="200" dir="auto" class="mt-2 w-full rounded-md border border-zinc-700 bg-zinc-950 px-3 py-2 text-white">
+            </label>
+            <label class="block sm:col-span-2">
+              <span class="text-sm text-zinc-300">Message</span>
+              <textarea id="dns-block-page-message" rows="4" maxlength="2000" dir="auto" class="mt-2 w-full rounded-md border border-zinc-700 bg-zinc-950 px-3 py-2 text-white"></textarea>
+            </label>
+            <label class="block sm:col-span-2">
+              <span class="text-sm text-zinc-300">Support Text</span>
+              <input id="dns-block-page-support-text" type="text" maxlength="500" dir="auto" class="mt-2 w-full rounded-md border border-zinc-700 bg-zinc-950 px-3 py-2 text-white">
+            </label>
+            <label class="block sm:col-span-2">
+              <span class="text-sm text-zinc-300">Support URL (optional)</span>
+              <input id="dns-block-page-support-url" type="text" maxlength="2048" spellcheck="false" placeholder="https://helpdesk.example or mailto:soc@example" class="mt-2 w-full rounded-md border border-zinc-700 bg-zinc-950 px-3 py-2 text-white">
+            </label>
+            <div class="sm:col-span-2">
+              <span class="text-sm text-zinc-300">Custom Logo (optional)</span>
+              <input id="dns-block-page-logo" type="file" accept="image/png,image/jpeg,image/webp" class="mt-2 block w-full rounded-md border border-zinc-700 bg-zinc-950 px-3 py-2 text-sm text-zinc-300 file:mr-3 file:rounded file:border-0 file:bg-emerald-400 file:px-3 file:py-1.5 file:font-semibold file:text-zinc-950">
+              <p class="mt-2 text-xs text-zinc-500">PNG, JPEG, or WebP up to 256 KB. The image is embedded in policy for air-gapped operation.</p>
+              <div class="mt-3 flex flex-wrap gap-2">
+                <button id="dns-block-page-remove-logo" type="button" class="rounded-md border border-zinc-700 px-3 py-2 text-sm text-zinc-300 transition hover:border-red-400 hover:text-red-200">Use Axiom logo</button>
+                <button id="dns-block-page-reset" type="button" class="rounded-md border border-zinc-700 px-3 py-2 text-sm text-zinc-300 transition hover:border-emerald-400 hover:text-emerald-100">Reset Axiom defaults</button>
+              </div>
+            </div>
+          </div>
+
+          <div>
+            <p class="text-xs font-semibold uppercase text-zinc-500">Live Preview</p>
+            <div id="dns-block-page-preview" dir="auto" class="mt-2 min-h-[380px] rounded-md border border-zinc-700 bg-zinc-950 p-7 text-zinc-100">
+              <div class="flex items-center gap-3">
+                <div id="dns-block-page-preview-default-logo" class="h-11 w-11 text-emerald-300">
+                  <svg viewBox="0 0 48 48" fill="none" xmlns="http://www.w3.org/2000/svg" aria-label="Axiom">
+                    <path d="M24 2.5 41.6 12.75v20.5L24 43.5 6.4 33.25v-20.5z" fill="#0b2f32" stroke="currentColor" stroke-width="2" />
+                    <path d="M16 33 24 14l8 19M19.2 26.5h9.6" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round" />
+                  </svg>
+                </div>
+                <img id="dns-block-page-preview-custom-logo" alt="Custom block page logo" class="hidden h-12 max-w-[190px] object-contain">
+                <p id="dns-block-page-preview-organization" class="font-semibold text-white">Axiom Security</p>
+              </div>
+              <div id="dns-block-page-preview-signal" class="mt-8 h-1 w-10 bg-emerald-300"></div>
+              <h4 id="dns-block-page-preview-title" class="mt-5 text-3xl font-semibold text-white">Access to this site has been blocked</h4>
+              <p id="dns-block-page-preview-message" class="mt-4 whitespace-pre-line text-sm leading-6 text-zinc-300">This domain was blocked by your organization's DNS security policy.</p>
+              <div id="dns-block-page-preview-domain" class="mt-6 rounded-md border border-zinc-700 bg-zinc-900 px-4 py-3 text-left font-mono text-sm text-emerald-300" dir="ltr">blocked.example</div>
+              <p id="dns-block-page-preview-support" class="mt-5 text-sm text-zinc-500">Contact your IT or security team if you believe this is an error.</p>
+              <p class="mt-8 border-t border-zinc-800 pt-5 text-xs text-zinc-600">Protected by Axiom DNS Security</p>
+            </div>
+          </div>
+        </div>
       </div>
 
       <div class="border-t border-zinc-800 p-6">
@@ -6373,7 +6469,19 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
     let latestAuditTotals = { smb: 0, dns: 0 };
     let enrollmentContext = { token: "", managementUrl: "" };
     let localDnsRecords = [];
+    let dnsBlockPageLogoDataUrl = "";
     let latestSmbFileActivity = [];
+
+    const defaultDnsBlockPage = {
+      enabled: true,
+      organization_name: "Axiom Security",
+      title: "Access to this site has been blocked",
+      message: "This domain was blocked by your organization's DNS security policy.",
+      primary_color: "#34f5c5",
+      support_text: "Contact your IT or security team if you believe this is an error.",
+      support_url: "",
+      logo_data_url: ""
+    };
 
     function authHeaders(extra = {}) {
       return token ? { ...extra, Authorization: `Bearer ${token}` } : extra;
@@ -8199,6 +8307,8 @@ DNS node -> upstream resolvers: UDP/TCP 53`;
       fillModeSelect("dns-blocked-action", policy.blocked_domain_action);
       fillModeSelect("dns-monitored-action", policy.monitored_domain_action);
       document.getElementById("dns-block-response").value = policy.block_response || "nxdomain";
+      document.getElementById("dns-sinkhole-ipv4").value =
+        policy.sinkhole_ipv4 && policy.sinkhole_ipv4 !== "0.0.0.0" ? policy.sinkhole_ipv4 : "";
       document.getElementById("dns-blocked-domains").value = (policy.blocked_domains || []).join("\n");
       document.getElementById("dns-monitored-domains").value = (policy.monitored_domains || []).join("\n");
       document.getElementById("dns-threat-feeds").value = (policy.threat_feed_urls || []).join("\n");
@@ -8209,7 +8319,90 @@ DNS node -> upstream resolvers: UDP/TCP 53`;
         ttl_seconds: Number(record.ttl_seconds || 300)
       }));
       renderLocalDnsRecords();
+      setDnsBlockPageFields(policy.block_page || defaultDnsBlockPage);
+      updateDnsBlockPageControls();
       document.getElementById("dns-policy-state").textContent = "DNS policy loaded";
+    }
+
+    function setDnsBlockPageFields(page) {
+      const merged = { ...defaultDnsBlockPage, ...(page || {}) };
+      document.getElementById("dns-block-page-enabled").checked = merged.enabled !== false;
+      document.getElementById("dns-block-page-organization").value = merged.organization_name;
+      document.getElementById("dns-block-page-title").value = merged.title;
+      document.getElementById("dns-block-page-message").value = merged.message;
+      document.getElementById("dns-block-page-color").value = merged.primary_color;
+      document.getElementById("dns-block-page-support-text").value = merged.support_text;
+      document.getElementById("dns-block-page-support-url").value = merged.support_url || "";
+      dnsBlockPageLogoDataUrl = merged.logo_data_url || "";
+      document.getElementById("dns-block-page-logo").value = "";
+      updateDnsBlockPagePreview();
+    }
+
+    function updateDnsBlockPageControls() {
+      const sinkhole = document.getElementById("dns-block-response").value === "sinkhole";
+      const enabled = document.getElementById("dns-block-page-enabled").checked;
+      document.getElementById("dns-sinkhole-ipv4").disabled = !sinkhole;
+      document.querySelectorAll("#dns-block-page-panel input, #dns-block-page-panel textarea, #dns-block-page-panel button")
+        .forEach((element) => {
+          if (element.id === "dns-block-page-enabled") {
+            element.disabled = !sinkhole;
+          } else {
+            element.disabled = !sinkhole || !enabled;
+          }
+        });
+      document.getElementById("dns-block-page-preview").style.opacity = sinkhole && enabled ? "1" : "0.45";
+    }
+
+    function updateDnsBlockPagePreview() {
+      const color = document.getElementById("dns-block-page-color").value || defaultDnsBlockPage.primary_color;
+      document.getElementById("dns-block-page-preview-organization").textContent =
+        document.getElementById("dns-block-page-organization").value || defaultDnsBlockPage.organization_name;
+      document.getElementById("dns-block-page-preview-title").textContent =
+        document.getElementById("dns-block-page-title").value || defaultDnsBlockPage.title;
+      document.getElementById("dns-block-page-preview-message").textContent =
+        document.getElementById("dns-block-page-message").value || defaultDnsBlockPage.message;
+      const supportText = document.getElementById("dns-block-page-support-text").value;
+      const supportPreview = document.getElementById("dns-block-page-preview-support");
+      supportPreview.textContent = supportText;
+      supportPreview.classList.toggle("hidden", !supportText);
+      document.getElementById("dns-block-page-preview-signal").style.backgroundColor = color;
+      document.getElementById("dns-block-page-preview-domain").style.color = color;
+      const defaultLogo = document.getElementById("dns-block-page-preview-default-logo");
+      const customLogo = document.getElementById("dns-block-page-preview-custom-logo");
+      defaultLogo.style.color = color;
+      if (dnsBlockPageLogoDataUrl) {
+        customLogo.src = dnsBlockPageLogoDataUrl;
+        customLogo.classList.remove("hidden");
+        defaultLogo.classList.add("hidden");
+      } else {
+        customLogo.removeAttribute("src");
+        customLogo.classList.add("hidden");
+        defaultLogo.classList.remove("hidden");
+      }
+    }
+
+    function loadDnsBlockPageLogo(event) {
+      const file = event.target.files && event.target.files[0];
+      if (!file) return;
+      const allowedTypes = ["image/png", "image/jpeg", "image/webp"];
+      if (!allowedTypes.includes(file.type)) {
+        event.target.value = "";
+        showToast("Logo rejected", "Use a PNG, JPEG, or WebP image.", "error");
+        return;
+      }
+      if (file.size > 256 * 1024) {
+        event.target.value = "";
+        showToast("Logo rejected", "The decoded logo must be 256 KB or smaller.", "error");
+        return;
+      }
+      const reader = new FileReader();
+      reader.onload = () => {
+        dnsBlockPageLogoDataUrl = String(reader.result || "");
+        updateDnsBlockPagePreview();
+        document.getElementById("dns-policy-state").textContent = "Block page logo changed · save to apply";
+      };
+      reader.onerror = () => showToast("Logo read failed", "The selected image could not be read.", "error");
+      reader.readAsDataURL(file);
     }
 
     async function loadReputationCenter() {
@@ -8590,7 +8783,17 @@ DNS node -> upstream resolvers: UDP/TCP 53`;
         monitored_domains: linesToArray("dns-monitored-domains"),
         threat_feed_urls: linesToArray("dns-threat-feeds"),
         block_response: document.getElementById("dns-block-response").value,
-        sinkhole_ipv4: "0.0.0.0",
+        sinkhole_ipv4: document.getElementById("dns-sinkhole-ipv4").value.trim() || "0.0.0.0",
+        block_page: {
+          enabled: document.getElementById("dns-block-page-enabled").checked,
+          organization_name: document.getElementById("dns-block-page-organization").value.trim(),
+          title: document.getElementById("dns-block-page-title").value.trim(),
+          message: document.getElementById("dns-block-page-message").value.trim(),
+          primary_color: document.getElementById("dns-block-page-color").value,
+          support_text: document.getElementById("dns-block-page-support-text").value.trim(),
+          support_url: document.getElementById("dns-block-page-support-url").value.trim(),
+          logo_data_url: dnsBlockPageLogoDataUrl
+        },
         local_records: localDnsRecords
       };
     }
@@ -8997,6 +9200,32 @@ DNS node -> upstream resolvers: UDP/TCP 53`;
       if (button.dataset.clusterAction === "remove-member") removeClusterMember(name, button.dataset.nodeId);
     });
     document.getElementById("save-dns-policy").addEventListener("click", saveDnsPolicy);
+    document.getElementById("dns-block-response").addEventListener("change", () => {
+      updateDnsBlockPageControls();
+      document.getElementById("dns-policy-state").textContent = "Block response changed · save to apply";
+    });
+    document.getElementById("dns-block-page-enabled").addEventListener("change", () => {
+      updateDnsBlockPageControls();
+      document.getElementById("dns-policy-state").textContent = "Block page state changed · save to apply";
+    });
+    document.querySelectorAll("#dns-block-page-panel input[type='text'], #dns-block-page-panel input[type='color'], #dns-block-page-panel textarea")
+      .forEach((element) => element.addEventListener("input", () => {
+        updateDnsBlockPagePreview();
+        document.getElementById("dns-policy-state").textContent = "Block page changed · save to apply";
+      }));
+    document.getElementById("dns-block-page-logo").addEventListener("change", loadDnsBlockPageLogo);
+    document.getElementById("dns-block-page-remove-logo").addEventListener("click", () => {
+      dnsBlockPageLogoDataUrl = "";
+      document.getElementById("dns-block-page-logo").value = "";
+      updateDnsBlockPagePreview();
+      document.getElementById("dns-policy-state").textContent = "Axiom logo selected · save to apply";
+    });
+    document.getElementById("dns-block-page-reset").addEventListener("click", () => {
+      setDnsBlockPageFields(defaultDnsBlockPage);
+      updateDnsBlockPageControls();
+      document.getElementById("dns-policy-state").textContent = "Axiom block page defaults restored · save to apply";
+      showToast("Block page reset", "Axiom defaults are ready to be saved.", "success");
+    });
     document.getElementById("add-dns-local-record").addEventListener("click", addLocalDnsRecord);
     document.getElementById("dns-local-records-body").addEventListener("input", () => {
       document.getElementById("dns-policy-state").textContent = "Local DNS records changed · save to apply";

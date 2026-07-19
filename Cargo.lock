@@ -138,6 +138,7 @@ version = "0.1.0"
 dependencies = [
  "axiom-license",
  "axiom-reputation",
+ "base64",
  "serde",
  "thiserror",
  "toml",

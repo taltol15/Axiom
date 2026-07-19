@@ -14,13 +14,16 @@ use std::{
 };
 
 use anyhow::Context;
-use axiom_config::{DnsBlockResponse, DnsConfig, DnsLocalRecordConfig, DnsRecordType, PolicyMode};
+use axiom_config::{
+    DnsBlockPageConfig, DnsBlockResponse, DnsConfig, DnsLocalRecordConfig, DnsRecordType,
+    PolicyMode,
+};
 use axiom_core::{DnsAction, DnsProtocol, DnsQueryEvent, RuntimeState};
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream, UdpSocket},
-    sync::RwLock,
+    sync::{RwLock, Semaphore},
     task::JoinSet,
     time::timeout,
 };
@@ -37,6 +40,11 @@ const DNS_RCODE_NOERROR: u8 = 0;
 const DNS_RCODE_FORMERR: u8 = 1;
 const DNS_RCODE_REFUSED: u8 = 5;
 const DNS_RCODE_NXDOMAIN: u8 = 3;
+const BLOCK_PAGE_HTTP_PORT: u16 = 80;
+const BLOCK_PAGE_MAX_HEADER_BYTES: usize = 16 * 1024;
+const BLOCK_PAGE_MAX_CONNECTIONS: usize = 256;
+const BLOCK_PAGE_READ_TIMEOUT: Duration = Duration::from_secs(5);
+const BLOCK_PAGE_RETRY_INTERVAL: Duration = Duration::from_secs(15);
 
 pub async fn run_dns_gateway(config: DnsConfig, runtime: Arc<RuntimeState>) -> anyhow::Result<()> {
     if !config.enabled {
@@ -73,6 +81,7 @@ pub async fn run_dns_gateway(config: DnsConfig, runtime: Arc<RuntimeState>) -> a
     tasks.spawn(run_udp_server(Arc::clone(&state), Arc::clone(&udp_socket)));
     tasks.spawn(run_tcp_server(Arc::clone(&state), tcp_listener));
     tasks.spawn(refresh_threat_feeds_periodically(Arc::clone(&state)));
+    tasks.spawn(run_block_page_supervisor(Arc::clone(&state)));
 
     while let Some(result) = tasks.join_next().await {
         match result {
@@ -189,7 +198,7 @@ async fn handle_dns_query(
         .policy_decision(&policy, &question.normalized_name)
         .await;
     if decision.action == DnsAction::Block {
-        let response = build_policy_block_response(&query, &question, &policy);
+        let response = build_policy_block_response(&query, &question, &policy, &state.config);
         state.runtime.record_dns_query(DnsQueryEvent::now(
             protocol,
             client_addr,
@@ -309,6 +318,268 @@ async fn refresh_threat_feeds_periodically(state: Arc<DnsGatewayState>) -> anyho
         interval.tick().await;
         state.refresh_threat_feeds().await;
     }
+}
+
+async fn run_block_page_supervisor(state: Arc<DnsGatewayState>) -> anyhow::Result<()> {
+    loop {
+        let policy = state.runtime.dns_policy_config();
+        let Some(bind_addr) = local_block_page_bind_addr(&state.config, &policy) else {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            continue;
+        };
+
+        match bind_tcp_listener_to_interface(&state.config.interface, bind_addr, 1024).await {
+            Ok(listener) => {
+                info!(
+                    interface = state.config.interface,
+                    %bind_addr,
+                    "DNS block page HTTP listener started"
+                );
+                if let Err(error) = run_block_page_server(Arc::clone(&state), listener).await {
+                    warn!(%bind_addr, ?error, "DNS block page listener stopped; retrying");
+                }
+            }
+            Err(error) => {
+                warn!(
+                    interface = state.config.interface,
+                    %bind_addr,
+                    ?error,
+                    "failed binding DNS block page HTTP listener; DNS resolution remains available"
+                );
+            }
+        }
+
+        tokio::time::sleep(BLOCK_PAGE_RETRY_INTERVAL).await;
+    }
+}
+
+fn local_block_page_bind_addr(
+    config: &DnsConfig,
+    policy: &axiom_config::DnsPolicyConfig,
+) -> Option<SocketAddr> {
+    if policy.block_response != DnsBlockResponse::Sinkhole || !policy.block_page.enabled {
+        return None;
+    }
+
+    let IpAddr::V4(listen_ip) = config.listen_ip? else {
+        return None;
+    };
+    if listen_ip.is_unspecified() {
+        return None;
+    }
+
+    if !policy.sinkhole_ipv4.is_unspecified() && policy.sinkhole_ipv4 != listen_ip {
+        return None;
+    }
+
+    Some(SocketAddr::new(IpAddr::V4(listen_ip), BLOCK_PAGE_HTTP_PORT))
+}
+
+async fn run_block_page_server(
+    state: Arc<DnsGatewayState>,
+    listener: TcpListener,
+) -> anyhow::Result<()> {
+    let permits = Arc::new(Semaphore::new(BLOCK_PAGE_MAX_CONNECTIONS));
+    loop {
+        let accepted = tokio::select! {
+            accepted = listener.accept() => Some(accepted),
+            _ = tokio::time::sleep(Duration::from_secs(2)) => None,
+        };
+        let Some(accepted) = accepted else {
+            let policy = state.runtime.dns_policy_config();
+            if local_block_page_bind_addr(&state.config, &policy).is_none() {
+                info!(
+                    interface = state.config.interface,
+                    "DNS block page HTTP listener stopped after policy change"
+                );
+                return Ok(());
+            }
+            continue;
+        };
+        let (stream, peer_addr) = accepted?;
+        let Ok(permit) = Arc::clone(&permits).try_acquire_owned() else {
+            warn!(%peer_addr, "DNS block page connection limit reached");
+            drop(stream);
+            continue;
+        };
+        let state = Arc::clone(&state);
+        tokio::spawn(async move {
+            let _permit = permit;
+            if let Err(error) = handle_block_page_connection(state, stream).await {
+                warn!(%peer_addr, ?error, "failed serving DNS block page request");
+            }
+        });
+    }
+}
+
+async fn handle_block_page_connection(
+    state: Arc<DnsGatewayState>,
+    mut stream: TcpStream,
+) -> anyhow::Result<()> {
+    let mut request = Vec::with_capacity(1_024);
+    let mut buffer = [0_u8; 1_024];
+    loop {
+        let bytes_read = timeout(BLOCK_PAGE_READ_TIMEOUT, stream.read(&mut buffer))
+            .await
+            .context("DNS block page request timed out")??;
+        if bytes_read == 0 {
+            break;
+        }
+        request.extend_from_slice(&buffer[..bytes_read]);
+        if request.len() > BLOCK_PAGE_MAX_HEADER_BYTES {
+            write_http_response(
+                &mut stream,
+                "431 Request Header Fields Too Large",
+                "text/plain; charset=utf-8",
+                b"Request headers are too large.",
+                false,
+            )
+            .await?;
+            return Ok(());
+        }
+        if request.windows(4).any(|window| window == b"\r\n\r\n") {
+            break;
+        }
+    }
+
+    let (method, host) = parse_block_page_request(&request)?;
+    if !matches!(method, "GET" | "HEAD") {
+        write_http_response(
+            &mut stream,
+            "405 Method Not Allowed",
+            "text/plain; charset=utf-8",
+            b"Method not allowed.",
+            false,
+        )
+        .await?;
+        return Ok(());
+    }
+
+    let policy = state.runtime.dns_policy_config();
+    if local_block_page_bind_addr(&state.config, &policy).is_none() {
+        write_http_response(
+            &mut stream,
+            "404 Not Found",
+            "text/plain; charset=utf-8",
+            b"Not found.",
+            method == "HEAD",
+        )
+        .await?;
+        return Ok(());
+    }
+
+    let html = render_block_page(&policy.block_page, &host);
+    write_http_response(
+        &mut stream,
+        "200 OK",
+        "text/html; charset=utf-8",
+        html.as_bytes(),
+        method == "HEAD",
+    )
+    .await?;
+    Ok(())
+}
+
+fn parse_block_page_request(request: &[u8]) -> anyhow::Result<(&str, String)> {
+    let request = std::str::from_utf8(request).context("block page request is not valid UTF-8")?;
+    let mut lines = request.split("\r\n");
+    let request_line = lines
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("missing HTTP request line"))?;
+    let mut request_parts = request_line.split_whitespace();
+    let method = request_parts
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("missing HTTP method"))?;
+    let _target = request_parts
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("missing HTTP request target"))?;
+    let version = request_parts
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("missing HTTP version"))?;
+    if !matches!(version, "HTTP/1.0" | "HTTP/1.1") {
+        return Err(anyhow::anyhow!("unsupported HTTP version"));
+    }
+
+    let host = lines
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("host").then_some(value.trim())
+        })
+        .unwrap_or("blocked domain")
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(255)
+        .collect();
+    Ok((method, host))
+}
+
+async fn write_http_response(
+    stream: &mut TcpStream,
+    status: &str,
+    content_type: &str,
+    body: &[u8],
+    head_only: bool,
+) -> io::Result<()> {
+    let headers = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nCache-Control: no-store, max-age=0\r\nContent-Security-Policy: default-src 'none'; img-src data:; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'\r\nX-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\nReferrer-Policy: no-referrer\r\nPermissions-Policy: camera=(), microphone=(), geolocation=()\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    stream.write_all(headers.as_bytes()).await?;
+    if !head_only {
+        stream.write_all(body).await?;
+    }
+    stream.shutdown().await
+}
+
+fn render_block_page(config: &DnsBlockPageConfig, requested_host: &str) -> String {
+    let organization = html_escape(&config.organization_name);
+    let title = html_escape(&config.title);
+    let message = html_escape(&config.message).replace('\n', "<br>");
+    let host = html_escape(requested_host);
+    let support_text = html_escape(&config.support_text);
+    let color = html_escape(&config.primary_color);
+    let logo = if config.logo_data_url.is_empty() {
+        built_in_axiom_logo()
+    } else {
+        format!(
+            "<img class=\"brand-logo\" src=\"{}\" alt=\"{} logo\">",
+            html_escape(&config.logo_data_url),
+            organization
+        )
+    };
+    let support = if support_text.is_empty() {
+        String::new()
+    } else if config.support_url.is_empty() {
+        format!("<p class=\"support\">{support_text}</p>")
+    } else {
+        format!(
+            "<p class=\"support\"><a href=\"{}\" rel=\"noopener noreferrer\">{support_text}</a></p>",
+            html_escape(&config.support_url)
+        )
+    };
+
+    format!(
+        "<!doctype html><html lang=\"en\" dir=\"auto\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>{title}</title><style>:root{{--accent:{color}}}*{{box-sizing:border-box}}body{{margin:0;min-height:100vh;display:grid;place-items:center;background:#09090b;color:#f4f4f5;font-family:Inter,Segoe UI,Arial,sans-serif;padding:24px}}main{{width:min(680px,100%);border:1px solid #27272a;border-radius:8px;background:#18181b;padding:40px;box-shadow:0 24px 80px rgba(0,0,0,.38)}}.brand{{display:flex;align-items:center;gap:14px;margin-bottom:34px}}.brand-logo{{display:block;width:auto;height:48px;max-width:210px;object-fit:contain}}.brand-name{{font-size:17px;font-weight:700}}.signal{{width:42px;height:4px;background:var(--accent);margin-bottom:22px}}h1{{font-size:clamp(28px,5vw,42px);line-height:1.12;margin:0}}.message{{font-size:17px;line-height:1.7;color:#d4d4d8;margin:20px 0 26px}}.domain{{direction:ltr;text-align:left;border:1px solid #3f3f46;border-radius:6px;background:#09090b;padding:13px 15px;color:var(--accent);font:600 14px ui-monospace,SFMono-Regular,Consolas,monospace;overflow-wrap:anywhere}}.support{{margin:24px 0 0;color:#a1a1aa;font-size:14px;line-height:1.6}}a{{color:var(--accent)}}footer{{margin-top:34px;padding-top:22px;border-top:1px solid #27272a;color:#71717a;font-size:12px}}svg{{display:block;width:48px;height:48px}}@media(max-width:540px){{main{{padding:28px 22px}}}}</style></head><body><main><div class=\"brand\">{logo}<div class=\"brand-name\">{organization}</div></div><div class=\"signal\"></div><h1>{title}</h1><p class=\"message\">{message}</p><div class=\"domain\">{host}</div>{support}<footer>Protected by Axiom DNS Security</footer></main></body></html>"
+    )
+}
+
+fn built_in_axiom_logo() -> String {
+    "<svg viewBox=\"0 0 48 48\" fill=\"none\" xmlns=\"http://www.w3.org/2000/svg\" role=\"img\" aria-label=\"Axiom\"><path d=\"M24 2.5 41.6 12.75v20.5L24 43.5 6.4 33.25v-20.5z\" fill=\"#0b2f32\" stroke=\"#34f5c5\" stroke-width=\"2\"/><path d=\"M16 33 24 14l8 19M19.2 26.5h9.6\" stroke=\"#34f5c5\" stroke-width=\"2.6\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/><circle cx=\"24\" cy=\"13.4\" r=\"2.5\" fill=\"#09090b\" stroke=\"#34f5c5\" stroke-width=\"2\"/><circle cx=\"15.6\" cy=\"33.4\" r=\"2.2\" fill=\"#09090b\" stroke=\"#34f5c5\" stroke-width=\"2\"/><circle cx=\"32.4\" cy=\"33.4\" r=\"2.2\" fill=\"#09090b\" stroke=\"#34f5c5\" stroke-width=\"2\"/></svg>".to_string()
+}
+
+fn html_escape(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        match character {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '\"' => escaped.push_str("&quot;"),
+            '\'' => escaped.push_str("&#39;"),
+            _ => escaped.push(character),
+        }
+    }
+    escaped
 }
 
 struct DnsGatewayState {
@@ -691,20 +962,33 @@ fn build_policy_block_response(
     request: &[u8],
     question: &DnsQuestion,
     policy: &axiom_config::DnsPolicyConfig,
+    config: &DnsConfig,
 ) -> Vec<u8> {
     match policy.block_response {
         DnsBlockResponse::Nxdomain => build_error_response(request, DNS_RCODE_NXDOMAIN)
             .unwrap_or_else(|| minimal_error_response(request, DNS_RCODE_NXDOMAIN)),
         DnsBlockResponse::Refused => build_error_response(request, DNS_RCODE_REFUSED)
             .unwrap_or_else(|| minimal_error_response(request, DNS_RCODE_REFUSED)),
-        DnsBlockResponse::Sinkhole => {
-            build_a_record_response(request, question, policy.sinkhole_ipv4, 60).unwrap_or_else(
-                || {
-                    build_error_response(request, DNS_RCODE_NXDOMAIN)
-                        .unwrap_or_else(|| minimal_error_response(request, DNS_RCODE_NXDOMAIN))
-                },
-            )
-        }
+        DnsBlockResponse::Sinkhole => effective_sinkhole_ipv4(config, policy)
+            .and_then(|address| build_a_record_response(request, question, address, 60))
+            .unwrap_or_else(|| {
+                build_error_response(request, DNS_RCODE_NXDOMAIN)
+                    .unwrap_or_else(|| minimal_error_response(request, DNS_RCODE_NXDOMAIN))
+            }),
+    }
+}
+
+fn effective_sinkhole_ipv4(
+    config: &DnsConfig,
+    policy: &axiom_config::DnsPolicyConfig,
+) -> Option<Ipv4Addr> {
+    if !policy.sinkhole_ipv4.is_unspecified() {
+        return Some(policy.sinkhole_ipv4);
+    }
+
+    match config.listen_ip {
+        Some(IpAddr::V4(address)) if !address.is_unspecified() => Some(address),
+        _ => None,
     }
 }
 
@@ -1115,6 +1399,77 @@ mod tests {
         assert_eq!(response_code(&response), DNS_RCODE_NOERROR);
         assert_eq!(read_u16(&response, 6), Some(1));
         assert_eq!(&response[response.len() - 4..], &[10, 10, 10, 10]);
+    }
+
+    #[test]
+    fn automatic_sinkhole_uses_each_dns_node_listen_address() {
+        let config = DnsConfig {
+            listen_ip: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 53, 12))),
+            ..DnsConfig::default()
+        };
+        let policy = DnsPolicyConfig {
+            block_response: DnsBlockResponse::Sinkhole,
+            sinkhole_ipv4: Ipv4Addr::UNSPECIFIED,
+            ..DnsPolicyConfig::default()
+        };
+
+        assert_eq!(
+            effective_sinkhole_ipv4(&config, &policy),
+            Some(Ipv4Addr::new(172, 16, 53, 12))
+        );
+        assert_eq!(
+            local_block_page_bind_addr(&config, &policy),
+            Some("172.16.53.12:80".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn explicit_external_sinkhole_does_not_bind_local_block_page() {
+        let config = DnsConfig {
+            listen_ip: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 53, 12))),
+            ..DnsConfig::default()
+        };
+        let policy = DnsPolicyConfig {
+            block_response: DnsBlockResponse::Sinkhole,
+            sinkhole_ipv4: Ipv4Addr::new(172, 16, 53, 100),
+            ..DnsPolicyConfig::default()
+        };
+
+        assert_eq!(
+            effective_sinkhole_ipv4(&config, &policy),
+            Some(Ipv4Addr::new(172, 16, 53, 100))
+        );
+        assert_eq!(local_block_page_bind_addr(&config, &policy), None);
+    }
+
+    #[test]
+    fn block_page_renders_hebrew_and_escapes_untrusted_values() {
+        let page = DnsBlockPageConfig {
+            title: "הגישה נחסמה".to_string(),
+            message: "פנו לצוות התמיכה".to_string(),
+            organization_name: "Axiom <Security>".to_string(),
+            ..DnsBlockPageConfig::default()
+        };
+
+        let html = render_block_page(&page, "bad.example<script>");
+
+        assert!(html.contains("הגישה נחסמה"));
+        assert!(html.contains("פנו לצוות התמיכה"));
+        assert!(html.contains("Axiom &lt;Security&gt;"));
+        assert!(html.contains("bad.example&lt;script&gt;"));
+        assert!(!html.contains("bad.example<script>"));
+        assert!(html.contains("Protected by Axiom DNS Security"));
+    }
+
+    #[test]
+    fn parses_http_host_for_block_page() {
+        let request =
+            b"GET /download HTTP/1.1\r\nHost: blocked.example\r\nConnection: close\r\n\r\n";
+
+        let (method, host) = parse_block_page_request(request).unwrap();
+
+        assert_eq!(method, "GET");
+        assert_eq!(host, "blocked.example");
     }
 
     #[test]

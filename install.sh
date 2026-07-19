@@ -1644,9 +1644,19 @@ write_config() {
         printf "\"%s\"" "$(toml_escape "${DNS_THREAT_FEED_URLS[${index}]}")"
       done
       printf "]\n"
-      echo "block_response = \"nxdomain\""
+      echo "block_response = \"sinkhole\""
       echo "sinkhole_ipv4 = \"0.0.0.0\""
       echo "local_records = []"
+      echo
+      echo "[dns.policy.block_page]"
+      echo "enabled = true"
+      echo "organization_name = \"Axiom Security\""
+      echo "title = \"Access to this site has been blocked\""
+      echo "message = \"This domain was blocked by your organization's DNS security policy.\""
+      echo "primary_color = \"#34f5c5\""
+      echo "support_text = \"Contact your IT or security team if you believe this is an error.\""
+      echo "support_url = \"\""
+      echo "logo_data_url = \"\""
       echo
     fi
     echo "[policy.smb]"

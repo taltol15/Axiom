@@ -132,6 +132,7 @@ Expected result:
 ```text
 UDP 53 listening on the DNS node IP
 TCP 53 listening on the DNS node IP
+TCP 80 listening after Branded block page policy is active
 TCP 9443 listening for encrypted management control pushes
 ```
 
@@ -152,6 +153,15 @@ Open `Clusters` in the Management UI and confirm:
 Rotating the join password does not rotate existing node credentials. Removing a
 replica from the Cluster Center revokes that node's control-plane credential;
 re-enrollment is required before it can report again.
+
+Read `CLUSTER_AND_HIGH_AVAILABILITY_KB.md` before publishing a production SMB
+VIP or multiple DNS addresses. It explains every Cluster Center option, load
+balancer requirements, session persistence, client IP visibility, anti-bypass
+firewall rules, failure behavior and acceptance testing.
+
+Read `DNS_BLOCK_PAGE_KB.md` before enabling the branded DNS response. Client
+networks must reach the DNS node or external block-page VIP on TCP 80, and HTTPS
+certificate behavior must be included in the customer rollout plan.
 
 ## Repair Existing Installation
 
