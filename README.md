@@ -5,6 +5,10 @@ deployments. It protects file-server traffic through inline SMB inspection,
 centralized reputation, policy enforcement, DNS filtering, and a dedicated
 management console.
 
+Engineers joining the project should start with `DEVELOPER_HANDOFF.md`. It
+documents both repositories, cross-repository contracts, runtime architecture,
+security invariants, release workflow and current limitations.
+
 ## Deployment Roles
 
 The recommended production deployment uses at least three Axiom servers:
