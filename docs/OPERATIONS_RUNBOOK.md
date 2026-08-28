@@ -27,6 +27,29 @@ TCP 53   - DNS node
 
 ## Management UI Troubleshooting
 
+If the UI loads but freezes, navigation is sluggish, or Settings cannot show the
+enrollment token / license activation file:
+
+1. Check whether reverse DNS is enabled unintentionally:
+
+```bash
+sudo grep -n client_reverse_dns /etc/axiom/axiom.toml
+```
+
+If `client_reverse_dns = true` and the server cannot resolve client PTR records
+quickly, disable it and restart:
+
+```bash
+sudo sed -i 's/client_reverse_dns = true/client_reverse_dns = false/' /etc/axiom/axiom.toml
+sudo systemctl restart axiom
+```
+
+2. Confirm the status API responds quickly from the management host:
+
+```bash
+curl -sk -H "Authorization: Bearer <session-or-token>" https://127.0.0.1:8443/api/status -o /dev/null -w '%{time_total}s\n'
+```
+
 If the UI does not load:
 
 ```bash

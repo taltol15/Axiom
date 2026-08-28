@@ -26,7 +26,7 @@ enabled = false
 
 [management.directory]
 enabled = false
-client_reverse_dns = true
+client_reverse_dns = false
 
 [license]
 enabled = true

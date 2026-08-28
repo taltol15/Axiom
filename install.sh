@@ -844,7 +844,7 @@ configure_directory_integration() {
   DIRECTORY_BASE_DN=""
   DIRECTORY_USER_FILTER="(sAMAccountName={username})"
   DIRECTORY_REQUIRED_GROUP_DN=""
-  DIRECTORY_CLIENT_REVERSE_DNS="true"
+  DIRECTORY_CLIENT_REVERSE_DNS="false"
 
   if ! prompt_yes_no "Enable Active Directory login for the Management UI" "no"; then
     return

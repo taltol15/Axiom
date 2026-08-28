@@ -64,6 +64,7 @@ struct WebState {
     fleet_nodes: Mutex<HashMap<String, FleetNodeStatus>>,
     client_identities: Mutex<HashMap<String, ClientIdentityCacheEntry>>,
     cluster_join_attempts: Mutex<HashMap<String, ClusterJoinThrottle>>,
+    admin_session_token: Mutex<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -102,12 +103,23 @@ pub async fn run_management_server(
     );
     let state = Arc::new(WebState {
         runtime,
-        config_path,
-        config: Mutex::new(config),
+        config_path: config_path.clone(),
+        config: Mutex::new(config.clone()),
         reputation,
         fleet_nodes: Mutex::new(HashMap::new()),
         client_identities: Mutex::new(HashMap::new()),
         cluster_join_attempts: Mutex::new(HashMap::new()),
+        admin_session_token: Mutex::new(session_token(&config.management.admin)),
+    });
+
+    let identity_refresh_state = Arc::clone(&state);
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            refresh_client_identity_cache(identity_refresh_state.clone()).await;
+        }
     });
 
     let app = Router::new()
@@ -239,7 +251,7 @@ async fn add_security_headers(request: Request<Body>, next: Next) -> Response {
     headers.insert(
         header::CONTENT_SECURITY_POLICY,
         HeaderValue::from_static(
-            "default-src 'self'; script-src 'self' https://cdn.tailwindcss.com 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'",
+            "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'",
         ),
     );
     response
@@ -284,7 +296,20 @@ async fn api_status(headers: HeaderMap, State(state): State<Arc<WebState>>) -> R
             .into_response();
     }
 
-    Json(build_status_response(&state)).into_response()
+    let state = Arc::clone(&state);
+    match tokio::task::spawn_blocking(move || build_status_response(&state)).await {
+        Ok(response) => Json(response).into_response(),
+        Err(error) => {
+            warn!(?error, "status response task failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    message: "failed building status response",
+                }),
+            )
+                .into_response()
+        }
+    }
 }
 
 async fn api_diagnostics(headers: HeaderMap, State(state): State<Arc<WebState>>) -> Response {
@@ -1741,10 +1766,15 @@ async fn api_enrollment_token(headers: HeaderMap, State(state): State<Arc<WebSta
     }
 
     let config = state.config.lock().expect("web config mutex poisoned");
+    let token = config.node.enrollment_token.clone();
+    let token_preview = token_preview(config.node.enrollment_token.as_deref());
+    let management_url = current_management_url(&config);
+    drop(config);
+
     Json(EnrollmentTokenResponse {
-        token: config.node.enrollment_token.clone(),
-        token_preview: token_preview(config.node.enrollment_token.as_deref()),
-        management_url: current_management_url(&config),
+        token,
+        token_preview,
+        management_url,
         reporting_nodes: state
             .fleet_nodes
             .lock()
@@ -2136,10 +2166,20 @@ async fn api_logout(State(state): State<Arc<WebState>>) -> Response {
 }
 
 fn build_status_response(state: &WebState) -> StatusResponse {
-    let config = state.config.lock().expect("web config mutex poisoned");
+    let config = {
+        let guard = state.config.lock().expect("web config mutex poisoned");
+        guard.clone()
+    };
+    let fleet_nodes_raw = fleet_node_snapshots(state);
     let stats = state.runtime.snapshot();
+    let fleet_nodes = fleet_nodes_raw
+        .into_iter()
+        .map(|mut node| {
+            node.stats = trim_node_stats_for_status(&node.stats);
+            node
+        })
+        .collect::<Vec<_>>();
     let deployment_warnings = build_deployment_warnings(&config, &stats);
-    let fleet_nodes = fleet_node_snapshots(state);
     let clusters = cluster_summaries(state);
     let client_identities =
         resolve_client_identities(state, &config.management.directory, &stats, &fleet_nodes);
@@ -2170,7 +2210,10 @@ fn build_status_response(state: &WebState) -> StatusResponse {
 }
 
 fn build_license_status(state: &WebState) -> LicenseStatus {
-    let config = state.config.lock().expect("web config mutex poisoned");
+    let config = {
+        let guard = state.config.lock().expect("web config mutex poisoned");
+        guard.clone()
+    };
     let fleet_nodes = fleet_node_snapshots(state);
     let client_identities = state
         .client_identities
@@ -2244,7 +2287,10 @@ fn build_license_usage(
 }
 
 fn build_diagnostics_response(state: &WebState) -> DiagnosticsResponse {
-    let config = state.config.lock().expect("web config mutex poisoned");
+    let config = {
+        let guard = state.config.lock().expect("web config mutex poisoned");
+        guard.clone()
+    };
     let status = state.runtime.snapshot();
     let deployment_warnings = build_deployment_warnings(&config, &status);
     let fleet_nodes = fleet_node_snapshots(state);
@@ -2559,10 +2605,11 @@ fn build_backup_bundle(state: &WebState) -> AxiomBackupBundle {
 }
 
 fn is_authorized(headers: &HeaderMap, state: &WebState) -> bool {
-    let expected_token = {
-        let config = state.config.lock().expect("web config mutex poisoned");
-        session_token(&config.management.admin)
-    };
+    let expected_token = state
+        .admin_session_token
+        .lock()
+        .expect("admin session token mutex poisoned")
+        .clone();
 
     if let Some(header_value) = headers.get(header::AUTHORIZATION)
         && let Ok(value) = header_value.to_str()
@@ -2603,28 +2650,40 @@ fn bearer_token(headers: &HeaderMap) -> Option<&str> {
 
 fn node_authorization(headers: &HeaderMap, state: &WebState) -> Option<NodeAuthorization> {
     let supplied_token = bearer_token(headers)?;
-    let config = state.config.lock().expect("web config mutex poisoned");
+    let (legacy_token, cluster_members) = {
+        let config = state.config.lock().expect("web config mutex poisoned");
+        let legacy_token = config.node.enrollment_token.clone();
+        let cluster_members: Vec<_> = config
+            .clusters
+            .groups
+            .iter()
+            .flat_map(|group| {
+                group.members.iter().map(|member| {
+                    (
+                        group.name.clone(),
+                        group.role,
+                        member.node_id.clone(),
+                        member.token.clone(),
+                    )
+                })
+            })
+            .collect();
+        (legacy_token, cluster_members)
+    };
 
-    if config
-        .node
-        .enrollment_token
-        .as_deref()
-        .is_some_and(|token| {
-            !token.is_empty() && constant_time_eq(supplied_token.as_bytes(), token.as_bytes())
-        })
-    {
+    if legacy_token.as_deref().is_some_and(|token| {
+        !token.is_empty() && constant_time_eq(supplied_token.as_bytes(), token.as_bytes())
+    }) {
         return Some(NodeAuthorization::Legacy);
     }
 
-    config.clusters.groups.iter().find_map(|group| {
-        group.members.iter().find_map(|member| {
-            constant_time_eq(supplied_token.as_bytes(), member.token.as_bytes()).then(|| {
-                NodeAuthorization::Cluster {
-                    name: group.name.clone(),
-                    role: group.role,
-                    node_id: member.node_id.clone(),
-                }
-            })
+    cluster_members.into_iter().find_map(|(name, role, node_id, token)| {
+        constant_time_eq(supplied_token.as_bytes(), token.as_bytes()).then(|| {
+            NodeAuthorization::Cluster {
+                name,
+                role,
+                node_id,
+            }
         })
     })
 }
@@ -3143,6 +3202,61 @@ fn run_diagnostic_command(command: &str, args: &[&str]) -> CommandOutput {
     }
 }
 
+fn trim_node_stats_for_status(stats: &serde_json::Value) -> serde_json::Value {
+    let Some(object) = stats.as_object() else {
+        return serde_json::Value::Object(serde_json::Map::new());
+    };
+
+    let mut trimmed = serde_json::Map::new();
+    for (key, value) in object {
+        let keep = value.is_number()
+            || value.is_string()
+            || value.is_boolean()
+            || matches!(
+                key.as_str(),
+                "policy_runtime" | "dns_policy_runtime" | "route_stats"
+            );
+        if keep {
+            trimmed.insert(key.clone(), value.clone());
+        }
+    }
+    serde_json::Value::Object(trimmed)
+}
+
+fn collect_status_client_ips(
+    stats: &StatusSnapshot,
+    fleet_nodes: &[FleetNodeStatus],
+) -> HashSet<String> {
+    let mut ips = HashSet::new();
+    if let Ok(value) = serde_json::to_value(stats) {
+        collect_client_ips_from_json(&value, &mut ips);
+    }
+    for node in fleet_nodes {
+        collect_client_ips_from_json(&node.stats, &mut ips);
+    }
+    ips
+}
+
+fn cached_client_identities(
+    state: &WebState,
+    ips: &HashSet<String>,
+) -> HashMap<String, String> {
+    let now = unix_timestamp_seconds();
+    let mut cache = state
+        .client_identities
+        .lock()
+        .expect("client identity cache mutex poisoned");
+    cache.retain(|_, entry| entry.expires_unix_timestamp_seconds > now);
+
+    ips.iter()
+        .filter_map(|ip| {
+            cache
+                .get(ip)
+                .map(|entry| (ip.clone(), entry.hostname.clone()))
+        })
+        .collect()
+}
+
 fn resolve_client_identities(
     state: &WebState,
     directory: &DirectoryConfig,
@@ -3153,41 +3267,62 @@ fn resolve_client_identities(
         return HashMap::new();
     }
 
-    let mut ips = HashSet::new();
-    if let Ok(value) = serde_json::to_value(stats) {
-        collect_client_ips_from_json(&value, &mut ips);
-    }
-    for node in fleet_nodes {
-        collect_client_ips_from_json(&node.stats, &mut ips);
-    }
+    let ips = collect_status_client_ips(stats, fleet_nodes);
+    cached_client_identities(state, &ips)
+}
 
-    let now = unix_timestamp_seconds();
-    let mut cache = state
-        .client_identities
+async fn refresh_client_identity_cache(state: Arc<WebState>) {
+    let directory = state
+        .config
         .lock()
-        .expect("client identity cache mutex poisoned");
-    cache.retain(|_, entry| entry.expires_unix_timestamp_seconds > now);
-
-    for ip in ips.iter().take(96) {
-        if cache.contains_key(ip) {
-            continue;
-        }
-
-        if let Some(hostname) = reverse_lookup_hostname(ip) {
-            cache.insert(
-                ip.clone(),
-                ClientIdentityCacheEntry {
-                    hostname,
-                    expires_unix_timestamp_seconds: now + 3600,
-                },
-            );
-        }
+        .expect("web config mutex poisoned")
+        .management
+        .directory
+        .clone();
+    if !directory.client_reverse_dns {
+        return;
     }
 
-    cache
-        .iter()
-        .map(|(ip, entry)| (ip.clone(), entry.hostname.clone()))
-        .collect()
+    let stats = state.runtime.snapshot();
+    let fleet_nodes = fleet_node_snapshots(&state);
+    let ips = collect_status_client_ips(&stats, &fleet_nodes);
+    let missing_ips: Vec<String> = {
+        let now = unix_timestamp_seconds();
+        let cache = state
+            .client_identities
+            .lock()
+            .expect("client identity cache mutex poisoned");
+        ips.into_iter()
+            .filter(|ip| {
+                cache
+                    .get(ip)
+                    .is_none_or(|entry| entry.expires_unix_timestamp_seconds <= now)
+            })
+            .take(12)
+            .collect()
+    };
+
+    for ip in missing_ips {
+        let lookup_ip = ip.clone();
+        let resolved = tokio::task::spawn_blocking(move || reverse_lookup_hostname(&lookup_ip))
+            .await
+            .ok()
+            .flatten();
+        if let Some(hostname) = resolved {
+            let now = unix_timestamp_seconds();
+            state
+                .client_identities
+                .lock()
+                .expect("client identity cache mutex poisoned")
+                .insert(
+                    ip,
+                    ClientIdentityCacheEntry {
+                        hostname,
+                        expires_unix_timestamp_seconds: now + 3600,
+                    },
+                );
+        }
+    }
 }
 
 fn collect_client_ips_from_json(value: &serde_json::Value, ips: &mut HashSet<String>) {
@@ -4428,7 +4563,6 @@ const LOGIN_HTML: &str = r##"<!doctype html>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Axiom Management Login</title>
-  <script src="https://cdn.tailwindcss.com"></script>
   <style>
     * { box-sizing: border-box; }
     body {
@@ -4631,7 +4765,6 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Axiom Dashboard</title>
-  <script src="https://cdn.tailwindcss.com"></script>
   <style>
     :root {
       --page: #eef5f8;
@@ -6463,6 +6596,8 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
     let lastClusters = [];
     let reputationEntries = [];
     let latestLicenseStatus = null;
+    let refreshInFlight = false;
+    let activeDashboardView = localStorage.getItem("axiomDashboardView") || "overview";
     let latestDiagnosticsBundle = null;
     let latestSmokeTest = null;
     let latestAuditEvents = [];
@@ -6702,6 +6837,7 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
       if (name === "readiness") name = "support";
       const knownViews = new Set(["overview", "nodes", "clusters", "smb", "dns", "security", "audit", "support", "settings"]);
       if (!knownViews.has(name)) name = "overview";
+      activeDashboardView = name;
       document.querySelectorAll(".dashboard-view").forEach((section) => {
         section.classList.toggle("active", section.id === `view-${name}`);
       });
@@ -6709,6 +6845,9 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
         button.classList.toggle("active", button.dataset.view === name);
       });
       localStorage.setItem("axiomDashboardView", name);
+      if (name === "audit") {
+        renderAuditLog();
+      }
     }
 
     function actionBadgeClass(action) {
@@ -7861,9 +8000,22 @@ DNS node -> upstream resolvers: UDP/TCP 53`;
     }
 
     async function refresh() {
-      const response = await fetch("/api/status", {
-        headers: authHeaders()
-      });
+      if (refreshInFlight || document.hidden) {
+        return;
+      }
+      refreshInFlight = true;
+      try {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 20000);
+      let response;
+      try {
+        response = await fetch("/api/status", {
+          headers: authHeaders(),
+          signal: controller.signal
+        });
+      } finally {
+        clearTimeout(timer);
+      }
 
       if (response.status === 401) {
         localStorage.removeItem("axiomToken");
@@ -8142,7 +8294,17 @@ DNS node -> upstream resolvers: UDP/TCP 53`;
         smb: Number(stats.audit_events || 0),
         dns: Number(stats.dns_queries || 0)
       };
-      renderAuditLog();
+      if (activeDashboardView === "audit") {
+        renderAuditLog();
+      }
+      } catch (error) {
+        if (error.name === "AbortError") {
+          document.getElementById("refresh-state").textContent =
+            `Status refresh timed out · ${new Date().toLocaleTimeString()}`;
+        }
+      } finally {
+        refreshInFlight = false;
+      }
     }
 
     function fillModeSelect(id, value) {
@@ -8611,23 +8773,40 @@ DNS node -> upstream resolvers: UDP/TCP 53`;
       }
     }
 
-    async function loadEnrollmentToken() {
-      const response = await fetch("/api/enrollment-token", { headers: authHeaders() });
-      const payload = await response.json().catch(() => ({ message: "token load failed" }));
-      if (!response.ok) {
-        document.getElementById("enrollment-token-state").textContent = payload.message || "Token load failed";
-        return;
+    async function fetchJsonWithTimeout(url, options = {}, timeoutMs = 15000) {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), timeoutMs);
+      try {
+        const response = await fetch(url, { ...options, signal: controller.signal });
+        const payload = await response.json().catch(() => ({}));
+        return { response, payload };
+      } finally {
+        clearTimeout(timer);
       }
+    }
 
-      document.getElementById("enrollment-token-value").value = payload.token || "";
-      document.getElementById("enrollment-token-preview").textContent = payload.token_preview || "not configured";
-      document.getElementById("enrollment-token-state").textContent =
-        `${payload.reporting_nodes || 0} reporting nodes · management ${payload.management_url}`;
-      enrollmentContext = {
-        token: payload.token || "",
-        managementUrl: payload.management_url || ""
-      };
-      renderOnboardingCommands();
+    async function loadEnrollmentToken() {
+      document.getElementById("enrollment-token-state").textContent = "Loading enrollment token";
+      try {
+        const { response, payload } = await fetchJsonWithTimeout("/api/enrollment-token", { headers: authHeaders() });
+        if (!response.ok) {
+          document.getElementById("enrollment-token-state").textContent = payload.message || "Token load failed";
+          return;
+        }
+
+        document.getElementById("enrollment-token-value").value = payload.token || "";
+        document.getElementById("enrollment-token-preview").textContent = payload.token_preview || "not configured";
+        document.getElementById("enrollment-token-state").textContent =
+          `${payload.reporting_nodes || 0} reporting nodes · management ${payload.management_url}`;
+        enrollmentContext = {
+          token: payload.token || "",
+          managementUrl: payload.management_url || ""
+        };
+        renderOnboardingCommands();
+      } catch (error) {
+        document.getElementById("enrollment-token-state").textContent =
+          error.name === "AbortError" ? "Token load timed out — check management server API health" : "Token load failed";
+      }
     }
 
     async function copyEnrollmentToken() {
@@ -9288,12 +9467,12 @@ DNS node -> upstream resolvers: UDP/TCP 53`;
 
     setActiveView(localStorage.getItem("axiomDashboardView") || "overview");
     loadLocalSettings();
-    refresh();
+    loadEnrollmentToken();
     loadPolicies();
     loadDnsPolicy();
     loadReputationCenter();
-    loadEnrollmentToken();
-    setInterval(refresh, 2000);
+    setTimeout(refresh, 250);
+    setInterval(refresh, 5000);
   </script>
 </body>
 </html>

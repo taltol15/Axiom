@@ -1530,7 +1530,7 @@ fn default_directory_user_filter() -> String {
 }
 
 fn default_directory_client_reverse_dns() -> bool {
-    true
+    false
 }
 
 fn default_signatures() -> Vec<SignaturePolicyConfig> {
