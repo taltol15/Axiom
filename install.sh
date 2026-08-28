@@ -1835,6 +1835,45 @@ EOF
   rm -f "${temp_helper}" "${temp_sudoers}"
 }
 
+binary_contains_ui_branding() {
+  local binary_path="$1"
+
+  if ! command -v strings >/dev/null 2>&1; then
+    echo "WARNING: strings(1) unavailable; skipping embedded UI branding scan." >&2
+    return 0
+  fi
+
+  local strings_cmd=(strings)
+  if strings -a "${binary_path}" >/dev/null 2>&1; then
+    strings_cmd=(strings -a)
+  fi
+
+  if "${strings_cmd[@]}" "${binary_path}" 2>/dev/null | grep -a -F -q "trustity-axiom-logo"; then
+    return 0
+  fi
+
+  if "${strings_cmd[@]}" "${binary_path}" 2>/dev/null | grep -a -F -q "Trustity Axiom"; then
+    return 0
+  fi
+
+  return 1
+}
+
+binary_contains_legacy_ui_branding() {
+  local binary_path="$1"
+
+  if ! command -v strings >/dev/null 2>&1; then
+    return 1
+  fi
+
+  local strings_cmd=(strings)
+  if strings -a "${binary_path}" >/dev/null 2>&1; then
+    strings_cmd=(strings -a)
+  fi
+
+  "${strings_cmd[@]}" "${binary_path}" 2>/dev/null | grep -a -F -q "Built for authorized enterprise security operations"
+}
+
 verify_installed_binary() {
   local binary_path="$1"
   local installed_version=""
@@ -1857,13 +1896,14 @@ verify_installed_binary() {
     fi
   fi
 
-  if ! strings "${binary_path}" | grep -q "Trustity Axiom - Management Console"; then
-    echo "ERROR: ${binary_path} is missing the Trustity Axiom management UI branding." >&2
+  if binary_contains_legacy_ui_branding "${binary_path}"; then
+    echo "ERROR: ${binary_path} still contains legacy management UI branding." >&2
     exit 1
   fi
 
-  if strings "${binary_path}" | grep -q "Built for authorized enterprise security operations"; then
-    echo "ERROR: ${binary_path} still contains legacy management UI branding." >&2
+  if ! binary_contains_ui_branding "${binary_path}"; then
+    echo "ERROR: ${binary_path} is missing the Trustity Axiom management UI branding." >&2
+    echo "  Hint: strings -a ${binary_path} | grep -F trustity-axiom-logo" >&2
     exit 1
   fi
 
@@ -1932,6 +1972,7 @@ build_release_binary_from_source() {
     fi
   )
 
+  verify_installed_binary "${BINARY_SOURCE}"
   ${SUDO} install -m 0755 -o root -g root "${BINARY_SOURCE}" "${BINARY_PATH}"
 }
 
