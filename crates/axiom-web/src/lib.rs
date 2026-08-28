@@ -4,7 +4,7 @@ use std::{
     net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
     process::Command,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -49,6 +49,28 @@ use tracing::{info, warn};
 
 const SESSION_COOKIE_NAME: &str = "axiom_session";
 const SESSION_MAX_AGE_SECONDS: u64 = 8 * 60 * 60;
+
+static LOGIN_HTML: OnceLock<String> = OnceLock::new();
+static DASHBOARD_HTML: OnceLock<String> = OnceLock::new();
+
+fn embedded_ui_html(template: &'static str) -> String {
+    template.replace(
+        "/*__EMBEDDED_TAILWIND_CSS__*/",
+        include_str!("../assets/embedded-tailwind.css"),
+    )
+}
+
+fn login_html() -> String {
+    LOGIN_HTML
+        .get_or_init(|| embedded_ui_html(LOGIN_HTML_TEMPLATE))
+        .clone()
+}
+
+fn dashboard_html() -> String {
+    DASHBOARD_HTML
+        .get_or_init(|| embedded_ui_html(DASHBOARD_HTML_TEMPLATE))
+        .clone()
+}
 const DEFAULT_MANAGEMENT_TLS_CERT_PATH: &str = "/etc/axiom/tls/axiom.crt";
 const DEFAULT_MANAGEMENT_TLS_KEY_PATH: &str = "/etc/axiom/tls/axiom.key";
 const AXIOM_RESTART_HELPER_PATH: &str = "/usr/local/sbin/axiom-restart-service";
@@ -262,7 +284,7 @@ async fn login_page(headers: HeaderMap, State(state): State<Arc<WebState>>) -> R
         return Redirect::temporary("/dashboard").into_response();
     }
 
-    html_no_cache(LOGIN_HTML)
+    html_no_cache(login_html())
 }
 
 async fn dashboard_page(headers: HeaderMap, State(state): State<Arc<WebState>>) -> Response {
@@ -270,10 +292,10 @@ async fn dashboard_page(headers: HeaderMap, State(state): State<Arc<WebState>>) 
         return Redirect::temporary("/login").into_response();
     }
 
-    html_no_cache(DASHBOARD_HTML)
+    html_no_cache(dashboard_html())
 }
 
-fn html_no_cache(html: &'static str) -> Response {
+fn html_no_cache(html: String) -> Response {
     let mut response = Html(html).into_response();
     let headers = response.headers_mut();
     headers.insert(
@@ -4527,12 +4549,12 @@ mod tests {
             "dns-block-page-preview",
         ] {
             assert!(
-                DASHBOARD_HTML.contains(&format!("id=\"{required_id}\"")),
+                DASHBOARD_HTML_TEMPLATE.contains(&format!("id=\"{required_id}\"")),
                 "dashboard is missing {required_id}"
             );
         }
-        assert!(DASHBOARD_HTML.contains("HTTPS certificate validation"));
-        assert!(DASHBOARD_HTML.contains("Reset Axiom defaults"));
+        assert!(DASHBOARD_HTML_TEMPLATE.contains("HTTPS certificate validation"));
+        assert!(DASHBOARD_HTML_TEMPLATE.contains("Reset Axiom defaults"));
     }
 
     #[tokio::test]
@@ -4557,13 +4579,14 @@ mod tests {
     }
 }
 
-const LOGIN_HTML: &str = r##"<!doctype html>
+const LOGIN_HTML_TEMPLATE: &str = r##"<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Axiom Management Login</title>
   <style>
+    /*__EMBEDDED_TAILWIND_CSS__*/
     * { box-sizing: border-box; }
     body {
       margin: 0;
@@ -4633,6 +4656,26 @@ const LOGIN_HTML: &str = r##"<!doctype html>
       line-height: 1;
     }
     .axiom-wordmark span { color: #34f5c5; display: inline; }
+    .axiom-brand-stack {
+      display: flex;
+      flex-direction: column;
+      gap: 0.35rem;
+    }
+    .trustity-byline {
+      align-items: center;
+      color: #d8b4fe;
+      display: inline-flex;
+      font-size: 0.68rem;
+      font-weight: 700;
+      gap: 0.45rem;
+      letter-spacing: 0.24em;
+      text-transform: uppercase;
+    }
+    .trustity-mark {
+      flex: 0 0 auto;
+      height: 1rem;
+      width: 1rem;
+    }
     .max-w-3xl { max-width: 48rem; }
     .max-w-md { max-width: 28rem; }
     .w-full { width: 100%; }
@@ -4687,7 +4730,16 @@ const LOGIN_HTML: &str = r##"<!doctype html>
             <circle cx="15.6" cy="33.4" r="2.2" fill="#05070d" stroke="url(#axiom-login-grad)" stroke-width="2" />
             <circle cx="32.4" cy="33.4" r="2.2" fill="#05070d" stroke="url(#axiom-login-grad)" stroke-width="2" />
           </svg>
-          <span class="axiom-wordmark">AXIOM<span>.</span></span>
+          <div class="axiom-brand-stack">
+            <span class="axiom-wordmark">AXIOM<span>.</span></span>
+            <div class="trustity-byline" aria-label="A Trustity product">
+              <svg class="trustity-mark" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+                <path d="M12 2 4 6v6c0 5.25 3.4 10.15 8 12 4.6-1.85 8-6.75 8-12V6l-8-4Z" fill="#b875e8"/>
+                <path d="M12 7.2 8.5 9v3.4c0 3.1 1.9 6 3.5 7.1 1.6-1.1 3.5-4 3.5-7.1V9L12 7.2Z" fill="#0b0e14"/>
+              </svg>
+              <span>Trustity</span>
+            </div>
+          </div>
         </h1>
         <p class="mt-6 max-w-2xl text-lg leading-8 text-zinc-300">Real-time SMB reverse proxy visibility for segmented enterprise file-server networks.</p>
       </div>
@@ -4759,13 +4811,14 @@ const LOGIN_HTML: &str = r##"<!doctype html>
 </html>
 "##;
 
-const DASHBOARD_HTML: &str = r##"<!doctype html>
+const DASHBOARD_HTML_TEMPLATE: &str = r##"<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Axiom Dashboard</title>
   <style>
+    /*__EMBEDDED_TAILWIND_CSS__*/
     :root {
       --page: #eef5f8;
       --page-soft: #f8fafc;
@@ -5123,6 +5176,29 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
       margin-top: 0.35rem;
     }
 
+    .axiom-brand-stack {
+      display: flex;
+      flex-direction: column;
+      gap: 0.2rem;
+    }
+
+    .trustity-byline {
+      align-items: center;
+      color: #d8b4fe;
+      display: inline-flex;
+      font-size: 0.68rem;
+      font-weight: 700;
+      gap: 0.45rem;
+      letter-spacing: 0.24em;
+      text-transform: uppercase;
+    }
+
+    .trustity-mark {
+      flex: 0 0 auto;
+      height: 0.95rem;
+      width: 0.95rem;
+    }
+
     .toast-stack {
       bottom: 1.25rem;
       display: grid;
@@ -5294,7 +5370,16 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
             <circle cx="15.6" cy="33.4" r="2.2" fill="#05070d" stroke="url(#axiom-dashboard-grad)" stroke-width="2" />
             <circle cx="32.4" cy="33.4" r="2.2" fill="#05070d" stroke="url(#axiom-dashboard-grad)" stroke-width="2" />
           </svg>
-          <span class="axiom-wordmark">AXIOM<span>.</span></span>
+          <div class="axiom-brand-stack">
+            <span class="axiom-wordmark">AXIOM<span>.</span></span>
+            <div class="trustity-byline" aria-label="A Trustity product">
+              <svg class="trustity-mark" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+                <path d="M12 2 4 6v6c0 5.25 3.4 10.15 8 12 4.6-1.85 8-6.75 8-12V6l-8-4Z" fill="#b875e8"/>
+                <path d="M12 7.2 8.5 9v3.4c0 3.1 1.9 6 3.5 7.1 1.6-1.1 3.5-4 3.5-7.1V9L12 7.2Z" fill="#0b0e14"/>
+              </svg>
+              <span>Trustity</span>
+            </div>
+          </div>
         </div>
         <p class="axiom-console-label">Management Console</p>
       </div>

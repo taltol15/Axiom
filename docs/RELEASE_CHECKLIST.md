@@ -4,6 +4,7 @@ Use this checklist before shipping a customer build.
 
 ## Build Integrity
 
+- `./scripts/build-dashboard-css.sh`
 - `cargo fmt --all --check`
 - `cargo test --workspace`
 - `cargo build --release -p axiom-daemon`
