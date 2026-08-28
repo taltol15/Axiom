@@ -3,7 +3,7 @@ set -Eeuo pipefail
 
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DIST_DIR="${PROJECT_ROOT}/dist"
-VERSION="${1:-1.1.4}"
+VERSION="${1:-1.1.5}"
 INSTALLER_NAME="axiom-installer-${VERSION}.sh"
 PREBUILT_DIR="${PROJECT_ROOT}/packaging/prebuilt"
 LINUX_TARGET="${AXIOM_LINUX_TARGET:-x86_64-unknown-linux-gnu}"

@@ -1896,6 +1896,24 @@ prebuilt_binary_runs_on_host() {
   [[ -n "${version}" ]]
 }
 
+ensure_embedded_ui_assets() {
+  local css="${PROJECT_ROOT}/crates/axiom-web/assets/embedded-tailwind.css"
+  local logo="${PROJECT_ROOT}/crates/axiom-web/assets/trustity-axiom-logo.base64"
+
+  if [[ -s "${css}" && -s "${logo}" ]]; then
+    echo "Embedded UI assets found in package; skipping Tailwind rebuild on target server."
+    return 0
+  fi
+
+  if [[ -x "${PROJECT_ROOT}/scripts/build-dashboard-css.sh" ]]; then
+    "${PROJECT_ROOT}/scripts/build-dashboard-css.sh"
+    return
+  fi
+
+  echo "ERROR: Embedded UI assets are missing from the installer package." >&2
+  exit 1
+}
+
 build_release_binary_from_source() {
   echo "Building Axiom release binary from source..."
   local axiom_rustflags="-C linker=cc -C link-self-contained=no -C link-arg=-fuse-ld=bfd"
@@ -1903,9 +1921,7 @@ build_release_binary_from_source() {
     axiom_rustflags="${RUSTFLAGS} ${axiom_rustflags}"
   fi
 
-  if [[ -x "${PROJECT_ROOT}/scripts/build-dashboard-css.sh" ]]; then
-    "${PROJECT_ROOT}/scripts/build-dashboard-css.sh"
-  fi
+  ensure_embedded_ui_assets
 
   echo "Using system linker for release build: cc with ld.bfd"
   (
