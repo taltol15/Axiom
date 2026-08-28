@@ -1,0 +1,10 @@
+Axiom 1.1.2 customer installer
+
+File: axiom-installer-1.1.2.sh
+SHA256: 588f456ef2bc23b28a961330995c79b3e588436dee54b51ef8203a62e2844252
+
+Install:
+  chmod +x axiom-installer-1.1.2.sh
+  sudo ./axiom-installer-1.1.2.sh
+
+Git tag: v1.1.2

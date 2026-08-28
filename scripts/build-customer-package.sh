@@ -3,7 +3,7 @@ set -Eeuo pipefail
 
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DIST_DIR="${PROJECT_ROOT}/dist"
-VERSION="${1:-1.1.0}"
+VERSION="${1:-1.1.2}"
 INSTALLER_NAME="axiom-installer-${VERSION}.sh"
 
 "${PROJECT_ROOT}/scripts/build-dashboard-css.sh"

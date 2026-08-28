@@ -60,6 +60,10 @@ fn embedded_ui_html(template: &'static str) -> String {
             include_str!("../assets/embedded-tailwind.css"),
         )
         .replace("/*__AXIOM_VERSION__*/", env!("CARGO_PKG_VERSION"))
+        .replace(
+            "/*__TRUSTITY_AXIOM_LOGO__*/",
+            include_str!("../assets/trustity-axiom-logo.base64").trim(),
+        )
 }
 
 fn login_html() -> String {
@@ -4648,39 +4652,17 @@ const LOGIN_HTML_TEMPLATE: &str = r##"<!doctype html>
     .axiom-brand {
       align-items: center;
       display: inline-flex;
-      gap: 0.75rem;
     }
-    .axiom-brand svg {
-      flex: 0 0 auto;
-      height: 3rem;
-      width: 3rem;
+    .trustity-axiom-logo {
+      display: block;
+      height: auto;
+      max-height: 3rem;
+      max-width: min(100%, 22rem);
+      width: auto;
     }
-    .axiom-wordmark {
-      color: #fff;
-      font-size: clamp(2.6rem, 7vw, 4.75rem);
-      font-weight: 800;
-      line-height: 1;
-    }
-    .axiom-wordmark span { color: #34f5c5; display: inline; }
-    .axiom-brand-stack {
-      display: flex;
-      flex-direction: column;
-      gap: 0.35rem;
-    }
-    .trustity-byline {
-      align-items: center;
-      color: #d8b4fe;
-      display: inline-flex;
-      font-size: 0.68rem;
-      font-weight: 700;
-      gap: 0.45rem;
-      letter-spacing: 0.24em;
-      text-transform: uppercase;
-    }
-    .trustity-mark {
-      flex: 0 0 auto;
-      height: 1rem;
-      width: 1rem;
+    .axiom-brand-login .trustity-axiom-logo {
+      max-height: 4.75rem;
+      max-width: min(100%, 30rem);
     }
     .max-w-3xl { max-width: 48rem; }
     .max-w-md { max-width: 28rem; }
@@ -4716,37 +4698,9 @@ const LOGIN_HTML_TEMPLATE: &str = r##"<!doctype html>
           <span class="h-2 w-2 rounded-full bg-emerald-300"></span>
           Inline SMB protection
         </div>
-        <h1 class="axiom-brand" aria-label="Axiom">
-          <svg viewBox="0 0 48 48" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Axiom logomark">
-            <defs>
-              <linearGradient id="axiom-login-grad" x1="6" y1="4" x2="42" y2="44" gradientUnits="userSpaceOnUse">
-                <stop stop-color="#34F5C5" />
-                <stop offset="0.5" stop-color="#2FE3FF" />
-                <stop offset="1" stop-color="#5B8CFF" />
-              </linearGradient>
-              <linearGradient id="axiom-login-grad-soft" x1="6" y1="4" x2="42" y2="44" gradientUnits="userSpaceOnUse">
-                <stop stop-color="#2FE3FF" stop-opacity="0.25" />
-                <stop offset="1" stop-color="#5B8CFF" stop-opacity="0.05" />
-              </linearGradient>
-            </defs>
-            <path d="M24 2.5 41.6 12.75v20.5L24 43.5 6.4 33.25v-20.5z" fill="url(#axiom-login-grad-soft)" stroke="url(#axiom-login-grad)" stroke-width="2" stroke-linejoin="round" />
-            <path d="M16 33 24 14l8 19" stroke="url(#axiom-login-grad)" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round" />
-            <path d="M19.2 26.5h9.6" stroke="url(#axiom-login-grad)" stroke-width="2.6" stroke-linecap="round" />
-            <circle cx="24" cy="13.4" r="2.5" fill="#05070d" stroke="url(#axiom-login-grad)" stroke-width="2" />
-            <circle cx="15.6" cy="33.4" r="2.2" fill="#05070d" stroke="url(#axiom-login-grad)" stroke-width="2" />
-            <circle cx="32.4" cy="33.4" r="2.2" fill="#05070d" stroke="url(#axiom-login-grad)" stroke-width="2" />
-          </svg>
-          <div class="axiom-brand-stack">
-            <span class="axiom-wordmark">AXIOM<span>.</span></span>
-            <div class="trustity-byline" aria-label="A Trustity product">
-              <svg class="trustity-mark" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
-                <path d="M12 2 4 6v6c0 5.25 3.4 10.15 8 12 4.6-1.85 8-6.75 8-12V6l-8-4Z" fill="#b875e8"/>
-                <path d="M12 7.2 8.5 9v3.4c0 3.1 1.9 6 3.5 7.1 1.6-1.1 3.5-4 3.5-7.1V9L12 7.2Z" fill="#0b0e14"/>
-              </svg>
-              <span>Trustity</span>
-            </div>
-          </div>
-        </h1>
+        <div class="axiom-brand axiom-brand-login" aria-label="Trustity Axiom">
+          <img src="data:image/png;base64,/*__TRUSTITY_AXIOM_LOGO__*/" alt="Trustity Axiom" class="trustity-axiom-logo">
+        </div>
         <p class="mt-6 max-w-2xl text-lg leading-8 text-zinc-300">Real-time SMB reverse proxy visibility for segmented enterprise file-server networks.</p>
       </div>
     </section>
@@ -4779,7 +4733,7 @@ const LOGIN_HTML_TEMPLATE: &str = r##"<!doctype html>
 
           <button class="w-full rounded-md bg-emerald-400 px-4 py-3 font-semibold text-zinc-950 transition hover:bg-emerald-300 focus:outline-none focus:ring-2 focus:ring-emerald-300 focus:ring-offset-2 focus:ring-offset-zinc-950" type="submit">Log in</button>
           <p id="error" class="hidden rounded-md border border-red-500/30 bg-red-500/10 px-4 py-3 text-sm text-red-200"></p>
-          <p class="text-center text-xs text-zinc-500">Axiom v/*__AXIOM_VERSION__*/</p>
+          <p class="text-center text-xs text-zinc-500">Trustity Axiom - Management Console - Version /*__AXIOM_VERSION__*/ - Copyright © 2026 - <a class="text-zinc-400 hover:text-emerald-300" href="https://trustity.co">https://trustity.co</a></p>
         </form>
       </div>
     </section>
@@ -5155,55 +5109,15 @@ const DASHBOARD_HTML_TEMPLATE: &str = r##"<!doctype html>
       align-items: center;
       color: #fff;
       display: inline-flex;
-      gap: 0.75rem;
       min-width: 0;
     }
 
-    .axiom-brand svg {
-      flex: 0 0 auto;
-      height: 2.4rem;
-      width: 2.4rem;
-    }
-
-    .axiom-wordmark {
-      color: #fff;
-      font-size: 1.55rem;
-      font-weight: 800;
-      line-height: 1;
-    }
-
-    .axiom-wordmark span {
-      color: var(--accent);
-      display: inline;
-    }
-
-    .axiom-console-label {
-      color: #94a3b8;
-      font-size: 0.875rem;
-      margin-top: 0.35rem;
-    }
-
-    .axiom-brand-stack {
-      display: flex;
-      flex-direction: column;
-      gap: 0.2rem;
-    }
-
-    .trustity-byline {
-      align-items: center;
-      color: #d8b4fe;
-      display: inline-flex;
-      font-size: 0.68rem;
-      font-weight: 700;
-      gap: 0.45rem;
-      letter-spacing: 0.24em;
-      text-transform: uppercase;
-    }
-
-    .trustity-mark {
-      flex: 0 0 auto;
-      height: 0.95rem;
-      width: 0.95rem;
+    .trustity-axiom-logo {
+      display: block;
+      height: auto;
+      max-height: 3rem;
+      max-width: min(100%, 22rem);
+      width: auto;
     }
 
     .toast-stack {
@@ -5357,38 +5271,9 @@ const DASHBOARD_HTML_TEMPLATE: &str = r##"<!doctype html>
   <header class="border-b border-zinc-800 bg-zinc-950/95">
     <div class="mx-auto flex max-w-7xl items-center justify-between gap-6 px-6 py-5">
       <div>
-        <div class="axiom-brand" aria-label="Axiom">
-          <svg viewBox="0 0 48 48" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Axiom logomark">
-            <defs>
-              <linearGradient id="axiom-dashboard-grad" x1="6" y1="4" x2="42" y2="44" gradientUnits="userSpaceOnUse">
-                <stop stop-color="#34F5C5" />
-                <stop offset="0.5" stop-color="#2FE3FF" />
-                <stop offset="1" stop-color="#5B8CFF" />
-              </linearGradient>
-              <linearGradient id="axiom-dashboard-grad-soft" x1="6" y1="4" x2="42" y2="44" gradientUnits="userSpaceOnUse">
-                <stop stop-color="#2FE3FF" stop-opacity="0.25" />
-                <stop offset="1" stop-color="#5B8CFF" stop-opacity="0.05" />
-              </linearGradient>
-            </defs>
-            <path d="M24 2.5 41.6 12.75v20.5L24 43.5 6.4 33.25v-20.5z" fill="url(#axiom-dashboard-grad-soft)" stroke="url(#axiom-dashboard-grad)" stroke-width="2" stroke-linejoin="round" />
-            <path d="M16 33 24 14l8 19" stroke="url(#axiom-dashboard-grad)" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round" />
-            <path d="M19.2 26.5h9.6" stroke="url(#axiom-dashboard-grad)" stroke-width="2.6" stroke-linecap="round" />
-            <circle cx="24" cy="13.4" r="2.5" fill="#05070d" stroke="url(#axiom-dashboard-grad)" stroke-width="2" />
-            <circle cx="15.6" cy="33.4" r="2.2" fill="#05070d" stroke="url(#axiom-dashboard-grad)" stroke-width="2" />
-            <circle cx="32.4" cy="33.4" r="2.2" fill="#05070d" stroke="url(#axiom-dashboard-grad)" stroke-width="2" />
-          </svg>
-          <div class="axiom-brand-stack">
-            <span class="axiom-wordmark">AXIOM<span>.</span></span>
-            <div class="trustity-byline" aria-label="A Trustity product">
-              <svg class="trustity-mark" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
-                <path d="M12 2 4 6v6c0 5.25 3.4 10.15 8 12 4.6-1.85 8-6.75 8-12V6l-8-4Z" fill="#b875e8"/>
-                <path d="M12 7.2 8.5 9v3.4c0 3.1 1.9 6 3.5 7.1 1.6-1.1 3.5-4 3.5-7.1V9L12 7.2Z" fill="#0b0e14"/>
-              </svg>
-              <span>Trustity</span>
-            </div>
-          </div>
+        <div class="axiom-brand" aria-label="Trustity Axiom">
+          <img src="data:image/png;base64,/*__TRUSTITY_AXIOM_LOGO__*/" alt="Trustity Axiom" class="trustity-axiom-logo">
         </div>
-        <p class="axiom-console-label">Management Console</p>
       </div>
       <button id="logout" class="rounded-md border border-zinc-700 px-4 py-2 text-sm text-zinc-200 transition hover:border-red-400 hover:text-red-200">Log out</button>
     </div>
@@ -6655,11 +6540,11 @@ const DASHBOARD_HTML_TEMPLATE: &str = r##"<!doctype html>
 
   <footer class="border-t border-zinc-800 bg-zinc-950 px-6 py-6 text-sm text-zinc-500">
     <div class="mx-auto flex max-w-7xl flex-col gap-2 md:flex-row md:items-center md:justify-between">
-      <p>© 2026 Axiom Security · v/*__AXIOM_VERSION__*/ · Built for authorized enterprise security operations.</p>
+      <p>Trustity Axiom - Management Console - Version /*__AXIOM_VERSION__*/ - Copyright © 2026 - <a class="text-zinc-400 hover:text-emerald-300" href="https://trustity.co">https://trustity.co</a></p>
       <div class="flex flex-wrap gap-4">
+        <a class="hover:text-emerald-300" href="https://trustity.co" target="_blank" rel="noopener noreferrer">Trustity</a>
         <a class="hover:text-emerald-300" href="#">Documentation</a>
         <a class="hover:text-emerald-300" href="#">Support</a>
-        <a class="hover:text-emerald-300" href="#">Privacy</a>
       </div>
     </div>
   </footer>

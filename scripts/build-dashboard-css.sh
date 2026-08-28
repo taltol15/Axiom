@@ -17,3 +17,10 @@ fi
 )
 
 echo "Wrote embedded Tailwind CSS: ${OUTPUT}"
+
+LOGO_PNG="${WEB_DIR}/assets/trustity-axiom-logo.png"
+LOGO_B64="${WEB_DIR}/assets/trustity-axiom-logo.base64"
+if [[ -f "${LOGO_PNG}" ]]; then
+  base64 < "${LOGO_PNG}" | tr -d '\n' > "${LOGO_B64}"
+  echo "Wrote embedded logo base64: ${LOGO_B64}"
+fi
