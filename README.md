@@ -9,6 +9,8 @@ Engineers joining the project should start with `DEVELOPER_HANDOFF.md`. It
 documents both repositories, cross-repository contracts, runtime architecture,
 security invariants, release workflow and current limitations.
 
+**Current customer release:** 1.1.6 — see `docs/CURRENT_RELEASE.md`.
+
 ## Deployment Roles
 
 The recommended production deployment uses at least three Axiom servers:

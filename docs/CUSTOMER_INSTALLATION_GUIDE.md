@@ -19,15 +19,27 @@ The installer checks and installs required packages such as:
 
 ## Download Installer
 
-Copy `axiom-installer.sh` to the server.
+Customers with Trustity Dev access download the current installer from
+**Trustity Dev → Downloads**. The supported baseline is **Axiom 1.1.6**
+(`axiom-installer-1.1.6.sh`). See `docs/CURRENT_RELEASE.md` for SHA-256 and
+publish notes.
+
+For air-gapped or direct transfer, copy `axiom-installer.sh` or the versioned
+installer file to the server:
 
 ```bash
-chmod +x axiom-installer.sh
+chmod +x axiom-installer-1.1.6.sh
 ```
 
 ## Install Management Server
 
 Run:
+
+```bash
+sudo ./axiom-installer-1.1.6.sh
+```
+
+Or, if using the generic symlink/copy name:
 
 ```bash
 sudo ./axiom-installer.sh

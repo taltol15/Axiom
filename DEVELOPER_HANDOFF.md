@@ -470,6 +470,7 @@ curl -fsS https://axmapp.com/api/health
 - `README.md`: setup and feature summary.
 - `docs/PRODUCT_OVERVIEW.md`: role and product overview.
 - `docs/PRODUCTION_DEPLOYMENT.md`: topology and deployment.
+- `docs/CURRENT_RELEASE.md`: supported customer version and publish checklist.
 - `docs/CUSTOMER_INSTALLATION_GUIDE.md`: role-by-role installation.
 - `docs/OPERATIONS_RUNBOOK.md`: support operations.
 - `docs/CLUSTER_AND_HIGH_AVAILABILITY_KB.md`: Cluster/LB/DNS HA contract.
