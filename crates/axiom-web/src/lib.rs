@@ -3234,6 +3234,18 @@ fn run_diagnostic_command(command: &str, args: &[&str]) -> CommandOutput {
     }
 }
 
+fn trim_policy_runtime_for_status(value: &serde_json::Value) -> Option<serde_json::Value> {
+    let object = value.as_object()?;
+    let mut trimmed = serde_json::Map::new();
+    for (key, nested) in object {
+        if key == "active_policy" {
+            continue;
+        }
+        trimmed.insert(key.clone(), nested.clone());
+    }
+    Some(serde_json::Value::Object(trimmed))
+}
+
 fn trim_node_stats_for_status(stats: &serde_json::Value) -> serde_json::Value {
     let Some(object) = stats.as_object() else {
         return serde_json::Value::Object(serde_json::Map::new());
@@ -3241,15 +3253,21 @@ fn trim_node_stats_for_status(stats: &serde_json::Value) -> serde_json::Value {
 
     let mut trimmed = serde_json::Map::new();
     for (key, value) in object {
-        let keep = value.is_number()
-            || value.is_string()
-            || value.is_boolean()
-            || matches!(
-                key.as_str(),
-                "policy_runtime" | "dns_policy_runtime" | "route_stats"
-            );
-        if keep {
-            trimmed.insert(key.clone(), value.clone());
+        match key.as_str() {
+            "policy_runtime" | "dns_policy_runtime" => {
+                if let Some(slim) = trim_policy_runtime_for_status(value) {
+                    trimmed.insert(key.clone(), slim);
+                }
+            }
+            "route_stats" => {
+                trimmed.insert(key.clone(), value.clone());
+            }
+            _ => {
+                let keep = value.is_number() || value.is_string() || value.is_boolean();
+                if keep {
+                    trimmed.insert(key.clone(), value.clone());
+                }
+            }
         }
     }
     serde_json::Value::Object(trimmed)
@@ -4512,6 +4530,39 @@ fn utf16le_test_payload(value: &str) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn trim_node_stats_drops_heavy_policy_payloads() {
+        let stats = serde_json::json!({
+            "dns_queries": 42,
+            "active_connection_details": [{"peer_addr": "10.0.0.2:445"}],
+            "policy_runtime": {
+                "generation": 3,
+                "blocking_rules": ["rule-a"],
+                "active_policy": {"signatures": [{"pattern": "huge"}]}
+            },
+            "dns_policy_runtime": {
+                "generation": 2,
+                "active_policy": {"blocked_domain_action": "block"}
+            },
+            "route_stats": [{"route_name": "smb", "active_connections": 1}]
+        });
+
+        let trimmed = trim_node_stats_for_status(&stats);
+        assert_eq!(trimmed.get("dns_queries").and_then(|v| v.as_u64()), Some(42));
+        assert!(trimmed.get("active_connection_details").is_none());
+        assert!(trimmed
+            .pointer("/policy_runtime/active_policy")
+            .is_none());
+        assert_eq!(
+            trimmed.pointer("/policy_runtime/generation").and_then(|v| v.as_u64()),
+            Some(3)
+        );
+        assert!(trimmed
+            .pointer("/dns_policy_runtime/active_policy")
+            .is_none());
+        assert_eq!(trimmed["route_stats"].as_array().map(Vec::len), Some(1));
+    }
 
     #[test]
     fn escapes_ldap_filter_values() {

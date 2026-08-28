@@ -3,10 +3,22 @@ set -Eeuo pipefail
 
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DIST_DIR="${PROJECT_ROOT}/dist"
-VERSION="${1:-1.1.2}"
+VERSION="${1:-1.1.3}"
 INSTALLER_NAME="axiom-installer-${VERSION}.sh"
+PREBUILT_DIR="${PROJECT_ROOT}/packaging/prebuilt"
 
 "${PROJECT_ROOT}/scripts/build-dashboard-css.sh"
+
+echo "Building release binary for customer package..."
+(
+  cd "${PROJECT_ROOT}"
+  cargo build --release -p axiom-daemon
+)
+
+mkdir -p "${PREBUILT_DIR}"
+cp "${PROJECT_ROOT}/target/release/axiom-daemon" "${PREBUILT_DIR}/axiom-daemon"
+printf '%s\n' "${VERSION}" > "${PREBUILT_DIR}/VERSION"
+"${PREBUILT_DIR}/axiom-daemon" --version
 
 mkdir -p "${DIST_DIR}"
 "${PROJECT_ROOT}/scripts/build-installer.sh" "${DIST_DIR}/${INSTALLER_NAME}"

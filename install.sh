@@ -866,7 +866,7 @@ configure_directory_integration() {
     fi
   fi
 
-  if prompt_yes_no "Resolve client names through reverse DNS" "yes"; then
+  if prompt_yes_no "Resolve client names through reverse DNS" "no"; then
     DIRECTORY_CLIENT_REVERSE_DNS="true"
   else
     DIRECTORY_CLIENT_REVERSE_DNS="false"
@@ -1835,24 +1835,71 @@ EOF
   rm -f "${temp_helper}" "${temp_sudoers}"
 }
 
-build_and_install_binary() {
-  echo
-  echo "Building Axiom release binary..."
-  local axiom_rustflags="-C linker=cc -C link-self-contained=no -C link-arg=-fuse-ld=bfd"
-  if [[ -n "${RUSTFLAGS:-}" ]]; then
-    axiom_rustflags="${RUSTFLAGS} ${axiom_rustflags}"
+verify_installed_binary() {
+  local binary_path="$1"
+  local installed_version=""
+  local package_version=""
+
+  installed_version="$("${binary_path}" --version 2>/dev/null || true)"
+  if [[ -z "${installed_version}" ]]; then
+    echo "ERROR: ${binary_path} did not report an Axiom version." >&2
+    exit 1
   fi
 
-  echo "Using system linker for release build: cc with ld.bfd"
-  (
-    cd "${PROJECT_ROOT}"
-    RUSTFLAGS="${axiom_rustflags}" cargo build --release -p axiom-daemon
-    if [[ "${AXIOM_INSTALL_LICENSE_TOOL}" == "1" ]]; then
-      RUSTFLAGS="${axiom_rustflags}" cargo build --release -p axiom-license --bin axiom-license-tool
+  if [[ -f "${PROJECT_ROOT}/packaging/prebuilt/VERSION" ]]; then
+    package_version="$(tr -d '[:space:]' < "${PROJECT_ROOT}/packaging/prebuilt/VERSION")"
+    if [[ -n "${package_version}" && "${installed_version}" != "${package_version}" ]]; then
+      echo "ERROR: Installed binary version ${installed_version} does not match package version ${package_version}." >&2
+      exit 1
     fi
-  )
+  fi
 
-  ${SUDO} install -m 0755 -o root -g root "${BINARY_SOURCE}" "${BINARY_PATH}"
+  if ! strings "${binary_path}" | grep -q "Trustity Axiom - Management Console"; then
+    echo "ERROR: ${binary_path} is missing the Trustity Axiom management UI branding." >&2
+    exit 1
+  fi
+
+  if strings "${binary_path}" | grep -q "Built for authorized enterprise security operations"; then
+    echo "ERROR: ${binary_path} still contains legacy management UI branding." >&2
+    exit 1
+  fi
+
+  echo "Verified Axiom ${installed_version} management UI branding."
+}
+
+build_and_install_binary() {
+  echo
+  local prebuilt_binary="${PROJECT_ROOT}/packaging/prebuilt/axiom-daemon"
+  if [[ -f "${prebuilt_binary}" ]]; then
+    echo "Installing pre-built Axiom binary from customer package..."
+    if [[ -f "${PROJECT_ROOT}/packaging/prebuilt/VERSION" ]]; then
+      echo "Package version: $(tr -d '[:space:]' < "${PROJECT_ROOT}/packaging/prebuilt/VERSION")"
+    fi
+    ${SUDO} install -m 0755 -o root -g root "${prebuilt_binary}" "${BINARY_PATH}"
+  else
+    echo "Building Axiom release binary from source..."
+    local axiom_rustflags="-C linker=cc -C link-self-contained=no -C link-arg=-fuse-ld=bfd"
+    if [[ -n "${RUSTFLAGS:-}" ]]; then
+      axiom_rustflags="${RUSTFLAGS} ${axiom_rustflags}"
+    fi
+
+    if [[ -x "${PROJECT_ROOT}/scripts/build-dashboard-css.sh" ]]; then
+      "${PROJECT_ROOT}/scripts/build-dashboard-css.sh"
+    fi
+
+    echo "Using system linker for release build: cc with ld.bfd"
+    (
+      cd "${PROJECT_ROOT}"
+      RUSTFLAGS="${axiom_rustflags}" cargo build --release -p axiom-daemon
+      if [[ "${AXIOM_INSTALL_LICENSE_TOOL}" == "1" ]]; then
+        RUSTFLAGS="${axiom_rustflags}" cargo build --release -p axiom-license --bin axiom-license-tool
+      fi
+    )
+
+    ${SUDO} install -m 0755 -o root -g root "${BINARY_SOURCE}" "${BINARY_PATH}"
+  fi
+
+  verify_installed_binary "${BINARY_PATH}"
   ${SUDO} setcap 'cap_net_bind_service,cap_net_raw+ep' "${BINARY_PATH}"
   if [[ "${AXIOM_INSTALL_LICENSE_TOOL}" == "1" ]]; then
     ${SUDO} install -m 0755 -o root -g root "${LICENSE_TOOL_SOURCE}" "${LICENSE_TOOL_PATH}"
