@@ -54,10 +54,12 @@ static LOGIN_HTML: OnceLock<String> = OnceLock::new();
 static DASHBOARD_HTML: OnceLock<String> = OnceLock::new();
 
 fn embedded_ui_html(template: &'static str) -> String {
-    template.replace(
-        "/*__EMBEDDED_TAILWIND_CSS__*/",
-        include_str!("../assets/embedded-tailwind.css"),
-    )
+    template
+        .replace(
+            "/*__EMBEDDED_TAILWIND_CSS__*/",
+            include_str!("../assets/embedded-tailwind.css"),
+        )
+        .replace("/*__AXIOM_VERSION__*/", env!("CARGO_PKG_VERSION"))
 }
 
 fn login_html() -> String {
@@ -87,6 +89,7 @@ struct WebState {
     client_identities: Mutex<HashMap<String, ClientIdentityCacheEntry>>,
     cluster_join_attempts: Mutex<HashMap<String, ClusterJoinThrottle>>,
     admin_session_token: Mutex<String>,
+    status_build_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 #[derive(Debug, Clone)]
@@ -132,6 +135,7 @@ pub async fn run_management_server(
         client_identities: Mutex::new(HashMap::new()),
         cluster_join_attempts: Mutex::new(HashMap::new()),
         admin_session_token: Mutex::new(session_token(&config.management.admin)),
+        status_build_lock: Arc::new(tokio::sync::Mutex::new(())),
     });
 
     let identity_refresh_state = Arc::clone(&state);
@@ -318,7 +322,9 @@ async fn api_status(headers: HeaderMap, State(state): State<Arc<WebState>>) -> R
             .into_response();
     }
 
+    let build_lock = Arc::clone(&state.status_build_lock);
     let state = Arc::clone(&state);
+    let _build_guard = build_lock.lock().await;
     match tokio::task::spawn_blocking(move || build_status_response(&state)).await {
         Ok(response) => Json(response).into_response(),
         Err(error) => {
@@ -688,7 +694,7 @@ async fn api_node_report(
         service_template: report.service_template,
         proxy_listeners: report.proxy_listeners,
         dns: report.dns,
-        stats: report.stats,
+        stats: trim_node_stats_for_status(&report.stats),
         last_control_push,
     };
 
@@ -4773,6 +4779,7 @@ const LOGIN_HTML_TEMPLATE: &str = r##"<!doctype html>
 
           <button class="w-full rounded-md bg-emerald-400 px-4 py-3 font-semibold text-zinc-950 transition hover:bg-emerald-300 focus:outline-none focus:ring-2 focus:ring-emerald-300 focus:ring-offset-2 focus:ring-offset-zinc-950" type="submit">Log in</button>
           <p id="error" class="hidden rounded-md border border-red-500/30 bg-red-500/10 px-4 py-3 text-sm text-red-200"></p>
+          <p class="text-center text-xs text-zinc-500">Axiom v/*__AXIOM_VERSION__*/</p>
         </form>
       </div>
     </section>
@@ -6648,7 +6655,7 @@ const DASHBOARD_HTML_TEMPLATE: &str = r##"<!doctype html>
 
   <footer class="border-t border-zinc-800 bg-zinc-950 px-6 py-6 text-sm text-zinc-500">
     <div class="mx-auto flex max-w-7xl flex-col gap-2 md:flex-row md:items-center md:justify-between">
-      <p>© 2026 Axiom Security. Built for authorized enterprise security operations.</p>
+      <p>© 2026 Axiom Security · v/*__AXIOM_VERSION__*/ · Built for authorized enterprise security operations.</p>
       <div class="flex flex-wrap gap-4">
         <a class="hover:text-emerald-300" href="#">Documentation</a>
         <a class="hover:text-emerald-300" href="#">Support</a>

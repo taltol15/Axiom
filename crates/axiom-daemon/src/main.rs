@@ -33,6 +33,11 @@ async fn main() -> anyhow::Result<()> {
     install_rustls_crypto_provider();
     init_tracing();
 
+    if env::args().nth(1).as_deref() == Some("--version") {
+        println!("{}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+
     let config_path = env::args()
         .nth(1)
         .unwrap_or_else(|| "config/axiom.toml".to_string());

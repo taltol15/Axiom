@@ -169,7 +169,7 @@ dependencies = [
 
 [[package]]
 name = "axiom-daemon"
-version = "1.1.0"
+version = "1.1.1"
 dependencies = [
  "anyhow",
  "axiom-config",
@@ -246,7 +246,7 @@ dependencies = [
 
 [[package]]
 name = "axiom-web"
-version = "0.1.0"
+version = "1.1.1"
 dependencies = [
  "anyhow",
  "argon2",
