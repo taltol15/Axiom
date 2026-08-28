@@ -1843,6 +1843,9 @@ verify_installed_binary() {
   installed_version="$("${binary_path}" --version 2>/dev/null || true)"
   if [[ -z "${installed_version}" ]]; then
     echo "ERROR: ${binary_path} did not report an Axiom version." >&2
+    if command -v file >/dev/null 2>&1; then
+      echo "  Binary type: $(file -b "${binary_path}")" >&2
+    fi
     exit 1
   fi
 
@@ -1867,36 +1870,73 @@ verify_installed_binary() {
   echo "Verified Axiom ${installed_version} management UI branding."
 }
 
+prebuilt_binary_runs_on_host() {
+  local binary_path="$1"
+
+  [[ -f "${binary_path}" ]] || return 1
+
+  if [[ "$(uname -s)" == "Linux" ]] && command -v file >/dev/null 2>&1; then
+    local file_info=""
+    file_info="$(file -b "${binary_path}")"
+    case "$(uname -m)" in
+      x86_64)
+        [[ "${file_info}" == *ELF* && "${file_info}" == *x86-64* ]] || return 1
+        ;;
+      aarch64)
+        [[ "${file_info}" == *ELF* && "${file_info}" == *aarch64* ]] || return 1
+        ;;
+      *)
+        [[ "${file_info}" == *ELF* ]] || return 1
+        ;;
+    esac
+  fi
+
+  local version=""
+  version="$("${binary_path}" --version 2>/dev/null || true)"
+  [[ -n "${version}" ]]
+}
+
+build_release_binary_from_source() {
+  echo "Building Axiom release binary from source..."
+  local axiom_rustflags="-C linker=cc -C link-self-contained=no -C link-arg=-fuse-ld=bfd"
+  if [[ -n "${RUSTFLAGS:-}" ]]; then
+    axiom_rustflags="${RUSTFLAGS} ${axiom_rustflags}"
+  fi
+
+  if [[ -x "${PROJECT_ROOT}/scripts/build-dashboard-css.sh" ]]; then
+    "${PROJECT_ROOT}/scripts/build-dashboard-css.sh"
+  fi
+
+  echo "Using system linker for release build: cc with ld.bfd"
+  (
+    cd "${PROJECT_ROOT}"
+    RUSTFLAGS="${axiom_rustflags}" cargo build --release -p axiom-daemon
+    if [[ "${AXIOM_INSTALL_LICENSE_TOOL}" == "1" ]]; then
+      RUSTFLAGS="${axiom_rustflags}" cargo build --release -p axiom-license --bin axiom-license-tool
+    fi
+  )
+
+  ${SUDO} install -m 0755 -o root -g root "${BINARY_SOURCE}" "${BINARY_PATH}"
+}
+
 build_and_install_binary() {
   echo
   local prebuilt_binary="${PROJECT_ROOT}/packaging/prebuilt/axiom-daemon"
-  if [[ -f "${prebuilt_binary}" ]]; then
+
+  if prebuilt_binary_runs_on_host "${prebuilt_binary}"; then
     echo "Installing pre-built Axiom binary from customer package..."
     if [[ -f "${PROJECT_ROOT}/packaging/prebuilt/VERSION" ]]; then
       echo "Package version: $(tr -d '[:space:]' < "${PROJECT_ROOT}/packaging/prebuilt/VERSION")"
     fi
     ${SUDO} install -m 0755 -o root -g root "${prebuilt_binary}" "${BINARY_PATH}"
   else
-    echo "Building Axiom release binary from source..."
-    local axiom_rustflags="-C linker=cc -C link-self-contained=no -C link-arg=-fuse-ld=bfd"
-    if [[ -n "${RUSTFLAGS:-}" ]]; then
-      axiom_rustflags="${RUSTFLAGS} ${axiom_rustflags}"
-    fi
-
-    if [[ -x "${PROJECT_ROOT}/scripts/build-dashboard-css.sh" ]]; then
-      "${PROJECT_ROOT}/scripts/build-dashboard-css.sh"
-    fi
-
-    echo "Using system linker for release build: cc with ld.bfd"
-    (
-      cd "${PROJECT_ROOT}"
-      RUSTFLAGS="${axiom_rustflags}" cargo build --release -p axiom-daemon
-      if [[ "${AXIOM_INSTALL_LICENSE_TOOL}" == "1" ]]; then
-        RUSTFLAGS="${axiom_rustflags}" cargo build --release -p axiom-license --bin axiom-license-tool
+    if [[ -f "${prebuilt_binary}" ]]; then
+      echo "Pre-built package binary is not compatible with this host; building from source instead..."
+      if command -v file >/dev/null 2>&1; then
+        echo "  Pre-built artifact: $(file -b "${prebuilt_binary}")"
       fi
-    )
-
-    ${SUDO} install -m 0755 -o root -g root "${BINARY_SOURCE}" "${BINARY_PATH}"
+    fi
+    build_release_binary_from_source
   fi
 
   verify_installed_binary "${BINARY_PATH}"

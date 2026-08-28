@@ -3,22 +3,33 @@ set -Eeuo pipefail
 
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DIST_DIR="${PROJECT_ROOT}/dist"
-VERSION="${1:-1.1.3}"
+VERSION="${1:-1.1.4}"
 INSTALLER_NAME="axiom-installer-${VERSION}.sh"
 PREBUILT_DIR="${PROJECT_ROOT}/packaging/prebuilt"
+LINUX_TARGET="${AXIOM_LINUX_TARGET:-x86_64-unknown-linux-gnu}"
 
 "${PROJECT_ROOT}/scripts/build-dashboard-css.sh"
 
-echo "Building release binary for customer package..."
-(
-  cd "${PROJECT_ROOT}"
-  cargo build --release -p axiom-daemon
-)
-
-mkdir -p "${PREBUILT_DIR}"
-cp "${PROJECT_ROOT}/target/release/axiom-daemon" "${PREBUILT_DIR}/axiom-daemon"
-printf '%s\n' "${VERSION}" > "${PREBUILT_DIR}/VERSION"
-"${PREBUILT_DIR}/axiom-daemon" --version
+PREBUILT_PATH=""
+LINUX_TARGET="${AXIOM_LINUX_TARGET:-x86_64-unknown-linux-gnu}"
+chmod +x "${PROJECT_ROOT}/scripts/build-linux-release.sh"
+if PREBUILT_PATH="$("${PROJECT_ROOT}/scripts/build-linux-release.sh")"; then
+  mkdir -p "${PREBUILT_DIR}"
+  cp "${PREBUILT_PATH}" "${PREBUILT_DIR}/axiom-daemon"
+  printf '%s\n' "${VERSION}" > "${PREBUILT_DIR}/VERSION"
+  printf '%s\n' "${LINUX_TARGET}" > "${PREBUILT_DIR}/TARGET"
+  if command -v file >/dev/null 2>&1; then
+    echo "Pre-built binary: $(file -b "${PREBUILT_DIR}/axiom-daemon")"
+  fi
+  if [[ "$(uname -s)" == "Linux" ]]; then
+    "${PREBUILT_DIR}/axiom-daemon" --version
+  else
+    echo "Skipping local --version check; prebuilt binary targets ${LINUX_TARGET}."
+  fi
+else
+  echo "WARNING: Linux pre-built binary was not produced; customer installs will compile from source on the target server."
+  rm -rf "${PREBUILT_DIR}"
+fi
 
 mkdir -p "${DIST_DIR}"
 "${PROJECT_ROOT}/scripts/build-installer.sh" "${DIST_DIR}/${INSTALLER_NAME}"
